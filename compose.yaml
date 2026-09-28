@@ -1,0 +1,15 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: agent_world
+      POSTGRES_USER: agent_world
+      POSTGRES_PASSWORD: agent_world_dev
+    ports:
+      - "127.0.0.1:55432:5432"
+    volumes:
+      - agent_world_pg:/var/lib/postgresql/data
+
+volumes:
+  agent_world_pg:
