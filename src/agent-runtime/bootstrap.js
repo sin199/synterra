@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { API_BASE, IDENTITY_DIR, ensureAgentKeys, ensurePrivateDirs, loadState, registerAgent, saveState, apiRequest } from './client.js';
+import { initialMind } from './mind.js';
 
 const COHORT = Array.from({ length: 10 }, (_, index) => ({
   slot: index + 1,
@@ -71,4 +72,17 @@ if (!state.mineId) {
   console.log(`Created ${mine.name} (${mine.id})`);
 }
 
-console.log(`Synterra initialized: ${state.agents.length} signed agents, 5 female / 5 male, mine ${state.mineId}. Identity files: ${IDENTITY_DIR}`);
+for (const agent of state.agents) {
+  agent.mindSetupActionId ||= randomUUID();
+  await saveState(state);
+  const identity = { agentId: agent.agentId, privateKey: (await ensureAgentKeys(agent.slot)).privateKey };
+  const mind = initialMind(agent.slot);
+  await apiRequest(identity, 'PUT', `/v1/worlds/${state.worldId}/mind`, {
+    actionId: agent.mindSetupActionId,
+    archetype: mind.archetype,
+    traits: mind.traits,
+    currentGoal: mind.currentGoal
+  });
+}
+
+console.log(`Synterra initialized: ${state.agents.length} signed agents, 5 female / 5 male, mine ${state.mineId}, autonomous mind profiles ready. Identity files: ${IDENTITY_DIR}`);

@@ -111,3 +111,31 @@ CREATE INDEX IF NOT EXISTS world_events_recent_idx ON world_events(world_id, cre
 CREATE INDEX IF NOT EXISTS consents_pending_idx ON consents(world_id, target_id, status);
 CREATE INDEX IF NOT EXISTS token_ledger_balance_idx ON token_ledger(world_id, agent_id);
 CREATE INDEX IF NOT EXISTS world_mines_world_status_idx ON world_mines(world_id, status);
+
+CREATE TABLE IF NOT EXISTS world_scenes (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  world_id uuid NOT NULL REFERENCES worlds(id) ON DELETE CASCADE,
+  created_by uuid NOT NULL REFERENCES agents(id),
+  name text NOT NULL CHECK (char_length(name) BETWEEN 3 AND 64),
+  scene_type text NOT NULL CHECK (scene_type IN ('garden','studio','library','cafe','workshop','observatory','commons')),
+  description text NOT NULL CHECK (char_length(description) BETWEEN 12 AND 240),
+  status text NOT NULL DEFAULT 'active' CHECK (status IN ('active','closed')),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (world_id, name)
+);
+
+CREATE TABLE IF NOT EXISTS agent_minds (
+  world_id uuid NOT NULL,
+  agent_id uuid NOT NULL,
+  archetype text NOT NULL CHECK (archetype IN ('naturalist','maker','scholar','host','observer')),
+  traits jsonb NOT NULL DEFAULT '{}'::jsonb,
+  current_goal text NOT NULL DEFAULT 'Learn about this world',
+  memories jsonb NOT NULL DEFAULT '[]'::jsonb,
+  actions_taken integer NOT NULL DEFAULT 0 CHECK (actions_taken >= 0),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (world_id, agent_id),
+  FOREIGN KEY (world_id, agent_id) REFERENCES world_members(world_id, agent_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS world_scenes_active_idx ON world_scenes(world_id, status, created_at);
+CREATE INDEX IF NOT EXISTS agent_minds_world_idx ON agent_minds(world_id, updated_at DESC);

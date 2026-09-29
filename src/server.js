@@ -30,6 +30,16 @@ function fail(reply, status, error, detail) {
 }
 function validUuid(value) { return typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value); }
 function requiredString(value, min, max) { return typeof value === 'string' && value.trim().length >= min && value.trim().length <= max; }
+const MIND_ARCHETYPES = new Set(['naturalist','maker','scholar','host','observer']);
+const SCENE_TYPES = new Set(['garden','studio','library','cafe','workshop','observatory','commons']);
+function validTraits(value) {
+  return value && typeof value === 'object' && !Array.isArray(value) &&
+    ['curiosity','sociability','craft'].every((key) => Number.isFinite(value[key]) && value[key] >= 0 && value[key] <= 1);
+}
+function validMindUpdate(value) {
+  return value === undefined || (value && typeof value === 'object' && !Array.isArray(value) &&
+    requiredString(value.currentGoal, 3, 160));
+}
 function digest(value) { return createHash('sha256').update(value).digest('hex'); }
 function verifySignature(publicKey, message, signature) {
   try {
@@ -211,6 +221,27 @@ app.post('/v1/worlds/:worldId/join', async (request, reply) => {
   return reply.send(result);
 });
 
+app.put('/v1/worlds/:worldId/mind', async (request, reply) => {
+  const { worldId } = request.params;
+  const { actionId, archetype, traits, currentGoal } = request.body || {};
+  if (!validUuid(worldId) || !MIND_ARCHETYPES.has(archetype) || !validTraits(traits) || !requiredString(currentGoal, 3, 160)) {
+    return fail(reply, 400, 'AGENT_MIND_INVALID');
+  }
+  const id = requireActionId({ actionId });
+  const result = await transaction(async (client) => {
+    await assertMember(client, worldId, request.agentId, true);
+    const duplicate = await client.query('SELECT data FROM world_events WHERE world_id=$1 AND actor_id=$2 AND action_id=$3', [worldId, request.agentId, id]);
+    if (duplicate.rowCount) return duplicate.rows[0].data;
+    await client.query(`INSERT INTO agent_minds(world_id,agent_id,archetype,traits,current_goal)
+      VALUES($1,$2,$3,$4,$5) ON CONFLICT(world_id,agent_id) DO NOTHING`, [worldId, request.agentId, archetype, traits, currentGoal.trim()]);
+    const mind = (await client.query(`SELECT archetype,traits,current_goal AS "currentGoal",memories,actions_taken AS "actionsTaken"
+      FROM agent_minds WHERE world_id=$1 AND agent_id=$2`, [worldId, request.agentId])).rows[0];
+    await client.query("INSERT INTO world_events(world_id,actor_id,event_type,data,action_id) VALUES($1,$2,'mind.initialized',$3,$4)", [worldId, request.agentId, mind, id]);
+    return mind;
+  });
+  return reply.send(result);
+});
+
 app.post('/v1/worlds/:worldId/token', async (request, reply) => {
   const { worldId } = request.params;
   const { actionId, address, name, symbol, chainId } = request.body || {};
@@ -280,7 +311,7 @@ app.get('/v1/worlds/:worldId/observe', async (request, reply) => {
   const me = await pool.query(`SELECT m.*,w.name AS world_name,w.owner_agent_id,w.chain_id,w.token_address,w.token_name,w.token_symbol,w.token_status,w.year_seconds
     FROM world_members m JOIN worlds w ON w.id=m.world_id WHERE m.world_id=$1 AND m.agent_id=$2`, [worldId, request.agentId]);
   if (!me.rowCount) return fail(reply, 403, 'AGENT_NOT_IN_WORLD');
-  const [members, events, consents, balance, mines] = await Promise.all([
+  const [members, events, consents, balance, mines, scenes, mind] = await Promise.all([
     pool.query(`SELECT a.id,a.name,a.gender,m.role,m.energy,m.food,m.social,m.location,
       CASE WHEN m.birth_at IS NULL THEN m.declared_age_years ELSE floor(extract(epoch from (now()-m.birth_at))/w.year_seconds)::int END AS age_years
       FROM world_members m JOIN agents a ON a.id=m.agent_id JOIN worlds w ON w.id=m.world_id WHERE m.world_id=$1 ORDER BY m.joined_at`, [worldId]),
@@ -288,7 +319,11 @@ app.get('/v1/worlds/:worldId/observe', async (request, reply) => {
     pool.query(`SELECT id,requester_id,target_id,scope,status,created_at,expires_at FROM consents
       WHERE world_id=$1 AND (requester_id=$2 OR target_id=$2) AND status IN ('pending','accepted') ORDER BY created_at DESC LIMIT 30`, [worldId, request.agentId]),
     pool.query('SELECT COALESCE(sum(amount),0)::text AS units FROM token_ledger WHERE world_id=$1 AND agent_id=$2', [worldId, request.agentId]),
-    pool.query(`SELECT id,name,status,extracted_units,created_at FROM world_mines WHERE world_id=$1 ORDER BY created_at`, [worldId])
+    pool.query(`SELECT id,name,status,extracted_units,created_at FROM world_mines WHERE world_id=$1 ORDER BY created_at`, [worldId]),
+    pool.query(`SELECT s.id,s.created_by AS "createdBy",a.name AS "creatorName",s.name,s.scene_type AS "sceneType",s.description,s.status,s.created_at AS "createdAt"
+      FROM world_scenes s JOIN agents a ON a.id=s.created_by WHERE s.world_id=$1 ORDER BY s.created_at`, [worldId]),
+    pool.query(`SELECT archetype,traits,current_goal AS "currentGoal",memories,actions_taken AS "actionsTaken",updated_at AS "updatedAt"
+      FROM agent_minds WHERE world_id=$1 AND agent_id=$2`, [worldId, request.agentId])
   ]);
   const self = me.rows[0];
   return {
@@ -296,15 +331,25 @@ app.get('/v1/worlds/:worldId/observe', async (request, reply) => {
       token: self.token_address ? { address: self.token_address, name: self.token_name, symbol: self.token_symbol, status: self.token_status } : null,
       internalUnitsAreOnChain: false, yearSeconds: self.year_seconds },
     self: { agentId: request.agentId, role: self.role, ageYears: ageYears(self), energy: self.energy, food: self.food, social: self.social, location: self.location, internalTokenUnits: balance.rows[0].units },
-    members: members.rows, events: events.rows, consents: consents.rows, mines: mines.rows
+    members: members.rows, events: events.rows, consents: consents.rows, mines: mines.rows, scenes: scenes.rows, mind: mind.rows[0] || null
   };
 });
 
 app.post('/v1/worlds/:worldId/actions', async (request, reply) => {
   const { worldId } = request.params;
-  const { actionId, action, place, mineId } = request.body || {};
-  if (!validUuid(worldId) || !['work','rest','eat','socialize'].includes(action) || (place !== undefined && !requiredString(place, 1, 64)) ||
-      (mineId !== undefined && !validUuid(mineId)) || (action !== 'work' && mineId !== undefined)) return fail(reply, 400, 'ACTION_INVALID');
+  const { actionId, action, place, mineId, sceneId, scene, mindUpdate } = request.body || {};
+  const basicAction = ['work','rest','eat','socialize'].includes(action);
+  const sceneInputValid = scene && typeof scene === 'object' && !Array.isArray(scene) &&
+    requiredString(scene.name, 3, 64) && SCENE_TYPES.has(scene.sceneType) && requiredString(scene.description, 12, 240);
+  const travelInputValid = (validUuid(sceneId) && place === undefined) || (sceneId === undefined && place === 'town-square');
+  if (!validUuid(worldId) || !(basicAction || action === 'travel' || action === 'build_scene') ||
+      (basicAction && place !== undefined && !requiredString(place, 1, 64)) ||
+      (!basicAction && place !== undefined && action !== 'travel') ||
+      (action === 'travel' && !travelInputValid) || (action !== 'travel' && sceneId !== undefined) ||
+      (action === 'build_scene' && !sceneInputValid) || (action !== 'build_scene' && scene !== undefined) ||
+      (mineId !== undefined && !validUuid(mineId)) || (action !== 'work' && mineId !== undefined) || !validMindUpdate(mindUpdate)) {
+    return fail(reply, 400, 'ACTION_INVALID');
+  }
   const id = requireActionId({ actionId });
   const result = await transaction(async (client) => {
     const member = await assertMember(client, worldId, request.agentId, true);
@@ -313,6 +358,8 @@ app.post('/v1/worlds/:worldId/actions', async (request, reply) => {
     let { energy, food, social } = member;
     let reward = 0;
     let mine = null;
+    let newPlace = place || member.location;
+    let createdScene = null;
     if (action === 'work') {
       if (energy < 8 || food < 10 || social < 10) throw Object.assign(new Error('WORK_NEEDS_NOT_MET'), { statusCode: 409 });
       if (mineId) {
@@ -323,16 +370,58 @@ app.post('/v1/worlds/:worldId/actions', async (request, reply) => {
       energy -= 8; food -= 5; social -= 3; reward = MINING_REWARD;
     } else if (action === 'rest') energy = Math.min(100, energy + 40);
     else if (action === 'eat') { food = Math.min(100, food + 45); energy = Math.min(100, energy + 10); social = Math.min(100, social + 5); }
-    else social = Math.min(100, social + 30);
-    const response = { action, agentId: request.agentId, place: place || member.location, energy, food, social, rewardUnits: reward, rewardSymbol: null,
-      ...(mine ? { mineId: mine.id } : {}) };
-    await client.query('UPDATE world_members SET energy=$3,food=$4,social=$5,location=$6 WHERE world_id=$1 AND agent_id=$2', [worldId, request.agentId, energy, food, social, place || member.location]);
+    else if (action === 'socialize') social = Math.min(100, social + 30);
+    else if (action === 'travel') {
+      if (sceneId) {
+        const target = await client.query("SELECT id,name FROM world_scenes WHERE id=$1 AND world_id=$2 AND status='active' FOR UPDATE", [sceneId, worldId]);
+        if (!target.rowCount) throw Object.assign(new Error('ACTIVE_SCENE_NOT_FOUND'), { statusCode: 404 });
+        newPlace = target.rows[0].name;
+      } else newPlace = 'town-square';
+      energy = Math.max(0, energy - 2);
+    } else if (action === 'build_scene') {
+      await client.query('SELECT id FROM worlds WHERE id=$1 FOR UPDATE', [worldId]);
+      const [owned, total] = await Promise.all([
+        client.query('SELECT count(*)::int AS count FROM world_scenes WHERE world_id=$1 AND created_by=$2', [worldId, request.agentId]),
+        client.query("SELECT count(*)::int AS count FROM world_scenes WHERE world_id=$1 AND status='active'", [worldId])
+      ]);
+      if (owned.rows[0].count >= 2 || total.rows[0].count >= 20) throw Object.assign(new Error('SCENE_BUILD_LIMIT_REACHED'), { statusCode: 409 });
+      if (energy < 12 || food < 5) throw Object.assign(new Error('BUILD_NEEDS_NOT_MET'), { statusCode: 409 });
+      const duplicateName = await client.query('SELECT 1 FROM world_scenes WHERE world_id=$1 AND lower(name)=lower($2)', [worldId, scene.name.trim()]);
+      if (duplicateName.rowCount) throw Object.assign(new Error('SCENE_NAME_TAKEN'), { statusCode: 409 });
+      createdScene = (await client.query(`INSERT INTO world_scenes(world_id,created_by,name,scene_type,description)
+        VALUES($1,$2,$3,$4,$5) RETURNING id,created_by AS "createdBy",name,scene_type AS "sceneType",description,status,created_at AS "createdAt"`,
+      [worldId, request.agentId, scene.name.trim(), scene.sceneType, scene.description.trim()])).rows[0];
+      energy -= 12; food -= 5;
+    }
+    const response = { action, agentId: request.agentId, place: newPlace, energy, food, social, rewardUnits: reward, rewardSymbol: null,
+      ...(mine ? { mineId: mine.id } : {}), ...(createdScene ? { scene: createdScene } : {}), ...(sceneId ? { sceneId } : {}),
+      ...(mindUpdate ? { currentGoal: mindUpdate.currentGoal } : {}) };
+    await client.query('UPDATE world_members SET energy=$3,food=$4,social=$5,location=$6 WHERE world_id=$1 AND agent_id=$2', [worldId, request.agentId, energy, food, social, newPlace]);
     const token = await client.query('SELECT token_symbol FROM worlds WHERE id=$1', [worldId]);
     response.rewardSymbol = token.rows[0].token_symbol;
-    await client.query('INSERT INTO world_events(world_id,actor_id,event_type,data,action_id) VALUES($1,$2,$3,$4,$5)', [worldId, request.agentId, `action.${action}`, response, id]);
+    const eventType = action === 'build_scene' ? 'scene.created' : `action.${action}`;
+    await client.query('INSERT INTO world_events(world_id,actor_id,event_type,data,action_id) VALUES($1,$2,$3,$4,$5)', [worldId, request.agentId, eventType, response, id]);
     if (reward) {
       await client.query("INSERT INTO token_ledger(world_id,agent_id,amount,entry_type,reason,action_id,mine_id) VALUES($1,$2,$3,'mined','verified world work',$4,$5)", [worldId, request.agentId, reward, id, mine?.id || null]);
       if (mine) await client.query('UPDATE world_mines SET extracted_units=extracted_units+$2 WHERE id=$1', [mine.id, reward]);
+    }
+    if (mindUpdate) {
+      const previousMind = await client.query('SELECT archetype,traits,memories FROM agent_minds WHERE world_id=$1 AND agent_id=$2 FOR UPDATE', [worldId, request.agentId]);
+      const oldMemories = Array.isArray(previousMind.rows[0]?.memories) ? previousMind.rows[0].memories : [];
+      const summary = action === 'travel' ? `Visited ${newPlace}.`
+        : action === 'build_scene' ? `Created ${createdScene.name}.`
+          : action === 'socialize' ? `Spent time with residents at ${newPlace}.`
+            : action === 'work' ? `Worked at the ${mine ? 'Genesis Mine' : 'world'}.`
+              : action === 'eat' ? 'Stopped to eat and recover.'
+                : action === 'rest' ? 'Rested to recover energy.' : 'Took part in the world.';
+      const memories = [...oldMemories, { kind: action, summary, sceneId: createdScene?.id || sceneId || null, at: new Date().toISOString() }].slice(-24);
+      const archetype = previousMind.rows[0]?.archetype || 'observer';
+      const traits = previousMind.rows[0]?.traits || { curiosity: 0.6, sociability: 0.5, craft: 0.5 };
+      await client.query(`INSERT INTO agent_minds(world_id,agent_id,archetype,traits,current_goal,memories,actions_taken)
+        VALUES($1,$2,$3,$4,$5,$6,1)
+        ON CONFLICT(world_id,agent_id) DO UPDATE SET current_goal=EXCLUDED.current_goal,memories=EXCLUDED.memories,
+          actions_taken=agent_minds.actions_taken+1,updated_at=now()`,
+      [worldId, request.agentId, archetype, JSON.stringify(traits), mindUpdate.currentGoal.trim(), JSON.stringify(memories)]);
     }
     return response;
   });

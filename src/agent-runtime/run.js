@@ -2,6 +2,7 @@ import { open, readFile, unlink } from 'node:fs/promises';
 import { createPrivateKey, randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { API_BASE, STATE_DIR, apiRequest, ensurePrivateDirs, loadState } from './client.js';
+import { decideNextAction } from './mind.js';
 
 const LOCK_FILE = path.join(STATE_DIR, 'runtime.lock');
 const configuredTick = Number(process.env.SYNTERRA_AGENT_TICK_MS || 900_000);
@@ -46,25 +47,26 @@ async function stop() {
 process.on('SIGINT', stop);
 process.on('SIGTERM', stop);
 
-function chooseAction(self) {
-  if (self.food < 70) return 'eat';
-  if (self.energy < 60) return 'rest';
-  if (self.social < 65) return 'socialize';
-  return 'work';
-}
-
 async function actOnce(agent) {
   const privateKey = createPrivateKey(await readFile(agent.privateKeyFile, 'utf8'));
   const identity = { agentId: agent.agentId, privateKey };
   const observation = await apiRequest(identity, 'GET', `/v1/worlds/${state.worldId}/observe`);
-  const action = chooseAction(observation.self);
+  const decision = decideNextAction(observation);
   const activeMine = observation.mines?.find((mine) => mine.id === state.mineId && mine.status === 'active');
-  if (action === 'work' && !activeMine) throw new Error('Configured Genesis Mine is unavailable; refusing unassigned work.');
+  if (decision.action === 'work' && !activeMine) throw new Error('Configured Genesis Mine is unavailable; refusing unassigned work.');
+  const body = { action: decision.action, actionId: cryptoRandomId(), mindUpdate: decision.mindUpdate };
+  if (decision.action === 'work') body.mineId = activeMine.id;
+  if (decision.action === 'travel') {
+    if (decision.sceneId) body.sceneId = decision.sceneId;
+    else body.place = 'town-square';
+  }
+  if (decision.action === 'build_scene') body.scene = decision.scene;
   const result = await apiRequest(identity, 'POST', `/v1/worlds/${state.worldId}/actions`, {
-    action, actionId: cryptoRandomId(), ...(action === 'work' ? { mineId: activeMine.id } : {})
+    ...body
   });
-  console.log(JSON.stringify({ time: new Date().toISOString(), agent: agent.name, gender: agent.gender, action,
-    energy: result.energy, food: result.food, social: result.social, rewardUnits: result.rewardUnits, mineId: result.mineId || null }));
+  console.log(JSON.stringify({ time: new Date().toISOString(), agent: agent.name, gender: agent.gender, action: result.action,
+    goal: decision.goal, place: result.place, scene: result.scene?.name || null, energy: result.energy, food: result.food,
+    social: result.social, rewardUnits: result.rewardUnits, mineId: result.mineId || null }));
 }
 
 function cryptoRandomId() {
