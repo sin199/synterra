@@ -31,7 +31,7 @@ function fail(reply, status, error, detail) {
 function validUuid(value) { return typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value); }
 function requiredString(value, min, max) { return typeof value === 'string' && value.trim().length >= min && value.trim().length <= max; }
 const MIND_ARCHETYPES = new Set(['naturalist','maker','scholar','host','observer']);
-const SCENE_TYPES = new Set(['garden','studio','library','cafe','workshop','observatory','commons']);
+const SCENE_TYPES = new Set(['garden','studio','library','cafe','workshop','observatory','commons','data_center']);
 function validTraits(value) {
   return value && typeof value === 'object' && !Array.isArray(value) &&
     ['curiosity','sociability','craft'].every((key) => Number.isFinite(value[key]) && value[key] >= 0 && value[key] <= 1);
@@ -74,7 +74,7 @@ function requireActionId(body) {
 app.addHook('preHandler', async (request, reply) => {
   const pathOnly = request.raw.url?.split('?')[0] || '';
   if (pathOnly === '/' || pathOnly === '/styles.css' || pathOnly === '/app.js' || pathOnly === '/public/stats' ||
-      pathOnly === '/health' || pathOnly === '/v1/agents/challenges' || pathOnly === '/v1/agents') return;
+      pathOnly === '/local/map-data' || pathOnly === '/health' || pathOnly === '/v1/agents/challenges' || pathOnly === '/v1/agents') return;
 
   const agentId = request.headers['x-agent-id'];
   const time = Number(request.headers['x-agent-time']);
@@ -135,6 +135,41 @@ app.get('/public/stats', async (_request, reply) => {
     FROM world_mines m JOIN worlds w ON w.id=m.world_id WHERE w.open=true`);
   return { openWorlds: worlds.rows[0].count, residents: residents.rows[0].count, chainId: CHAIN_ID,
     activeMines: mines.rows[0].active, extractedUnits: mines.rows[0].extracted_units };
+});
+
+app.get('/local/map-data', async (_request, reply) => {
+  if (!['127.0.0.1', '::1', 'localhost'].includes(HOST)) return fail(reply, 403, 'LOCAL_DASHBOARD_ONLY');
+  reply.header('Cache-Control', 'no-store');
+  const world = await pool.query(`SELECT id,name,created_at AS "createdAt"
+    FROM worlds WHERE open=true ORDER BY created_at DESC LIMIT 1`);
+  if (!world.rowCount) return { world: null, scenes: [], residents: [], events: [], dataCenterLogs: [], generatedAt: new Date().toISOString() };
+  const worldId = world.rows[0].id;
+  const [scenes, residents, events, dataCenterLogs] = await Promise.all([
+    pool.query(`SELECT s.id,s.name,s.scene_type AS "sceneType",s.status,s.created_at AS "createdAt",
+      (SELECT count(*)::int FROM world_members m WHERE m.world_id=s.world_id AND m.location=s.name) AS "residentCount"
+      FROM world_scenes s WHERE s.world_id=$1 ORDER BY s.created_at,s.id`, [worldId]),
+    pool.query(`SELECT a.id,a.name,a.gender,m.energy,m.food,m.social,m.location,
+        am.archetype,am.current_goal AS "currentGoal",am.actions_taken AS "actionsTaken",am.updated_at AS "mindUpdatedAt",
+        recent.event_type AS "lastEventType",recent.created_at AS "lastEventAt",recent.place AS "lastEventPlace"
+      FROM world_members m JOIN agents a ON a.id=m.agent_id
+      LEFT JOIN agent_minds am ON am.world_id=m.world_id AND am.agent_id=m.agent_id
+      LEFT JOIN LATERAL (
+        SELECT e.event_type,e.created_at,e.data->>'place' AS place
+        FROM world_events e WHERE e.world_id=m.world_id AND e.actor_id=m.agent_id AND e.event_type LIKE 'action.%'
+        ORDER BY e.id DESC LIMIT 1
+      ) recent ON true
+      WHERE m.world_id=$1 ORDER BY m.joined_at,a.name`, [worldId]),
+    pool.query(`SELECT a.name AS "agentName",e.event_type AS "eventType",e.data->>'place' AS place,e.created_at AS "createdAt"
+      FROM world_events e JOIN agents a ON a.id=e.actor_id
+      WHERE e.world_id=$1 AND (e.event_type LIKE 'action.%' OR e.event_type='scene.created')
+      ORDER BY e.id DESC LIMIT 24`, [worldId]),
+    pool.query(`SELECT a.name AS "agentName",e.event_type AS "eventType",e.data->>'place' AS place,e.created_at AS "createdAt"
+      FROM world_events e JOIN agents a ON a.id=e.actor_id
+      WHERE e.world_id=$1 AND (e.event_type LIKE 'action.%' OR e.event_type='scene.created')
+      ORDER BY e.id DESC LIMIT 100`, [worldId])
+  ]);
+  return { world: world.rows[0], scenes: scenes.rows, residents: residents.rows, events: events.rows,
+    dataCenterLogs: dataCenterLogs.rows, generatedAt: new Date().toISOString() };
 });
 
 app.post('/v1/agents/challenges', async () => {

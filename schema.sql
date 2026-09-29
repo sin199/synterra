@@ -117,12 +117,28 @@ CREATE TABLE IF NOT EXISTS world_scenes (
   world_id uuid NOT NULL REFERENCES worlds(id) ON DELETE CASCADE,
   created_by uuid NOT NULL REFERENCES agents(id),
   name text NOT NULL CHECK (char_length(name) BETWEEN 3 AND 64),
-  scene_type text NOT NULL CHECK (scene_type IN ('garden','studio','library','cafe','workshop','observatory','commons')),
+  scene_type text NOT NULL CONSTRAINT world_scenes_scene_type_check
+    CHECK (scene_type IN ('garden','studio','library','cafe','workshop','observatory','commons','data_center')),
   description text NOT NULL CHECK (char_length(description) BETWEEN 12 AND 240),
   status text NOT NULL DEFAULT 'active' CHECK (status IN ('active','closed')),
   created_at timestamptz NOT NULL DEFAULT now(),
   UNIQUE (world_id, name)
 );
+
+-- Upgrade existing local databases without replacing or rewriting scene data.
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conrelid = 'world_scenes'::regclass
+      AND contype = 'c'
+      AND pg_get_constraintdef(oid) LIKE '%data_center%'
+  ) THEN
+    ALTER TABLE world_scenes DROP CONSTRAINT IF EXISTS world_scenes_scene_type_check;
+    ALTER TABLE world_scenes ADD CONSTRAINT world_scenes_scene_type_check
+      CHECK (scene_type IN ('garden','studio','library','cafe','workshop','observatory','commons','data_center'));
+  END IF;
+END $$;
 
 CREATE TABLE IF NOT EXISTS agent_minds (
   world_id uuid NOT NULL,

@@ -2,7 +2,10 @@ import { open, readFile, unlink } from 'node:fs/promises';
 import { createPrivateKey, randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { API_BASE, STATE_DIR, apiRequest, ensurePrivateDirs, loadState } from './client.js';
-import { decideNextAction } from './mind.js';
+import { candidateActions, decideNextAction } from './mind.js';
+import { chooseWithTypeSafe } from './typesafe.js';
+import { skillsForAction } from './skills.js';
+import { createFruitflyRuntime } from './fruitfly.js';
 
 const LOCK_FILE = path.join(STATE_DIR, 'runtime.lock');
 const configuredTick = Number(process.env.SYNTERRA_AGENT_TICK_MS || 900_000);
@@ -13,6 +16,13 @@ await ensurePrivateDirs();
 const state = await loadState();
 if (!state.worldId || state.agents?.length !== 10) {
   throw new Error('Synterra is not initialized. Run `npm run agents:init` first.');
+}
+
+let fruitfly = null;
+try {
+  fruitfly = await createFruitflyRuntime(STATE_DIR);
+} catch (error) {
+  console.error(JSON.stringify({ time: new Date().toISOString(), fruitflyUnavailable: String(error?.message || error).slice(0, 180) }));
 }
 
 async function acquireLock() {
@@ -51,7 +61,37 @@ async function actOnce(agent) {
   const privateKey = createPrivateKey(await readFile(agent.privateKeyFile, 'utf8'));
   const identity = { agentId: agent.agentId, privateKey };
   const observation = await apiRequest(identity, 'GET', `/v1/worlds/${state.worldId}/observe`);
-  const decision = decideNextAction(observation);
+  let decision = decideNextAction(observation);
+  const candidates = candidateActions(observation, state.mineId);
+  let fruitflyChoice = null;
+  let decisionSource = 'local';
+  let typesafe = null;
+  if (fruitfly && candidates.length) {
+    try {
+      fruitflyChoice = fruitfly.choose(agent.agentId, observation, candidates, decision);
+      if (fruitflyChoice?.candidate) {
+        decision = { ...fruitflyChoice.candidate, mindUpdate: { currentGoal: fruitflyChoice.candidate.goal } };
+        decisionSource = 'fruitfly';
+      }
+    } catch (error) {
+      console.error(JSON.stringify({ time: new Date().toISOString(), agent: agent.name,
+        fruitflyFallback: String(error?.message || error).replace(/[\r\n\t]/g, ' ').slice(0, 160) }));
+    }
+  }
+  if (process.env.TYPESAFE_API_KEY) {
+    try {
+      const selection = await chooseWithTypeSafe(observation, candidates, state);
+      if (selection.decision) {
+        decision = { ...selection.decision, mindUpdate: { currentGoal: selection.decision.goal } };
+        decisionSource = 'typesafe';
+        typesafe = selection;
+      } else if (selection.reason !== 'single_candidate') {
+        typesafe = selection;
+      }
+    } catch (error) {
+      typesafe = { reason: `typesafe_setup_error: ${String(error?.message || 'selection unavailable').replace(/[\r\n\t]/g, ' ').slice(0, 160)}` };
+    }
+  }
   const activeMine = observation.mines?.find((mine) => mine.id === state.mineId && mine.status === 'active');
   if (decision.action === 'work' && !activeMine) throw new Error('Configured Genesis Mine is unavailable; refusing unassigned work.');
   const body = { action: decision.action, actionId: cryptoRandomId(), mindUpdate: decision.mindUpdate };
@@ -64,9 +104,26 @@ async function actOnce(agent) {
   const result = await apiRequest(identity, 'POST', `/v1/worlds/${state.worldId}/actions`, {
     ...body
   });
+  const selectedCandidate = candidates.find((candidate) => candidate.action === decision.action
+    && (!decision.sceneId || candidate.sceneId === decision.sceneId)) || null;
+  let fruitflyLearning = null;
+  if (fruitfly && fruitflyChoice && selectedCandidate) {
+    try {
+      fruitflyLearning = await fruitfly.learn(agent.agentId, observation, candidates, selectedCandidate, result);
+    } catch (error) {
+      console.error(JSON.stringify({ time: new Date().toISOString(), agent: agent.name,
+        fruitflyLearningError: String(error?.message || error).replace(/[\r\n\t]/g, ' ').slice(0, 160) }));
+    }
+  }
   console.log(JSON.stringify({ time: new Date().toISOString(), agent: agent.name, gender: agent.gender, action: result.action,
     goal: decision.goal, place: result.place, scene: result.scene?.name || null, energy: result.energy, food: result.food,
-    social: result.social, rewardUnits: result.rewardUnits, mineId: result.mineId || null }));
+    social: result.social, rewardUnits: result.rewardUnits, mineId: result.mineId || null, decisionSource,
+    ...(fruitflyChoice ? { fruitfly: { chosenFamily: fruitflyChoice.action, confidence: fruitflyChoice.confidence,
+      updatesBefore: fruitflyChoice.updates, ...(fruitflyLearning || {}) } } : {}),
+    skills: decision.skillIds || skillsForAction(decision.action),
+    ...(typesafe ? { model: typesafe.model, confidence: typesafe.confidence, inputTokens: typesafe.inputTokens,
+      inputCostUsd: typesafe.costUsd, monthlySpendUsd: typesafe.monthlySpendUsd } : {}),
+    ...(typesafe?.reason ? { typesafeFallback: typesafe.reason } : {}) }));
 }
 
 function cryptoRandomId() {
@@ -87,6 +144,7 @@ async function cycle() {
 }
 
 console.log(`Synterra runtime active for ${state.agents.length} agents; cycle interval ${TICK_MS} ms.`);
+if (!process.env.TYPESAFE_API_KEY) console.log('TypeSafe is not configured; agents are using local decision rules. Set TYPESAFE_API_KEY in .env to enable it.');
 await cycle();
 if (process.argv.includes('--once')) await stop();
 const timer = setInterval(() => { if (!stopping) cycle(); }, TICK_MS);
