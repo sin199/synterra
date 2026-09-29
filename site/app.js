@@ -1,6 +1,8 @@
 const worldCount = document.querySelector('#world-count');
 const residentCount = document.querySelector('#resident-count');
 const chainId = document.querySelector('#chain-id');
+const mineCount = document.querySelector('#mine-count');
+const mineOutput = document.querySelector('#mine-output');
 const statsState = document.querySelector('#stats-state');
 
 function displayCount(value) {
@@ -15,6 +17,8 @@ async function loadStats() {
     worldCount.textContent = displayCount(stats.openWorlds);
     residentCount.textContent = displayCount(stats.residents);
     chainId.textContent = displayCount(stats.chainId);
+    mineCount.textContent = displayCount(stats.activeMines);
+    mineOutput.textContent = displayCount(Number(stats.extractedUnits));
     statsState.textContent = '· Updated just now';
   } catch {
     statsState.textContent = '· Snapshot unavailable';

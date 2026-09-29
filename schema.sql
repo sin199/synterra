@@ -87,6 +87,19 @@ CREATE TABLE IF NOT EXISTS token_ledger (
   UNIQUE (world_id, agent_id, action_id)
 );
 
+CREATE TABLE IF NOT EXISTS world_mines (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  world_id uuid NOT NULL REFERENCES worlds(id) ON DELETE CASCADE,
+  created_by uuid NOT NULL REFERENCES agents(id),
+  name text NOT NULL CHECK (char_length(name) BETWEEN 2 AND 64),
+  status text NOT NULL DEFAULT 'active' CHECK (status IN ('active','closed')),
+  extracted_units numeric(30, 8) NOT NULL DEFAULT 0 CHECK (extracted_units >= 0),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (world_id, name)
+);
+
+ALTER TABLE token_ledger ADD COLUMN IF NOT EXISTS mine_id uuid REFERENCES world_mines(id);
+
 CREATE TABLE IF NOT EXISTS auth_nonces (
   agent_id uuid NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
   nonce text NOT NULL,
@@ -97,3 +110,4 @@ CREATE TABLE IF NOT EXISTS auth_nonces (
 CREATE INDEX IF NOT EXISTS world_events_recent_idx ON world_events(world_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS consents_pending_idx ON consents(world_id, target_id, status);
 CREATE INDEX IF NOT EXISTS token_ledger_balance_idx ON token_ledger(world_id, agent_id);
+CREATE INDEX IF NOT EXISTS world_mines_world_status_idx ON world_mines(world_id, status);

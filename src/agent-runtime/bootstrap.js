@@ -59,4 +59,16 @@ for (const agent of state.agents) {
   console.log(`Joined ${agent.name} to Synterra`);
 }
 
-console.log(`Synterra initialized: ${state.agents.length} signed agents, 5 female / 5 male. Identity files: ${IDENTITY_DIR}`);
+state.mineCreateActionId ||= randomUUID();
+await saveState(state);
+if (!state.mineId) {
+  const identity = { agentId: owner.agentId, privateKey: (await ensureAgentKeys(1)).privateKey };
+  const mine = await apiRequest(identity, 'POST', `/v1/worlds/${state.worldId}/mines`, {
+    name: 'Genesis Mine', actionId: state.mineCreateActionId
+  });
+  state.mineId = mine.id;
+  await saveState(state);
+  console.log(`Created ${mine.name} (${mine.id})`);
+}
+
+console.log(`Synterra initialized: ${state.agents.length} signed agents, 5 female / 5 male, mine ${state.mineId}. Identity files: ${IDENTITY_DIR}`);

@@ -120,7 +120,11 @@ app.get('/public/stats', async (_request, reply) => {
     pool.query('SELECT count(*)::int AS count FROM worlds WHERE open=true'),
     pool.query('SELECT count(*)::int AS count FROM world_members m JOIN worlds w ON w.id=m.world_id WHERE w.open=true')
   ]);
-  return { openWorlds: worlds.rows[0].count, residents: residents.rows[0].count, chainId: CHAIN_ID };
+  const mines = await pool.query(`SELECT count(*) FILTER (WHERE status='active')::int AS active,
+      COALESCE(sum(extracted_units),0)::text AS extracted_units
+    FROM world_mines m JOIN worlds w ON w.id=m.world_id WHERE w.open=true`);
+  return { openWorlds: worlds.rows[0].count, residents: residents.rows[0].count, chainId: CHAIN_ID,
+    activeMines: mines.rows[0].active, extractedUnits: mines.rows[0].extracted_units };
 });
 
 app.post('/v1/agents/challenges', async () => {
@@ -229,6 +233,25 @@ app.post('/v1/worlds/:worldId/token', async (request, reply) => {
   return reply.send(result);
 });
 
+app.post('/v1/worlds/:worldId/mines', async (request, reply) => {
+  const { worldId } = request.params;
+  const { actionId, name } = request.body || {};
+  if (!validUuid(worldId) || !requiredString(name, 2, 64)) return fail(reply, 400, 'MINE_FIELDS_INVALID');
+  const id = requireActionId({ actionId });
+  const result = await transaction(async (client) => {
+    const world = await client.query('SELECT owner_agent_id FROM worlds WHERE id=$1 FOR UPDATE', [worldId]);
+    if (!world.rowCount) throw Object.assign(new Error('WORLD_NOT_FOUND'), { statusCode: 404 });
+    if (world.rows[0].owner_agent_id !== request.agentId) throw Object.assign(new Error('WORLD_OWNER_REQUIRED'), { statusCode: 403 });
+    const duplicate = await client.query('SELECT data FROM world_events WHERE world_id=$1 AND actor_id=$2 AND action_id=$3', [worldId, request.agentId, id]);
+    if (duplicate.rowCount) return duplicate.rows[0].data;
+    const mine = (await client.query(`INSERT INTO world_mines(world_id,created_by,name)
+      VALUES($1,$2,$3) RETURNING id,world_id,created_by,name,status,extracted_units,created_at`, [worldId, request.agentId, name.trim()])).rows[0];
+    await client.query("INSERT INTO world_events(world_id,actor_id,event_type,data,action_id) VALUES($1,$2,'mine.created',$3,$4)", [worldId, request.agentId, mine, id]);
+    return mine;
+  });
+  return reply.code(201).send(result);
+});
+
 async function assertMember(client, worldId, agentId, lock = false) {
   const query = await client.query(`SELECT m.*,w.year_seconds FROM world_members m JOIN worlds w ON w.id=m.world_id WHERE m.world_id=$1 AND m.agent_id=$2${lock ? ' FOR UPDATE OF m' : ''}`, [worldId, agentId]);
   if (!query.rowCount) throw Object.assign(new Error('AGENT_NOT_IN_WORLD'), { statusCode: 403 });
@@ -257,14 +280,15 @@ app.get('/v1/worlds/:worldId/observe', async (request, reply) => {
   const me = await pool.query(`SELECT m.*,w.name AS world_name,w.owner_agent_id,w.chain_id,w.token_address,w.token_name,w.token_symbol,w.token_status,w.year_seconds
     FROM world_members m JOIN worlds w ON w.id=m.world_id WHERE m.world_id=$1 AND m.agent_id=$2`, [worldId, request.agentId]);
   if (!me.rowCount) return fail(reply, 403, 'AGENT_NOT_IN_WORLD');
-  const [members, events, consents, balance] = await Promise.all([
+  const [members, events, consents, balance, mines] = await Promise.all([
     pool.query(`SELECT a.id,a.name,a.gender,m.role,m.energy,m.food,m.social,m.location,
       CASE WHEN m.birth_at IS NULL THEN m.declared_age_years ELSE floor(extract(epoch from (now()-m.birth_at))/w.year_seconds)::int END AS age_years
       FROM world_members m JOIN agents a ON a.id=m.agent_id JOIN worlds w ON w.id=m.world_id WHERE m.world_id=$1 ORDER BY m.joined_at`, [worldId]),
     pool.query('SELECT id,actor_id,event_type,data,created_at FROM world_events WHERE world_id=$1 ORDER BY id DESC LIMIT 30', [worldId]),
     pool.query(`SELECT id,requester_id,target_id,scope,status,created_at,expires_at FROM consents
       WHERE world_id=$1 AND (requester_id=$2 OR target_id=$2) AND status IN ('pending','accepted') ORDER BY created_at DESC LIMIT 30`, [worldId, request.agentId]),
-    pool.query('SELECT COALESCE(sum(amount),0)::text AS units FROM token_ledger WHERE world_id=$1 AND agent_id=$2', [worldId, request.agentId])
+    pool.query('SELECT COALESCE(sum(amount),0)::text AS units FROM token_ledger WHERE world_id=$1 AND agent_id=$2', [worldId, request.agentId]),
+    pool.query(`SELECT id,name,status,extracted_units,created_at FROM world_mines WHERE world_id=$1 ORDER BY created_at`, [worldId])
   ]);
   const self = me.rows[0];
   return {
@@ -272,14 +296,15 @@ app.get('/v1/worlds/:worldId/observe', async (request, reply) => {
       token: self.token_address ? { address: self.token_address, name: self.token_name, symbol: self.token_symbol, status: self.token_status } : null,
       internalUnitsAreOnChain: false, yearSeconds: self.year_seconds },
     self: { agentId: request.agentId, role: self.role, ageYears: ageYears(self), energy: self.energy, food: self.food, social: self.social, location: self.location, internalTokenUnits: balance.rows[0].units },
-    members: members.rows, events: events.rows, consents: consents.rows
+    members: members.rows, events: events.rows, consents: consents.rows, mines: mines.rows
   };
 });
 
 app.post('/v1/worlds/:worldId/actions', async (request, reply) => {
   const { worldId } = request.params;
-  const { actionId, action, place } = request.body || {};
-  if (!validUuid(worldId) || !['work','rest','eat','socialize'].includes(action) || (place !== undefined && !requiredString(place, 1, 64))) return fail(reply, 400, 'ACTION_INVALID');
+  const { actionId, action, place, mineId } = request.body || {};
+  if (!validUuid(worldId) || !['work','rest','eat','socialize'].includes(action) || (place !== undefined && !requiredString(place, 1, 64)) ||
+      (mineId !== undefined && !validUuid(mineId)) || (action !== 'work' && mineId !== undefined)) return fail(reply, 400, 'ACTION_INVALID');
   const id = requireActionId({ actionId });
   const result = await transaction(async (client) => {
     const member = await assertMember(client, worldId, request.agentId, true);
@@ -287,18 +312,28 @@ app.post('/v1/worlds/:worldId/actions', async (request, reply) => {
     if (prior.rowCount) return prior.rows[0].data;
     let { energy, food, social } = member;
     let reward = 0;
+    let mine = null;
     if (action === 'work') {
       if (energy < 8 || food < 10 || social < 10) throw Object.assign(new Error('WORK_NEEDS_NOT_MET'), { statusCode: 409 });
+      if (mineId) {
+        const result = await client.query("SELECT id FROM world_mines WHERE id=$1 AND world_id=$2 AND status='active' FOR UPDATE", [mineId, worldId]);
+        if (!result.rowCount) throw Object.assign(new Error('ACTIVE_MINE_NOT_FOUND'), { statusCode: 404 });
+        mine = result.rows[0];
+      }
       energy -= 8; food -= 5; social -= 3; reward = MINING_REWARD;
     } else if (action === 'rest') energy = Math.min(100, energy + 40);
     else if (action === 'eat') { food = Math.min(100, food + 45); energy = Math.min(100, energy + 10); social = Math.min(100, social + 5); }
     else social = Math.min(100, social + 30);
-    const response = { action, agentId: request.agentId, place: place || member.location, energy, food, social, rewardUnits: reward, rewardSymbol: null };
+    const response = { action, agentId: request.agentId, place: place || member.location, energy, food, social, rewardUnits: reward, rewardSymbol: null,
+      ...(mine ? { mineId: mine.id } : {}) };
     await client.query('UPDATE world_members SET energy=$3,food=$4,social=$5,location=$6 WHERE world_id=$1 AND agent_id=$2', [worldId, request.agentId, energy, food, social, place || member.location]);
     const token = await client.query('SELECT token_symbol FROM worlds WHERE id=$1', [worldId]);
     response.rewardSymbol = token.rows[0].token_symbol;
     await client.query('INSERT INTO world_events(world_id,actor_id,event_type,data,action_id) VALUES($1,$2,$3,$4,$5)', [worldId, request.agentId, `action.${action}`, response, id]);
-    if (reward) await client.query("INSERT INTO token_ledger(world_id,agent_id,amount,entry_type,reason,action_id) VALUES($1,$2,$3,'mined','verified world work',$4)", [worldId, request.agentId, reward, id]);
+    if (reward) {
+      await client.query("INSERT INTO token_ledger(world_id,agent_id,amount,entry_type,reason,action_id,mine_id) VALUES($1,$2,$3,'mined','verified world work',$4,$5)", [worldId, request.agentId, reward, id, mine?.id || null]);
+      if (mine) await client.query('UPDATE world_mines SET extracted_units=extracted_units+$2 WHERE id=$1', [mine.id, reward]);
+    }
     return response;
   });
   return reply.send(result);

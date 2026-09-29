@@ -58,11 +58,13 @@ async function actOnce(agent) {
   const identity = { agentId: agent.agentId, privateKey };
   const observation = await apiRequest(identity, 'GET', `/v1/worlds/${state.worldId}/observe`);
   const action = chooseAction(observation.self);
+  const activeMine = observation.mines?.find((mine) => mine.id === state.mineId && mine.status === 'active');
+  if (action === 'work' && !activeMine) throw new Error('Configured Genesis Mine is unavailable; refusing unassigned work.');
   const result = await apiRequest(identity, 'POST', `/v1/worlds/${state.worldId}/actions`, {
-    action, actionId: cryptoRandomId()
+    action, actionId: cryptoRandomId(), ...(action === 'work' ? { mineId: activeMine.id } : {})
   });
   console.log(JSON.stringify({ time: new Date().toISOString(), agent: agent.name, gender: agent.gender, action,
-    energy: result.energy, food: result.food, social: result.social, rewardUnits: result.rewardUnits }));
+    energy: result.energy, food: result.food, social: result.social, rewardUnits: result.rewardUnits, mineId: result.mineId || null }));
 }
 
 function cryptoRandomId() {
