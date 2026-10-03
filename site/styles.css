@@ -14,6 +14,11 @@
 .map-summary>div:last-child{border:0;margin-left:auto}
 .map-summary strong{font:600 20px var(--display);color:var(--lime)}
 .map-summary>div>span{font:9px var(--mono);color:#8e9a87;letter-spacing:.4px}
+.map-summary .map-world-clock{gap:7px}
+.map-world-clock strong{font:600 17px var(--mono);color:#e5eddb}
+.map-world-clock>span{white-space:nowrap}
+.map-world-clock i{font:8px var(--mono);font-style:normal;color:var(--lime);letter-spacing:.5px}
+.map-world-clock i.is-offline{color:#e29272}
 .map-freshness{align-items:center!important;white-space:nowrap}
 .map-status-dot{width:7px;height:7px;flex:none;border-radius:50%;background:var(--lime);box-shadow:0 0 10px rgba(201,243,106,.65)}
 .map-status-dot.is-error{background:#e29272;box-shadow:0 0 9px rgba(226,146,114,.5)}
@@ -30,6 +35,8 @@
 .map-locations{position:absolute;inset:0}
 .map-loading{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);margin:0;color:#a2ae99;font-size:12px}
 .map-location{position:absolute;transform:translate(-50%,-50%);display:flex;flex-direction:column;align-items:center;gap:7px;width:150px;z-index:1}
+.map-exchange{z-index:2;width:118px;gap:4px}
+.map-exchange .map-place-label{border-color:rgba(201,243,106,.45);color:var(--lime);font:9px var(--mono);letter-spacing:.5px}
 .map-place-label{display:flex;align-items:center;gap:7px;max-width:150px;min-height:30px;padding:5px 9px;border:1px solid rgba(205,232,184,.19);background:rgba(19,29,21,.95);box-shadow:0 5px 15px rgba(0,0,0,.25);color:#cad5c0}
 .map-place-icon{color:var(--lime);font-size:14px;line-height:1}
 .map-place-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font:9px var(--mono);letter-spacing:.1px}
@@ -87,3 +94,48 @@
 @media(max-width:620px){.map-legend{min-width:720px}}
 .map-location[data-scene-type="data_center"] .map-place-label{border-color:rgba(125,190,220,.55);background:linear-gradient(135deg,rgba(31,61,74,.97),rgba(19,29,35,.97));}
 .map-location[data-scene-type="data_center"] .map-place-icon{color:#9ce4fa;text-shadow:0 0 10px rgba(102,206,239,.65);}
+.scene-map.is-3d .map-terrain,.scene-map.is-3d .map-center,.scene-map.is-3d #map-locations{display:none}
+.world3d-canvas{position:absolute;inset:0;width:100%;height:100%;display:block;touch-action:none;cursor:grab;outline:0}
+.world3d-canvas:active{cursor:grabbing}
+.world3d-canvas:focus-visible{box-shadow:inset 0 0 0 2px rgba(201,243,106,.8)}
+.world3d-labels{position:absolute;inset:0;z-index:2;pointer-events:none;overflow:hidden}
+.world3d-labels [hidden]{display:none!important}
+.world3d-scene-label{position:absolute;transform:translate(-50%,-50%);max-width:96px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:3px 6px;border:1px solid rgba(205,232,184,.22);background:rgba(17,26,20,.88);color:#d6e2cc;font:8px var(--mono);letter-spacing:.2px;text-shadow:0 1px 4px #0a100c}
+.world3d-agent-label{position:absolute;transform:translate(-50%,-50%);display:grid;place-items:center;width:22px;height:22px;padding:0;border-radius:50%;border:1px solid rgba(201,243,106,.82);background:#c9f36a;color:#1b2816;font:700 7px var(--mono);box-shadow:0 0 0 3px rgba(201,243,106,.16),0 3px 9px rgba(0,0,0,.4);cursor:pointer;pointer-events:auto}
+.world3d-agent-label:hover,.world3d-agent-label:focus-visible,.world3d-agent-label.is-selected{transform:translate(-50%,-55%) scale(1.17);background:#efffc5;outline:2px solid rgba(239,255,197,.48);outline-offset:2px}
+.world3d-market-label{position:absolute;z-index:2;transform:translate(-50%,-50%);width:min(205px,34vw);display:grid;gap:3px;padding:7px 9px;border:1px solid rgba(101,220,196,.5);background:linear-gradient(135deg,rgba(11,31,30,.96),rgba(15,23,20,.94));box-shadow:0 0 25px rgba(75,213,191,.13),inset 0 0 20px rgba(64,170,153,.08);color:#d7eee5;text-align:left;pointer-events:none}
+.world3d-market-title{color:#b8f2dc;font:700 9px var(--mono);letter-spacing:1.1px}
+.world3d-market-ticker{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#f2f5df;font:600 10px var(--mono)}
+.world3d-market-status{color:#8eaa9f;font:8px var(--mono);letter-spacing:.35px}
+.world3d-market-label[data-live="true"] .world3d-market-status{color:#98e9b1}
+.world3d-agent-label{overflow:visible}
+.world3d-agent-initials{display:grid;place-items:center;width:100%;height:100%;border-radius:50%}
+.world3d-agent-action{position:absolute;left:50%;top:100%;transform:translate(-50%,-1px);max-width:68px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:2px 4px;border:1px solid rgba(211,236,198,.22);border-radius:2px;background:rgba(15,24,18,.94);color:#d5e8c6;font:7px var(--mono);pointer-events:none}
+.world3d-agent-action[hidden]{display:none}
+.world3d-agent-action[data-kind="trade"]{border-color:rgba(104,223,191,.6);background:rgba(13,48,40,.96);color:#a6f1d8}
+.world3d-agent-action[data-kind="work"]{border-color:rgba(201,243,106,.45);color:#d9f28d}
+.world3d-agent-action[data-kind="travel"]{border-color:rgba(111,185,228,.45);color:#b3def7}
+
+/* Synterra internal simulated spot market */
+.market-dashboard{margin:0 0 22px;padding:22px;border:1px solid rgba(201,243,106,.2);background:linear-gradient(145deg,rgba(20,31,23,.96),rgba(16,24,18,.96));scroll-margin-top:24px}
+.market-dashboard-heading,.market-card-heading{display:flex;align-items:end;justify-content:space-between;gap:18px}
+.market-dashboard-heading h3{font:500 23px var(--display);letter-spacing:-.6px;margin:7px 0 0}
+.market-disclosure,.market-card-heading>span,.market-updated{font:9px var(--mono);color:#83917b}
+.market-dashboard-grid{display:grid;grid-template-columns:minmax(250px,.8fr) minmax(300px,1.2fr);gap:12px;margin-top:18px}
+.market-card{min-width:0;padding:17px;border:1px solid rgba(224,238,211,.09);background:rgba(17,26,20,.72)}
+.market-card h4{margin:0 0 12px;color:#cbd7c2;font:500 12px var(--display)}
+.market-quote-row,.portfolio-row{display:flex;align-items:center;justify-content:space-between;gap:15px;padding:10px 0;border-top:1px solid rgba(224,238,211,.07)}
+.market-asset{display:grid;gap:3px}.market-asset strong{font:600 11px var(--mono);color:var(--lime)}.market-asset span,.portfolio-row>span{font-size:10px;color:#8d9b87}
+.market-price,.portfolio-row strong{font:500 12px var(--mono);color:#e1ead9;white-space:nowrap}
+.market-updated{margin:12px 0 0}
+.portfolio-summary{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:0 18px}
+.market-empty{margin:0;color:#83917b;font-size:10px;line-height:1.7}
+.recent-trades-card{margin-top:12px}
+.market-card-heading{margin-bottom:9px}.market-card-heading h4{margin:0}
+.recent-trades{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px;margin:0;padding:0;list-style:none}
+.recent-trades>li:not(.market-empty){display:flex;align-items:center;justify-content:space-between;gap:12px;min-width:0;padding:10px 12px;border:1px solid rgba(224,238,211,.07);background:rgba(21,31,23,.55)}
+.trade-details{display:grid;gap:4px;min-width:0}.trade-details strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#dbe4d4;font-size:10px;font-weight:600}.trade-details span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#879380;font:8px var(--mono)}
+.recent-trades time{flex:none;color:#7f8b78;font:8px var(--mono)}
+.recent-trades>.market-empty{grid-column:1/-1;padding:8px 0}
+@media(max-width:760px){.market-dashboard{padding:16px}.market-dashboard-heading{align-items:flex-start;flex-direction:column;gap:8px}.market-dashboard-grid{grid-template-columns:1fr}.portfolio-summary{grid-template-columns:1fr}.recent-trades{grid-template-columns:1fr}.market-disclosure{font-size:8px}}
+.world3d-hint{color:#9cac8e!important}

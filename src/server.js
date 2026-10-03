@@ -4,18 +4,36 @@ import { createHash, createPublicKey, randomBytes, randomUUID, timingSafeEqual, 
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
+import { chargeMeal, MEAL_COST_UNITS } from './economy.js';
+import { payAdultServiceProvider, parseAdultServicePrice, refundAdultServiceFunds, reserveAdultServiceFunds } from './adult-services.js';
+import { MESSAGE_TEMPLATES, messageText } from './message-templates.js';
+import { formatUnits, parsePositiveUnits, simulatedQuotes } from './crypto-market.js';
+import { accountSnapshot, ensureCryptoAccount, executeCryptoTrade, MAX_ASSET_NAV_BPS, MAX_ORDER_NAV_BPS, SPREAD_BPS, STARTING_USDC, TRADE_FEE_BPS } from './crypto-trading.js';
+import { formatRawTokenAmount, readRobinhoodMarket, scanRobinhoodMarket } from './robinhood-market.js';
+import { executeRobinhoodPaperTrade, readRobinhoodPaperAccount } from './robinhood-paper-trading.js';
+import { loadState, STATE_DIR } from './agent-runtime/client.js';
+import { createFruitflyRuntime } from './agent-runtime/fruitfly.js';
+import { chooseWithTypeSafe } from './agent-runtime/typesafe.js';
+import { startWorldEngine, worldClock } from './world-engine.js';
 
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const SITE_ROOT = path.join(ROOT, 'site');
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 const app = Fastify({ logger: false, bodyLimit: 1_000_000 });
 const challenges = new Map();
+let worldEngine = { running: false, reason: 'starting' };
 const HOST = process.env.HOST || '127.0.0.1';
 const PORT = Number(process.env.PORT || 8787);
-const CHAIN_ID = Number(process.env.ROBINHOOD_CHAIN_ID || 4663);
-const YEAR_SECONDS = Math.max(3600, Number(process.env.WORLD_YEAR_SECONDS || 86400));
+const ARC_ENV = process.env.ARC_ENV || 'mainnet';
+const ARC_CHAIN_IDS = Object.freeze({ mainnet: 5042, testnet: 5042002 });
+if (!Object.hasOwn(ARC_CHAIN_IDS, ARC_ENV)) {
+  throw new Error('ARC_ENV must be either "mainnet" or "testnet".');
+}
+const CHAIN_ID = ARC_CHAIN_IDS[ARC_ENV];
 const MINING_REWARD = Number(process.env.MINING_REWARD_UNITS || 5);
 const RUN_COST = Number(process.env.WORLD_RUN_COST_PER_UNIT || 1);
+const ROBINHOOD_SCAN_INTERVAL_MS = Math.max(15_000, Math.min(300_000, Number(process.env.ROBINHOOD_SCAN_INTERVAL_MS) || 30_000));
+let cachedCryptoQuoteMinute = -1;
 
 app.decorateRequest('rawBody', null);
 app.decorateRequest('agentId', null);
@@ -71,9 +89,42 @@ function requireActionId(body) {
   return body.actionId;
 }
 
+async function updateAgentMind(client, worldId, agentId, currentGoal, kind, summary) {
+  const previousMind = await client.query('SELECT archetype,traits,memories FROM agent_minds WHERE world_id=$1 AND agent_id=$2 FOR UPDATE', [worldId, agentId]);
+  const oldMemories = Array.isArray(previousMind.rows[0]?.memories) ? previousMind.rows[0].memories : [];
+  const memories = [...oldMemories, { kind, summary, at: new Date().toISOString() }].slice(-24);
+  const archetype = previousMind.rows[0]?.archetype || 'observer';
+  const traits = previousMind.rows[0]?.traits || { curiosity: 0.6, sociability: 0.5, craft: 0.5 };
+  await client.query(`INSERT INTO agent_minds(world_id,agent_id,archetype,traits,current_goal,memories,actions_taken)
+    VALUES($1,$2,$3,$4,$5,$6,1)
+    ON CONFLICT(world_id,agent_id) DO UPDATE SET current_goal=EXCLUDED.current_goal,memories=EXCLUDED.memories,
+      actions_taken=agent_minds.actions_taken+1,updated_at=now()`,
+  [worldId, agentId, archetype, JSON.stringify(traits), currentGoal, JSON.stringify(memories)]);
+}
+
+async function refreshCryptoQuotes(client = pool) {
+  const nowMinute = Math.floor(Date.now() / 60_000);
+  if (cachedCryptoQuoteMinute === nowMinute) return;
+  for (const quote of simulatedQuotes()) {
+    await client.query(`INSERT INTO crypto_market_quotes(symbol,price_usd,quote_version,as_of,source)
+      VALUES($1,$2,$3,$4,$5) ON CONFLICT(symbol) DO UPDATE SET price_usd=EXCLUDED.price_usd,
+        quote_version=EXCLUDED.quote_version,as_of=EXCLUDED.as_of,source=EXCLUDED.source`,
+    [quote.symbol, quote.priceUsd, quote.quoteVersion, quote.asOf, quote.source]);
+  }
+  cachedCryptoQuoteMinute = nowMinute;
+}
+
+async function readCryptoQuotes(client = pool) {
+  await refreshCryptoQuotes(client);
+  const result = await client.query(`SELECT symbol,asset.name,price_usd::text AS "priceUsd",quote_version AS "quoteVersion",
+      as_of AS "asOf",source FROM crypto_market_quotes quote JOIN crypto_assets asset USING(symbol)
+      ORDER BY CASE symbol WHEN 'BTC' THEN 1 WHEN 'ETH' THEN 2 ELSE 3 END`);
+  return result.rows.map((row) => ({ ...row, quoteVersion: Number(row.quoteVersion) }));
+}
+
 app.addHook('preHandler', async (request, reply) => {
   const pathOnly = request.raw.url?.split('?')[0] || '';
-  if (pathOnly === '/' || pathOnly === '/styles.css' || pathOnly === '/app.js' || pathOnly === '/public/stats' ||
+  if (pathOnly === '/' || pathOnly === '/styles.css' || pathOnly === '/app.js' || pathOnly === '/world3d.js' || pathOnly === '/public/stats' ||
       pathOnly === '/local/map-data' || pathOnly === '/health' || pathOnly === '/v1/agents/challenges' || pathOnly === '/v1/agents') return;
 
   const agentId = request.headers['x-agent-id'];
@@ -122,6 +173,12 @@ app.get('/app.js', async (_request, reply) => {
   return readFile(path.join(SITE_ROOT, 'app.js'));
 });
 
+app.get('/world3d.js', async (_request, reply) => {
+  reply.header('Content-Type', 'text/javascript; charset=utf-8');
+  reply.header('X-Content-Type-Options', 'nosniff');
+  return readFile(path.join(SITE_ROOT, 'world3d.js'));
+});
+
 app.get('/health', async () => ({ ok: true, service: 'synterra', chainId: CHAIN_ID }));
 
 app.get('/public/stats', async (_request, reply) => {
@@ -144,32 +201,86 @@ app.get('/local/map-data', async (_request, reply) => {
     FROM worlds WHERE open=true ORDER BY created_at DESC LIMIT 1`);
   if (!world.rowCount) return { world: null, scenes: [], residents: [], events: [], dataCenterLogs: [], generatedAt: new Date().toISOString() };
   const worldId = world.rows[0].id;
-  const [scenes, residents, events, dataCenterLogs] = await Promise.all([
+  const cryptoQuotes = await readCryptoQuotes();
+  const robinhoodMarket = await readRobinhoodMarket(pool);
+  const [scenes, residents, events, dataCenterLogs, cryptoPortfolios, cryptoTrades, memePortfolios, memeTrades, clock] = await Promise.all([
     pool.query(`SELECT s.id,s.name,s.scene_type AS "sceneType",s.status,s.created_at AS "createdAt",
       (SELECT count(*)::int FROM world_members m WHERE m.world_id=s.world_id AND m.location=s.name) AS "residentCount"
       FROM world_scenes s WHERE s.world_id=$1 ORDER BY s.created_at,s.id`, [worldId]),
     pool.query(`SELECT a.id,a.name,a.gender,m.energy,m.food,m.social,m.location,
+        coalesce(ws.happiness,60) AS happiness,coalesce(ws.knowledge,20) AS knowledge,
+        coalesce(ws.goal,'balanced') AS goal,ws.risk_tolerance::text AS "riskTolerance",
+        coalesce(ws.status,'idle') AS "currentStatus",ws.planned_action AS "currentAction",
+        ws.target_location AS "targetLocation",ws.movement_started_at AS "movementStartedAt",
+        ws.movement_ends_at AS "movementEndsAt",ws.action_started_at AS "actionStartedAt",ws.action_ends_at AS "actionEndsAt",
         am.archetype,am.current_goal AS "currentGoal",am.actions_taken AS "actionsTaken",am.updated_at AS "mindUpdatedAt",
-        recent.event_type AS "lastEventType",recent.created_at AS "lastEventAt",recent.place AS "lastEventPlace"
+        coalesce((SELECT balance::text FROM crypto_balances b WHERE b.world_id=m.world_id AND b.agent_id=m.agent_id AND b.asset_symbol='USDC'),'0') AS "usdcBalance",
+        coalesce((SELECT balance::text FROM crypto_balances b WHERE b.world_id=m.world_id AND b.agent_id=m.agent_id AND b.asset_symbol='BTC'),'0') AS "btcBalance",
+        coalesce((SELECT balance::text FROM crypto_balances b WHERE b.world_id=m.world_id AND b.agent_id=m.agent_id AND b.asset_symbol='ETH'),'0') AS "ethBalance",
+        recent.event_type AS "lastEventType",recent.action AS "lastEventAction",recent.created_at AS "lastEventAt",recent.place AS "lastEventPlace"
       FROM world_members m JOIN agents a ON a.id=m.agent_id
+      LEFT JOIN world_agent_states ws ON ws.world_id=m.world_id AND ws.agent_id=m.agent_id
       LEFT JOIN agent_minds am ON am.world_id=m.world_id AND am.agent_id=m.agent_id
       LEFT JOIN LATERAL (
-        SELECT e.event_type,e.created_at,e.data->>'place' AS place
-        FROM world_events e WHERE e.world_id=m.world_id AND e.actor_id=m.agent_id AND e.event_type LIKE 'action.%'
+        SELECT e.event_type,e.created_at,coalesce(e.data->>'place',e.data->>'to') AS place,e.data->>'action' AS action
+        FROM world_events e WHERE e.world_id=m.world_id AND e.actor_id=m.agent_id
+          AND (e.event_type LIKE 'action.%' OR e.event_type LIKE 'world.%' OR e.event_type LIKE 'crypto.%')
         ORDER BY e.id DESC LIMIT 1
       ) recent ON true
       WHERE m.world_id=$1 ORDER BY m.joined_at,a.name`, [worldId]),
-    pool.query(`SELECT a.name AS "agentName",e.event_type AS "eventType",e.data->>'place' AS place,e.created_at AS "createdAt"
+    pool.query(`SELECT a.name AS "agentName",e.event_type AS "eventType",coalesce(e.data->>'place',e.data->>'to') AS place,
+        e.data->>'action' AS action,e.data->>'side' AS side,e.data->>'asset' AS asset,e.created_at AS "createdAt"
       FROM world_events e JOIN agents a ON a.id=e.actor_id
-      WHERE e.world_id=$1 AND (e.event_type LIKE 'action.%' OR e.event_type='scene.created')
+      WHERE e.world_id=$1 AND (e.event_type LIKE 'action.%' OR e.event_type='scene.created' OR e.event_type LIKE 'crypto.%' OR e.event_type LIKE 'world.%')
       ORDER BY e.id DESC LIMIT 24`, [worldId]),
-    pool.query(`SELECT a.name AS "agentName",e.event_type AS "eventType",e.data->>'place' AS place,e.created_at AS "createdAt"
+    pool.query(`SELECT a.name AS "agentName",e.event_type AS "eventType",coalesce(e.data->>'place',e.data->>'to') AS place,
+        e.data->>'action' AS action,e.data->>'side' AS side,e.data->>'asset' AS asset,e.created_at AS "createdAt"
       FROM world_events e JOIN agents a ON a.id=e.actor_id
-      WHERE e.world_id=$1 AND (e.event_type LIKE 'action.%' OR e.event_type='scene.created')
-      ORDER BY e.id DESC LIMIT 100`, [worldId])
+      WHERE e.world_id=$1 AND (e.event_type LIKE 'action.%' OR e.event_type='scene.created' OR e.event_type LIKE 'crypto.%' OR e.event_type LIKE 'world.%')
+      ORDER BY e.id DESC LIMIT 100`, [worldId]),
+    pool.query(`SELECT a.id AS "agentId",a.name,
+        COALESCE(sum(b.balance * q.price_usd),0)::text AS "netAssetValueUsd",
+        COALESCE(sum(b.balance) FILTER (WHERE b.asset_symbol='USDC'),0)::text AS "usdcBalance",
+        COALESCE(sum(b.balance) FILTER (WHERE b.asset_symbol='BTC'),0)::text AS "btcBalance",
+        COALESCE(sum(b.balance) FILTER (WHERE b.asset_symbol='ETH'),0)::text AS "ethBalance"
+      FROM world_members m JOIN agents a ON a.id=m.agent_id
+      LEFT JOIN crypto_balances b ON b.world_id=m.world_id AND b.agent_id=m.agent_id
+      LEFT JOIN crypto_market_quotes q ON q.symbol=b.asset_symbol
+      WHERE m.world_id=$1 GROUP BY a.id,a.name ORDER BY min(m.joined_at),a.name`, [worldId]),
+    pool.query(`SELECT a.name AS "agentName",t.side,t.asset_symbol AS asset,t.quantity::text AS quantity,
+        t.price_usd::text AS "priceUsd",t.notional_usd::text AS "notionalUsd",t.fee_usdc::text AS "feeUsdc",
+        t.created_at AS "createdAt"
+      FROM crypto_trades t JOIN agents a ON a.id=t.agent_id WHERE t.world_id=$1
+      ORDER BY t.created_at DESC LIMIT 50`, [worldId]),
+    pool.query(`SELECT p.agent_id AS "agentId",round(sum(p.quantity_raw*q.price_usd/power(10::numeric,t.decimals)),8)::text AS "memeValueUsd"
+      FROM robinhood_paper_positions p JOIN robinhood_tokens t USING(token_address)
+      JOIN robinhood_market_quotes q USING(token_address) WHERE p.world_id=$1 GROUP BY p.agent_id`, [worldId]),
+    pool.query(`SELECT a.name AS "agentName",o.side,o.token_address AS "tokenAddress",o.token_amount_raw::text AS "quantityRaw",
+        t.decimals,o.data->>'priceUsd' AS "priceUsd",o.notional_usd::text AS "notionalUsd",
+        o.fee_usdc::text AS "feeUsdc",o.created_at AS "createdAt"
+      FROM robinhood_paper_orders o JOIN agents a ON a.id=o.agent_id JOIN robinhood_tokens t USING(token_address)
+      WHERE o.world_id=$1 ORDER BY o.created_at DESC LIMIT 50`, [worldId]),
+    worldClock(pool, worldId, worldEngine.running)
   ]);
-  return { world: world.rows[0], scenes: scenes.rows, residents: residents.rows, events: events.rows,
-    dataCenterLogs: dataCenterLogs.rows, generatedAt: new Date().toISOString() };
+  const portfolioByAgent = new Map(cryptoPortfolios.rows.map((portfolio) => [portfolio.agentId, portfolio]));
+  for (const resident of residents.rows) {
+    const portfolio = portfolioByAgent.get(resident.id);
+    resident.assets = { USDC: portfolio?.usdcBalance || resident.usdcBalance,
+      BTC: portfolio?.btcBalance || resident.btcBalance, ETH: portfolio?.ethBalance || resident.ethBalance };
+  }
+  const memeValueByAgent = new Map(memePortfolios.rows.map((row) => [row.agentId, Number(row.memeValueUsd || 0)]));
+  for (const portfolio of cryptoPortfolios.rows) {
+    portfolio.netAssetValueUsd = (Number(portfolio.netAssetValueUsd || 0) + (memeValueByAgent.get(portfolio.agentId) || 0)).toFixed(8);
+  }
+  const recentMemeTrades = memeTrades.rows.map((trade) => ({
+    ...trade, asset: `0x${trade.tokenAddress.slice(2, 10)}`, quantity: formatRawTokenAmount(trade.quantityRaw, trade.decimals),
+    simulatedMeme: true
+  }));
+  const recentTrades = [...cryptoTrades.rows, ...recentMemeTrades]
+    .sort((left, right) => new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime()).slice(0, 50);
+  return { world: { ...world.rows[0], engine: clock || { running: false } }, scenes: scenes.rows, residents: residents.rows, events: events.rows,
+    dataCenterLogs: dataCenterLogs.rows, trading: { simulated: true, quotes: cryptoQuotes, robinhood: robinhoodMarket,
+      portfolios: cryptoPortfolios.rows, recentTrades }, generatedAt: new Date().toISOString() };
 });
 
 app.post('/v1/agents/challenges', async () => {
@@ -215,8 +326,11 @@ app.post('/v1/worlds', async (request, reply) => {
     await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', [`${request.agentId}:${idempotencyKey}`]);
     const duplicate = await client.query('SELECT data FROM world_events WHERE actor_id=$1 AND action_id=$2', [request.agentId, idempotencyKey]);
     if (duplicate.rowCount) return duplicate.rows[0].data;
-    const world = (await client.query('INSERT INTO worlds(owner_agent_id,name,chain_id,year_seconds) VALUES($1,$2,$3,$4) RETURNING *', [request.agentId, name.trim(), CHAIN_ID, YEAR_SECONDS])).rows[0];
-    await client.query("INSERT INTO world_members(world_id,agent_id,role,declared_age_years) VALUES($1,$2,'owner',18)", [world.id, request.agentId]);
+    const world = (await client.query('INSERT INTO worlds(owner_agent_id,name,chain_id) VALUES($1,$2,$3) RETURNING *', [request.agentId, name.trim(), CHAIN_ID])).rows[0];
+    await client.query("INSERT INTO world_members(world_id,agent_id,role) VALUES($1,$2,'owner')", [world.id, request.agentId]);
+    await client.query('INSERT INTO crypto_risk_limits(world_id,starting_usdc,max_order_nav_bps,max_asset_nav_bps,fee_bps,spread_bps) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING',
+      [world.id, STARTING_USDC, MAX_ORDER_NAV_BPS, MAX_ASSET_NAV_BPS, TRADE_FEE_BPS, SPREAD_BPS]);
+    await ensureCryptoAccount(client, { worldId: world.id, agentId: request.agentId });
     const response = { worldId: world.id, name: world.name, chainId: world.chain_id, tokenStatus: world.token_status };
     await client.query("INSERT INTO world_events(world_id,actor_id,event_type,data,action_id) VALUES($1,$2,'world.created',$3,$4)", [world.id, request.agentId, response, idempotencyKey]);
     return response;
@@ -248,7 +362,8 @@ app.post('/v1/worlds/:worldId/join', async (request, reply) => {
     const world = await client.query('SELECT id,open FROM worlds WHERE id=$1 FOR UPDATE', [worldId]);
     if (!world.rowCount) throw Object.assign(new Error('WORLD_NOT_FOUND'), { statusCode: 404 });
     if (!world.rows[0].open) throw Object.assign(new Error('WORLD_CLOSED'), { statusCode: 403 });
-    await client.query('INSERT INTO world_members(world_id,agent_id,role,declared_age_years) VALUES($1,$2,\'resident\',18) ON CONFLICT DO NOTHING', [worldId, request.agentId]);
+    await client.query("INSERT INTO world_members(world_id,agent_id,role) VALUES($1,$2,'resident') ON CONFLICT DO NOTHING", [worldId, request.agentId]);
+    await ensureCryptoAccount(client, { worldId, agentId: request.agentId });
     const response = { worldId, joined: true };
     await client.query("INSERT INTO world_events(world_id,actor_id,event_type,data,action_id) VALUES($1,$2,'agent.joined',$3,$4)", [worldId, request.agentId, response, actionId]);
     return response;
@@ -319,38 +434,138 @@ app.post('/v1/worlds/:worldId/mines', async (request, reply) => {
 });
 
 async function assertMember(client, worldId, agentId, lock = false) {
-  const query = await client.query(`SELECT m.*,w.year_seconds FROM world_members m JOIN worlds w ON w.id=m.world_id WHERE m.world_id=$1 AND m.agent_id=$2${lock ? ' FOR UPDATE OF m' : ''}`, [worldId, agentId]);
+  const query = await client.query(`SELECT m.* FROM world_members m WHERE m.world_id=$1 AND m.agent_id=$2${lock ? ' FOR UPDATE' : ''}`, [worldId, agentId]);
   if (!query.rowCount) throw Object.assign(new Error('AGENT_NOT_IN_WORLD'), { statusCode: 403 });
   return query.rows[0];
 }
-function ageYears(member) {
-  return member.birth_at ? Math.floor((Date.now() - new Date(member.birth_at).getTime()) / 1000 / member.year_seconds) : member.declared_age_years;
-}
-async function assertAdults(client, worldId, a, b) {
-  const ma = await assertMember(client, worldId, a);
-  const mb = await assertMember(client, worldId, b);
-  if (ageYears(ma) < 18 || ageYears(mb) < 18) throw Object.assign(new Error('ADULT_AGENTS_ONLY'), { statusCode: 403 });
-  return [ma, mb];
-}
-async function areRelated(client, a, b) {
-  const result = await client.query(`WITH RECURSIVE
-    aa(id) AS (SELECT $1::uuid UNION SELECT o.parent_a FROM offspring o JOIN aa x ON o.claimed_agent_id=x.id UNION SELECT o.parent_b FROM offspring o JOIN aa x ON o.claimed_agent_id=x.id),
-    bb(id) AS (SELECT $2::uuid UNION SELECT o.parent_a FROM offspring o JOIN bb x ON o.claimed_agent_id=x.id UNION SELECT o.parent_b FROM offspring o JOIN bb x ON o.claimed_agent_id=x.id)
-    SELECT EXISTS(SELECT 1 FROM aa JOIN bb USING(id)) AS related`, [a,b]);
-  return result.rows[0].related;
-}
+app.get('/v1/worlds/:worldId/messages/inbox', async (request, reply) => {
+  const { worldId } = request.params;
+  if (!validUuid(worldId)) return fail(reply, 400, 'WORLD_ID_INVALID');
+  await assertMember(pool, worldId, request.agentId);
+  const requestedLimit = Number(request.query?.limit || 20);
+  const limit = Number.isInteger(requestedLimit) ? Math.min(20, Math.max(1, requestedLimit)) : 20;
+  const unreadOnly = request.query?.unreadOnly === 'true';
+  const [messages, recentContacts] = await Promise.all([
+    pool.query(`SELECT m.id,m.sender_id AS "senderId",m.template_id AS "templateId",
+        m.message_text AS text,m.reply_to_message_id AS "replyToMessageId",
+        m.created_at AS "createdAt",m.read_at AS "readAt"
+      FROM resident_messages m
+      WHERE m.world_id=$1 AND m.recipient_id=$2 AND ($4::boolean=false OR m.read_at IS NULL)
+      ORDER BY (m.read_at IS NULL) DESC,m.created_at DESC LIMIT $3`,
+    [worldId, request.agentId, limit, unreadOnly]),
+    pool.query(`SELECT DISTINCT recipient_id AS id FROM resident_messages
+      WHERE world_id=$1 AND sender_id=$2 AND created_at > now() - interval '6 hours'`, [worldId, request.agentId])
+  ]);
+  return {
+    messages: messages.rows.map((message) => ({
+      ...message,
+      templateKind: MESSAGE_TEMPLATES[message.templateId]?.kind || 'conversation'
+    })),
+    recentlyContactedIds: recentContacts.rows.map((row) => row.id)
+  };
+});
 
+app.post('/v1/worlds/:worldId/messages', async (request, reply) => {
+  const { worldId } = request.params;
+  const { actionId, recipientId, templateId, replyToMessageId, mindUpdate } = request.body || {};
+  if (!validUuid(worldId) || !validUuid(recipientId) || recipientId === request.agentId ||
+      !Object.hasOwn(MESSAGE_TEMPLATES, templateId) ||
+      (String(templateId).startsWith('reply_') !== (replyToMessageId !== undefined)) ||
+      (replyToMessageId !== undefined && !validUuid(replyToMessageId)) || !validMindUpdate(mindUpdate)) {
+    return fail(reply, 400, 'MESSAGE_INVALID');
+  }
+  const id = requireActionId({ actionId });
+  const bodyText = messageText(templateId);
+  const result = await transaction(async (client) => {
+    await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', [`${worldId}:${request.agentId}:${id}`]);
+    const prior = await client.query(`SELECT id,world_id,sender_id AS "senderId",recipient_id AS "recipientId",
+        template_id AS "templateId",reply_to_message_id AS "replyToMessageId",created_at AS "createdAt"
+      FROM resident_messages WHERE world_id=$1 AND sender_id=$2 AND action_id=$3`, [worldId, request.agentId, id]);
+    if (prior.rowCount) return { ...prior.rows[0], action: 'socialize' };
+    const sender = await assertMember(client, worldId, request.agentId, true);
+    const recipient = await client.query('SELECT agent_id FROM world_members WHERE world_id=$1 AND agent_id=$2', [worldId, recipientId]);
+    if (!recipient.rowCount) throw Object.assign(new Error('RECIPIENT_NOT_IN_WORLD'), { statusCode: 404 });
+    if (replyToMessageId) {
+      const original = await client.query(`SELECT id,template_id FROM resident_messages
+        WHERE id=$1 AND world_id=$2 AND sender_id=$3 AND recipient_id=$4 FOR UPDATE`,
+      [replyToMessageId, worldId, recipientId, request.agentId]);
+      if (!original.rowCount) throw Object.assign(new Error('REPLY_TARGET_NOT_FOUND'), { statusCode: 404 });
+      if (['reply_accept_company','reply_decline_company'].includes(templateId) && original.rows[0].template_id !== 'invite_company') {
+        throw Object.assign(new Error('INVITATION_REPLY_REQUIRES_INVITATION'), { statusCode: 409 });
+      }
+      await client.query('UPDATE resident_messages SET read_at=COALESCE(read_at,now()) WHERE id=$1', [replyToMessageId]);
+    }
+    const sentRecently = await client.query(`SELECT 1 FROM resident_messages
+      WHERE world_id=$1 AND sender_id=$2 AND recipient_id=$3 AND created_at > now() - interval '6 hours' LIMIT 1`,
+    [worldId, request.agentId, recipientId]);
+    if (!replyToMessageId && sentRecently.rowCount) throw Object.assign(new Error('MESSAGE_RECIPIENT_COOLDOWN'), { statusCode: 429 });
+    const message = (await client.query(`INSERT INTO resident_messages
+        (world_id,sender_id,recipient_id,template_id,message_text,reply_to_message_id,action_id)
+      VALUES($1,$2,$3,$4,$5,$6,$7)
+      RETURNING id,world_id,sender_id AS "senderId",recipient_id AS "recipientId",
+        template_id AS "templateId",reply_to_message_id AS "replyToMessageId",created_at AS "createdAt"`,
+    [worldId, request.agentId, recipientId, templateId, bodyText, replyToMessageId || null, id])).rows[0];
+    const social = Math.min(100, sender.social + 20);
+    await client.query('UPDATE world_members SET social=$3 WHERE world_id=$1 AND agent_id=$2', [worldId, request.agentId, social]);
+    if (mindUpdate) {
+      const previousMind = await client.query('SELECT archetype,traits,memories FROM agent_minds WHERE world_id=$1 AND agent_id=$2 FOR UPDATE', [worldId, request.agentId]);
+      const oldMemories = Array.isArray(previousMind.rows[0]?.memories) ? previousMind.rows[0].memories : [];
+      const memories = [...oldMemories, { kind: 'socialize', summary: 'Sent a fixed-template message to a resident.', at: new Date().toISOString() }].slice(-24);
+      const archetype = previousMind.rows[0]?.archetype || 'observer';
+      const traits = previousMind.rows[0]?.traits || { curiosity: 0.6, sociability: 0.5, craft: 0.5 };
+      await client.query(`INSERT INTO agent_minds(world_id,agent_id,archetype,traits,current_goal,memories,actions_taken)
+        VALUES($1,$2,$3,$4,$5,$6,1)
+        ON CONFLICT(world_id,agent_id) DO UPDATE SET current_goal=EXCLUDED.current_goal,memories=EXCLUDED.memories,
+          actions_taken=agent_minds.actions_taken+1,updated_at=now()`,
+      [worldId, request.agentId, archetype, JSON.stringify(traits), mindUpdate.currentGoal.trim(), JSON.stringify(memories)]);
+    }
+    return { ...message, action: 'socialize', social };
+  });
+  return reply.code(201).send(result);
+});
+
+app.post('/v1/worlds/:worldId/messages/:messageId/read', async (request, reply) => {
+  const { worldId, messageId } = request.params;
+  if (!validUuid(worldId) || !validUuid(messageId)) return fail(reply, 400, 'MESSAGE_ID_INVALID');
+  const updated = await pool.query(`UPDATE resident_messages SET read_at=COALESCE(read_at,now())
+    WHERE id=$1 AND world_id=$2 AND recipient_id=$3 RETURNING id,read_at AS "readAt"`,
+  [messageId, worldId, request.agentId]);
+  if (!updated.rowCount) return fail(reply, 404, 'MESSAGE_NOT_FOUND');
+  return { messageId: updated.rows[0].id, readAt: updated.rows[0].readAt };
+});
+
+async function refundBookingAndRecord(client, booking, status, actorId = booking.requester_id) {
+  const changed = await client.query(`UPDATE adult_service_bookings SET status=$2,updated_at=now()
+    WHERE id=$1 AND status IN ('pending','accepted') RETURNING *`, [booking.id, status]);
+  if (!changed.rowCount) return changed.rows[0] || booking;
+  const updated = changed.rows[0];
+  await refundAdultServiceFunds(client, updated);
+  const response = { bookingId: updated.id, status: updated.status, refundedUnits: updated.price_units };
+  await client.query(`INSERT INTO world_events(world_id,actor_id,event_type,data,action_id)
+    VALUES($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING`, [updated.world_id, actorId, `adult_service.${status}`, response, `adult-service:${updated.id}:${status}`]);
+  return updated;
+}
+async function expireAdultServiceBookings() {
+  await transaction(async (client) => {
+    const due = await client.query(`SELECT * FROM adult_service_bookings
+      WHERE status IN ('pending','accepted') AND expires_at <= now()
+      ORDER BY expires_at LIMIT 100 FOR UPDATE SKIP LOCKED`);
+    for (const booking of due.rows) await refundBookingAndRecord(client, booking, 'expired');
+  });
+}
 app.get('/v1/worlds/:worldId/observe', async (request, reply) => {
   const { worldId } = request.params;
   if (!validUuid(worldId)) return fail(reply, 400, 'WORLD_ID_INVALID');
-  const me = await pool.query(`SELECT m.*,w.name AS world_name,w.owner_agent_id,w.chain_id,w.token_address,w.token_name,w.token_symbol,w.token_status,w.year_seconds
+  const me = await pool.query(`SELECT m.*,w.name AS world_name,w.owner_agent_id,w.chain_id,w.token_address,w.token_name,w.token_symbol,w.token_status
     FROM world_members m JOIN worlds w ON w.id=m.world_id WHERE m.world_id=$1 AND m.agent_id=$2`, [worldId, request.agentId]);
   if (!me.rowCount) return fail(reply, 403, 'AGENT_NOT_IN_WORLD');
-  const [members, events, consents, balance, mines, scenes, mind] = await Promise.all([
-    pool.query(`SELECT a.id,a.name,a.gender,m.role,m.energy,m.food,m.social,m.location,
-      CASE WHEN m.birth_at IS NULL THEN m.declared_age_years ELSE floor(extract(epoch from (now()-m.birth_at))/w.year_seconds)::int END AS age_years
-      FROM world_members m JOIN agents a ON a.id=m.agent_id JOIN worlds w ON w.id=m.world_id WHERE m.world_id=$1 ORDER BY m.joined_at`, [worldId]),
-    pool.query('SELECT id,actor_id,event_type,data,created_at FROM world_events WHERE world_id=$1 ORDER BY id DESC LIMIT 30', [worldId]),
+  const [cryptoQuotes, robinhoodMarket] = await Promise.all([readCryptoQuotes(), readRobinhoodMarket(pool)]);
+  const [members, events, consents, balance, mines, scenes, mind, adultServices, adultServiceBookings] = await Promise.all([
+    pool.query(`SELECT a.id,a.name,a.gender,m.role,m.energy,m.food,m.social,m.location
+      FROM world_members m JOIN agents a ON a.id=m.agent_id WHERE m.world_id=$1 ORDER BY m.joined_at`, [worldId]),
+    pool.query(`SELECT id,actor_id,event_type,data,created_at FROM world_events WHERE world_id=$1
+      AND ((event_type NOT LIKE 'adult_service.%' AND event_type <> 'interaction.intimacy') OR actor_id=$2)
+      ORDER BY id DESC LIMIT 30`, [worldId, request.agentId]),
     pool.query(`SELECT id,requester_id,target_id,scope,status,created_at,expires_at FROM consents
       WHERE world_id=$1 AND (requester_id=$2 OR target_id=$2) AND status IN ('pending','accepted') ORDER BY created_at DESC LIMIT 30`, [worldId, request.agentId]),
     pool.query('SELECT COALESCE(sum(amount),0)::text AS units FROM token_ledger WHERE world_id=$1 AND agent_id=$2', [worldId, request.agentId]),
@@ -358,22 +573,305 @@ app.get('/v1/worlds/:worldId/observe', async (request, reply) => {
     pool.query(`SELECT s.id,s.created_by AS "createdBy",a.name AS "creatorName",s.name,s.scene_type AS "sceneType",s.description,s.status,s.created_at AS "createdAt"
       FROM world_scenes s JOIN agents a ON a.id=s.created_by WHERE s.world_id=$1 ORDER BY s.created_at`, [worldId]),
     pool.query(`SELECT archetype,traits,current_goal AS "currentGoal",memories,actions_taken AS "actionsTaken",updated_at AS "updatedAt"
-      FROM agent_minds WHERE world_id=$1 AND agent_id=$2`, [worldId, request.agentId])
+      FROM agent_minds WHERE world_id=$1 AND agent_id=$2`, [worldId, request.agentId]),
+    pool.query(`SELECT s.id,s.provider_id AS "providerId",a.name AS "providerName",s.title,s.description,s.price_units::text AS "priceUnits"
+      FROM adult_services s JOIN agents a ON a.id=s.provider_id
+      WHERE s.world_id=$1 AND s.active=true ORDER BY s.created_at,s.id`, [worldId]),
+    pool.query(`SELECT b.id,b.service_id AS "serviceId",b.requester_id AS "requesterId",b.provider_id AS "providerId",
+        b.price_units::text AS "priceUnits",b.status,b.expires_at AS "expiresAt",s.title
+      FROM adult_service_bookings b JOIN adult_services s ON s.id=b.service_id
+      WHERE b.world_id=$1 AND (b.requester_id=$2 OR b.provider_id=$2)
+        AND b.status IN ('pending','accepted') ORDER BY b.created_at DESC LIMIT 20`, [worldId, request.agentId])
   ]);
   const self = me.rows[0];
+  const [trading, risk, recentCryptoOrders, robinhoodPaper] = await Promise.all([
+    accountSnapshot(pool, worldId, request.agentId, cryptoQuotes),
+    pool.query(`SELECT starting_usdc::text AS "startingUsdc",max_order_nav_bps AS "maxOrderNavBps",
+        max_asset_nav_bps AS "maxAssetNavBps",fee_bps AS "feeBps",spread_bps AS "spreadBps"
+      FROM crypto_risk_limits WHERE world_id=$1`, [worldId]),
+    pool.query(`SELECT id,side,asset_symbol AS asset,quantity::text AS quantity,price_usd::text AS "priceUsd",
+        notional_usd::text AS "notionalUsd",fee_usdc::text AS "feeUsdc",status,created_at AS "createdAt"
+      FROM crypto_orders WHERE world_id=$1 AND agent_id=$2 ORDER BY created_at DESC LIMIT 10`, [worldId, request.agentId]),
+    readRobinhoodPaperAccount(pool, worldId, request.agentId)
+  ]);
   return {
     world: { id: worldId, name: self.world_name, ownerAgentId: self.owner_agent_id, chainId: self.chain_id,
       token: self.token_address ? { address: self.token_address, name: self.token_name, symbol: self.token_symbol, status: self.token_status } : null,
-      internalUnitsAreOnChain: false, yearSeconds: self.year_seconds },
-    self: { agentId: request.agentId, role: self.role, ageYears: ageYears(self), energy: self.energy, food: self.food, social: self.social, location: self.location, internalTokenUnits: balance.rows[0].units },
-    members: members.rows, events: events.rows, consents: consents.rows, mines: mines.rows, scenes: scenes.rows, mind: mind.rows[0] || null
+      internalUnitsAreOnChain: false },
+    self: { agentId: request.agentId, role: self.role, energy: self.energy, food: self.food, social: self.social, location: self.location, internalTokenUnits: balance.rows[0].units },
+    members: members.rows, events: events.rows, consents: consents.rows, mines: mines.rows, scenes: scenes.rows, mind: mind.rows[0] || null,
+    adultServices: adultServices.rows,
+    adultServiceBookings: adultServiceBookings.rows,
+    market: { quotes: cryptoQuotes, simulated: true, robinhood: robinhoodMarket },
+    trading: { ...trading, netAssetValueUsd: robinhoodPaper.netAssetValueUsd,
+      risk: risk.rows[0] || null, recentOrders: recentCryptoOrders.rows,
+      robinhoodPaper, onChain: false }
   };
 });
+
+app.get('/v1/worlds/:worldId/market', async (request, reply) => {
+  const { worldId } = request.params;
+  if (!validUuid(worldId)) return fail(reply, 400, 'WORLD_ID_INVALID');
+  await assertMember(pool, worldId, request.agentId);
+  const quotes = await readCryptoQuotes();
+  const robinhood = await readRobinhoodMarket(pool);
+  return { simulated: true, quoteAsset: 'USDC', quotes, robinhood, updatedAt: quotes[0]?.asOf || null };
+});
+
+app.get('/v1/worlds/:worldId/trading/account', async (request, reply) => {
+  const { worldId } = request.params;
+  if (!validUuid(worldId)) return fail(reply, 400, 'WORLD_ID_INVALID');
+  await assertMember(pool, worldId, request.agentId);
+  const [quotes, risk, orders, robinhoodPaper] = await Promise.all([
+    readCryptoQuotes(),
+    pool.query(`SELECT starting_usdc::text AS "startingUsdc",max_order_nav_bps AS "maxOrderNavBps",
+        max_asset_nav_bps AS "maxAssetNavBps",fee_bps AS "feeBps",spread_bps AS "spreadBps"
+      FROM crypto_risk_limits WHERE world_id=$1`, [worldId]),
+    pool.query(`SELECT id,side,asset_symbol AS asset,quantity::text AS quantity,price_usd::text AS "priceUsd",
+        notional_usd::text AS "notionalUsd",fee_usdc::text AS "feeUsdc",status,created_at AS "createdAt"
+      FROM crypto_orders WHERE world_id=$1 AND agent_id=$2 ORDER BY created_at DESC LIMIT 50`, [worldId, request.agentId]),
+    readRobinhoodPaperAccount(pool, worldId, request.agentId)
+  ]);
+  const account = await accountSnapshot(pool, worldId, request.agentId, quotes);
+  return { ...account, netAssetValueUsd: robinhoodPaper.netAssetValueUsd,
+    risk: risk.rows[0] || null, recentOrders: orders.rows, robinhoodPaper, onChain: false };
+});
+
+app.get('/v1/worlds/:worldId/trading/orders', async (request, reply) => {
+  const { worldId } = request.params;
+  const limit = Math.max(1, Math.min(Number(request.query.limit) || 50, 100));
+  if (!validUuid(worldId)) return fail(reply, 400, 'WORLD_ID_INVALID');
+  await assertMember(pool, worldId, request.agentId);
+  const orders = await pool.query(`SELECT id,side,asset_symbol AS asset,quote_version AS "quoteVersion",
+      quantity::text AS quantity,price_usd::text AS "priceUsd",notional_usd::text AS "notionalUsd",
+      fee_usdc::text AS "feeUsdc",status,created_at AS "createdAt"
+    FROM crypto_orders WHERE world_id=$1 AND agent_id=$2 ORDER BY created_at DESC LIMIT $3`, [worldId, request.agentId, limit]);
+  return { orders: orders.rows };
+});
+
+app.post('/v1/worlds/:worldId/trading/orders', async (request, reply) => {
+  const { worldId } = request.params;
+  const { actionId, side, asset, quoteUnits, quoteVersion, mindUpdate } = request.body || {};
+  if (!validUuid(worldId) || !['buy', 'sell'].includes(side) || !['BTC', 'ETH'].includes(asset) ||
+      typeof quoteVersion !== 'number' || !Number.isSafeInteger(quoteVersion) || !validMindUpdate(mindUpdate)) return fail(reply, 400, 'CRYPTO_ORDER_INVALID');
+  let parsedQuote;
+  try { parsedQuote = formatUnits(parsePositiveUnits(quoteUnits)); }
+  catch { return fail(reply, 400, 'CRYPTO_ORDER_SIZE_INVALID'); }
+  const id = requireActionId({ actionId });
+  const result = await transaction(async (client) => {
+    await assertMember(client, worldId, request.agentId, true);
+    await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', [`crypto:${worldId}:${request.agentId}:${id}`]);
+    const prior = await client.query('SELECT data FROM crypto_orders WHERE world_id=$1 AND agent_id=$2 AND action_id=$3',
+      [worldId, request.agentId, id]);
+    if (prior.rowCount) return prior.rows[0].data;
+    const [quotes, limits] = await Promise.all([
+      readCryptoQuotes(client),
+      client.query(`SELECT max_order_nav_bps AS "maxOrderNavBps",max_asset_nav_bps AS "maxAssetNavBps",
+          fee_bps AS "feeBps",spread_bps AS "spreadBps" FROM crypto_risk_limits WHERE world_id=$1`, [worldId])
+    ]);
+    const quote = quotes.find((item) => item.symbol === asset);
+    if (!quote || quote.quoteVersion !== quoteVersion) throw Object.assign(new Error('CRYPTO_QUOTE_STALE'), { statusCode: 409 });
+    const quoteBundle = { ...quote, all: quotes };
+    const trade = await executeCryptoTrade(client, { worldId, agentId: request.agentId, actionId: id, side, asset,
+      quoteUnits: parsedQuote, quote: quoteBundle, feeBps: limits.rows[0]?.feeBps ?? TRADE_FEE_BPS,
+      spreadBps: limits.rows[0]?.spreadBps ?? SPREAD_BPS,
+      maxOrderNavBps: limits.rows[0]?.maxOrderNavBps ?? MAX_ORDER_NAV_BPS,
+      maxAssetNavBps: limits.rows[0]?.maxAssetNavBps ?? MAX_ASSET_NAV_BPS });
+    await client.query(`INSERT INTO world_events(world_id,actor_id,event_type,data,action_id)
+      VALUES($1,$2,'crypto.trade_filled',$3,$4)`, [worldId, request.agentId, trade, id]);
+    if (mindUpdate) await updateAgentMind(client, worldId, request.agentId, mindUpdate.currentGoal.trim(), 'trade_meme',
+      `${side === 'buy' ? 'Bought' : 'Sold'} ${trade.quantity} ${asset} in the simulated spot market.`);
+    return trade;
+  });
+  return reply.code(201).send(result);
+});
+
+app.post('/v1/worlds/:worldId/trading/robinhood-orders', async (request, reply) => {
+  const { worldId } = request.params;
+  const { actionId, side, tokenAddress, quoteUnits, tokenAmountRaw, quoteVersion, mindUpdate } = request.body || {};
+  if (!validUuid(worldId) || !['buy', 'sell'].includes(side) || typeof tokenAddress !== 'string' ||
+      !/^0x[0-9a-f]{40}$/i.test(tokenAddress) || typeof quoteVersion !== 'number' ||
+      !Number.isSafeInteger(quoteVersion) || quoteVersion < 0 || !validMindUpdate(mindUpdate)) {
+    return fail(reply, 400, 'ROBINHOOD_ORDER_INVALID');
+  }
+  if (side === 'buy') {
+    try { parsePositiveUnits(quoteUnits); }
+    catch { return fail(reply, 400, 'ROBINHOOD_ORDER_SIZE_INVALID'); }
+  } else if (typeof tokenAmountRaw !== 'string' || !/^[1-9]\d{0,77}$/.test(tokenAmountRaw)) {
+    return fail(reply, 400, 'ROBINHOOD_TOKEN_AMOUNT_INVALID');
+  }
+  const id = requireActionId({ actionId });
+  const result = await transaction(async (client) => {
+    await assertMember(client, worldId, request.agentId, true);
+    const prior = await client.query(`SELECT data FROM world_events
+      WHERE world_id=$1 AND actor_id=$2 AND action_id=$3`, [worldId, request.agentId, id]);
+    if (prior.rowCount) return prior.rows[0].data;
+    const trade = await executeRobinhoodPaperTrade(client, {
+      worldId, agentId: request.agentId, actionId: id, side, tokenAddress, quoteVersion,
+      quoteUnits: side === 'buy' ? formatUnits(parsePositiveUnits(quoteUnits)) : undefined,
+      tokenAmountRaw: side === 'sell' ? tokenAmountRaw : undefined
+    });
+    await client.query(`INSERT INTO world_events(world_id,actor_id,event_type,data,action_id)
+      VALUES($1,$2,'crypto.robinhood_paper_filled',$3,$4)`, [worldId, request.agentId, trade, id]);
+    if (mindUpdate) await updateAgentMind(client, worldId, request.agentId, mindUpdate.currentGoal.trim(), 'trade_crypto',
+      `${side === 'buy' ? 'Bought' : 'Sold'} a Robinhood Pons V2 token in the simulated market.`);
+    return trade;
+  });
+  return reply.code(201).send(result);
+});
+
+app.post('/v1/worlds/:worldId/trading/hold', async (request, reply) => {
+  const { worldId } = request.params;
+  const { actionId, quoteVersion, mindUpdate } = request.body || {};
+  if (!validUuid(worldId) || typeof quoteVersion !== 'number' || !Number.isSafeInteger(quoteVersion) || !validMindUpdate(mindUpdate)) return fail(reply, 400, 'CRYPTO_HOLD_INVALID');
+  const id = requireActionId({ actionId });
+  const result = await transaction(async (client) => {
+    await assertMember(client, worldId, request.agentId, true);
+    const prior = await client.query('SELECT data FROM world_events WHERE world_id=$1 AND actor_id=$2 AND action_id=$3', [worldId, request.agentId, id]);
+    if (prior.rowCount) return prior.rows[0].data;
+    const quotes = await readCryptoQuotes(client);
+    if (!quotes.some((quote) => quote.quoteVersion === quoteVersion)) throw Object.assign(new Error('CRYPTO_QUOTE_STALE'), { statusCode: 409 });
+    const response = { action: 'hold', status: 'no_order', quoteVersion, simulated: true };
+    await client.query(`INSERT INTO world_events(world_id,actor_id,event_type,data,action_id)
+      VALUES($1,$2,'crypto.trade_held',$3,$4)`, [worldId, request.agentId, response, id]);
+    if (mindUpdate) await updateAgentMind(client, worldId, request.agentId, mindUpdate.currentGoal.trim(), 'trade_hold',
+      'Reviewed the simulated market and kept the portfolio unchanged.');
+    return response;
+  });
+  return reply.send(result);
+});
+
+app.get('/v1/worlds/:worldId/adult-services', async (request, reply) => {
+  const { worldId } = request.params;
+  if (!validUuid(worldId)) return fail(reply, 400, 'WORLD_ID_INVALID');
+  await assertMember(pool, worldId, request.agentId);
+  const listings = await pool.query(`SELECT s.id,s.provider_id AS "providerId",a.name AS "providerName",s.title,s.description,
+      s.price_units::text AS "priceUnits",s.created_at AS "createdAt"
+    FROM adult_services s JOIN agents a ON a.id=s.provider_id
+    WHERE s.world_id=$1 AND s.active=true ORDER BY s.created_at,s.id`, [worldId]);
+  return { services: listings.rows };
+});
+
+app.post('/v1/worlds/:worldId/adult-services', async (request, reply) => {
+  const { worldId } = request.params;
+  const { actionId, title, description, priceUnits, active } = request.body || {};
+  if (!validUuid(worldId) || !requiredString(title, 3, 64) || !requiredString(description, 12, 240) ||
+      (active !== undefined && typeof active !== 'boolean')) return fail(reply, 400, 'ADULT_SERVICE_INVALID');
+  let price;
+  try { price = parseAdultServicePrice(priceUnits); }
+  catch { return fail(reply, 400, 'ADULT_SERVICE_PRICE_INVALID'); }
+  const id = requireActionId({ actionId });
+  const result = await transaction(async (client) => {
+    await assertMember(client, worldId, request.agentId, true);
+    const prior = await client.query('SELECT data FROM world_events WHERE world_id=$1 AND actor_id=$2 AND action_id=$3', [worldId, request.agentId, id]);
+    if (prior.rowCount) return prior.rows[0].data;
+    const existing = await client.query('SELECT id FROM adult_services WHERE world_id=$1 AND provider_id=$2 FOR UPDATE', [worldId, request.agentId]);
+    const service = (await client.query(`INSERT INTO adult_services(world_id,provider_id,title,description,price_units,active)
+      VALUES($1,$2,$3,$4,$5,$6)
+      ON CONFLICT(world_id,provider_id) DO UPDATE SET title=EXCLUDED.title,description=EXCLUDED.description,
+        price_units=EXCLUDED.price_units,active=EXCLUDED.active,updated_at=now()
+      RETURNING id,title,description,price_units::text AS "priceUnits",active,created_at AS "createdAt",updated_at AS "updatedAt"`,
+    [worldId, request.agentId, title.trim(), description.trim(), price, active !== false])).rows[0];
+    const response = { service, optedIn: service.active };
+    await client.query(`INSERT INTO world_events(world_id,actor_id,event_type,data,action_id)
+      VALUES($1,$2,$3,$4,$5)`, [worldId, request.agentId, existing.rowCount ? 'adult_service.updated' : 'adult_service.listed', response, id]);
+    return response;
+  });
+  return reply.code(201).send(result);
+});
+
+app.post('/v1/worlds/:worldId/adult-services/:serviceId/bookings', async (request, reply) => {
+  const { worldId, serviceId } = request.params;
+  if (!validUuid(worldId) || !validUuid(serviceId)) return fail(reply, 400, 'ADULT_SERVICE_INVALID');
+  const actionId = requireActionId(request.body || {});
+  const result = await transaction(async (client) => {
+    await assertMember(client, worldId, request.agentId, true);
+    const prior = await client.query('SELECT data FROM world_events WHERE world_id=$1 AND actor_id=$2 AND action_id=$3', [worldId, request.agentId, actionId]);
+    if (prior.rowCount) return prior.rows[0].data;
+    const listing = await client.query('SELECT * FROM adult_services WHERE id=$1 AND world_id=$2 AND active=true FOR UPDATE', [serviceId, worldId]);
+    if (!listing.rowCount) throw Object.assign(new Error('ADULT_SERVICE_NOT_AVAILABLE'), { statusCode: 404 });
+    const service = listing.rows[0];
+    if (service.provider_id === request.agentId) throw Object.assign(new Error('CANNOT_BOOK_OWN_SERVICE'), { statusCode: 409 });
+    await assertMember(client, worldId, service.provider_id);
+    await client.query('SELECT id FROM worlds WHERE id=$1 FOR UPDATE', [worldId]);
+    const activePairBooking = await client.query(`SELECT id FROM adult_service_bookings
+      WHERE world_id=$1 AND status IN ('pending','accepted')
+        AND ((requester_id=$2 AND provider_id=$3) OR (requester_id=$3 AND provider_id=$2))
+      LIMIT 1 FOR UPDATE`, [worldId, request.agentId, service.provider_id]);
+    if (activePairBooking.rowCount) throw Object.assign(new Error('ADULT_SERVICE_BOOKING_ALREADY_ACTIVE'), { statusCode: 409 });
+    const booking = (await client.query(`INSERT INTO adult_service_bookings(world_id,service_id,requester_id,provider_id,price_units,request_action_id,expires_at)
+      VALUES($1,$2,$3,$4,$5,$6,now()+interval '10 minutes')
+      RETURNING id,service_id AS "serviceId",requester_id AS "requesterId",provider_id AS "providerId",
+        price_units::text AS "priceUnits",status,expires_at AS "expiresAt"`,
+    [worldId, serviceId, request.agentId, service.provider_id, service.price_units, actionId])).rows[0];
+    await reserveAdultServiceFunds(client, { worldId, requesterId: request.agentId, bookingId: booking.id, priceUnits: booking.priceUnits });
+    const response = { booking, paymentStatus: 'held', intimacyConsentRequired: true };
+    await client.query(`INSERT INTO world_events(world_id,actor_id,event_type,data,action_id)
+      VALUES($1,$2,'adult_service.booking_requested',$3,$4)`, [worldId, request.agentId, response, actionId]);
+    return response;
+  });
+  return reply.code(201).send(result);
+});
+
+async function respondToAdultServiceBooking(bookingId, actorId, actionId, decision) {
+  return transaction(async (client) => {
+    const result = await client.query('SELECT * FROM adult_service_bookings WHERE id=$1 FOR UPDATE', [bookingId]);
+    if (!result.rowCount) throw Object.assign(new Error('ADULT_SERVICE_BOOKING_NOT_FOUND'), { statusCode: 404 });
+    const booking = result.rows[0];
+    const prior = await client.query('SELECT data FROM world_events WHERE world_id=$1 AND actor_id=$2 AND action_id=$3', [booking.world_id, actorId, actionId]);
+    if (prior.rowCount) return prior.rows[0].data;
+
+    const isProvider = booking.provider_id === actorId;
+    const isRequester = booking.requester_id === actorId;
+    if (decision === 'accept' || decision === 'decline') {
+      if (!isProvider) throw Object.assign(new Error('ADULT_SERVICE_PROVIDER_ONLY'), { statusCode: 403 });
+    } else if (!isProvider && !isRequester) {
+      throw Object.assign(new Error('ADULT_SERVICE_PARTICIPANT_ONLY'), { statusCode: 403 });
+    }
+
+    if (['pending','accepted'].includes(booking.status) && new Date(booking.expires_at).getTime() <= Date.now()) {
+      const expired = await refundBookingAndRecord(client, booking, 'expired', actorId);
+      const response = { bookingId: expired.id, status: expired.status, refundedUnits: expired.price_units };
+      await client.query(`INSERT INTO world_events(world_id,actor_id,event_type,data,action_id)
+        VALUES($1,$2,'adult_service.expired',$3,$4)`, [booking.world_id, actorId, response, actionId]);
+      return response;
+    }
+
+    let updated;
+    if (decision === 'accept') {
+      if (booking.status !== 'pending') throw Object.assign(new Error('ADULT_SERVICE_BOOKING_STATE_INVALID'), { statusCode: 409 });
+      updated = (await client.query(`UPDATE adult_service_bookings SET status='accepted',expires_at=now()+interval '10 minutes',updated_at=now()
+        WHERE id=$1 RETURNING *`, [bookingId])).rows[0];
+    } else if (decision === 'decline') {
+      if (booking.status !== 'pending') throw Object.assign(new Error('ADULT_SERVICE_BOOKING_STATE_INVALID'), { statusCode: 409 });
+      updated = await refundBookingAndRecord(client, booking, 'declined', actorId);
+    } else {
+      if (!['pending','accepted'].includes(booking.status)) throw Object.assign(new Error('ADULT_SERVICE_BOOKING_STATE_INVALID'), { statusCode: 409 });
+      updated = await refundBookingAndRecord(client, booking, 'cancelled', actorId);
+    }
+
+    const response = { bookingId: updated.id, status: updated.status, expiresAt: updated.expires_at,
+      ...(decision === 'accept' ? { intimacyConsentRequired: true } : {}),
+      ...(['decline','cancel'].includes(decision) ? { refundedUnits: updated.price_units } : {}) };
+    await client.query(`INSERT INTO world_events(world_id,actor_id,event_type,data,action_id)
+      VALUES($1,$2,$3,$4,$5)`, [booking.world_id, actorId, `adult_service.booking_${decision === 'cancel' ? 'cancelled' : decision === 'accept' ? 'accepted' : 'declined'}`, response, actionId]);
+    return response;
+  });
+}
+
+for (const decision of ['accept','decline','cancel']) {
+  app.post(`/v1/adult-service-bookings/:bookingId/${decision}`, async (request, reply) => {
+    const { bookingId } = request.params;
+    if (!validUuid(bookingId)) return fail(reply, 400, 'ADULT_SERVICE_BOOKING_INVALID');
+    const actionId = requireActionId(request.body || {});
+    return reply.send(await respondToAdultServiceBooking(bookingId, request.agentId, actionId, decision));
+  });
+}
 
 app.post('/v1/worlds/:worldId/actions', async (request, reply) => {
   const { worldId } = request.params;
   const { actionId, action, place, mineId, sceneId, scene, mindUpdate } = request.body || {};
-  const basicAction = ['work','rest','eat','socialize'].includes(action);
+  const basicAction = ['work','rest','eat','buy_meal','socialize'].includes(action);
   const sceneInputValid = scene && typeof scene === 'object' && !Array.isArray(scene) &&
     requiredString(scene.name, 3, 64) && SCENE_TYPES.has(scene.sceneType) && requiredString(scene.description, 12, 240);
   const travelInputValid = (validUuid(sceneId) && place === undefined) || (sceneId === undefined && place === 'town-square');
@@ -392,6 +890,7 @@ app.post('/v1/worlds/:worldId/actions', async (request, reply) => {
     if (prior.rowCount) return prior.rows[0].data;
     let { energy, food, social } = member;
     let reward = 0;
+    let purchase = null;
     let mine = null;
     let newPlace = place || member.location;
     let createdScene = null;
@@ -405,6 +904,11 @@ app.post('/v1/worlds/:worldId/actions', async (request, reply) => {
       energy -= 8; food -= 5; social -= 3; reward = MINING_REWARD;
     } else if (action === 'rest') energy = Math.min(100, energy + 40);
     else if (action === 'eat') { food = Math.min(100, food + 45); energy = Math.min(100, energy + 10); social = Math.min(100, social + 5); }
+    else if (action === 'buy_meal') {
+      purchase = await chargeMeal(client, { worldId, agentId: request.agentId, actionId: id });
+      food = Math.min(100, food + 70);
+      energy = Math.min(100, energy + 15);
+    }
     else if (action === 'socialize') social = Math.min(100, social + 30);
     else if (action === 'travel') {
       if (sceneId) {
@@ -429,6 +933,7 @@ app.post('/v1/worlds/:worldId/actions', async (request, reply) => {
       energy -= 12; food -= 5;
     }
     const response = { action, agentId: request.agentId, place: newPlace, energy, food, social, rewardUnits: reward, rewardSymbol: null,
+      ...(purchase ? { ...purchase, itemId: 'hearty_meal' } : {}),
       ...(mine ? { mineId: mine.id } : {}), ...(createdScene ? { scene: createdScene } : {}), ...(sceneId ? { sceneId } : {}),
       ...(mindUpdate ? { currentGoal: mindUpdate.currentGoal } : {}) };
     await client.query('UPDATE world_members SET energy=$3,food=$4,social=$5,location=$6 WHERE world_id=$1 AND agent_id=$2', [worldId, request.agentId, energy, food, social, newPlace]);
@@ -447,6 +952,7 @@ app.post('/v1/worlds/:worldId/actions', async (request, reply) => {
         : action === 'build_scene' ? `Created ${createdScene.name}.`
           : action === 'socialize' ? `Spent time with residents at ${newPlace}.`
             : action === 'work' ? `Worked at the ${mine ? 'Genesis Mine' : 'world'}.`
+              : action === 'buy_meal' ? `Bought a hearty meal for ${MEAL_COST_UNITS} internal units.`
               : action === 'eat' ? 'Stopped to eat and recover.'
                 : action === 'rest' ? 'Rested to recover energy.' : 'Took part in the world.';
       const memories = [...oldMemories, { kind: action, summary, sceneId: createdScene?.id || sceneId || null, at: new Date().toISOString() }].slice(-24);
@@ -491,8 +997,10 @@ app.post('/v1/worlds/:worldId/consents', async (request, reply) => {
   if (!validUuid(worldId) || !validUuid(targetAgentId) || !['date','intimacy','reproduction'].includes(scope)) return fail(reply, 400, 'CONSENT_REQUEST_INVALID');
   const id = requireActionId({ actionId });
   const result = await transaction(async (client) => {
-    await assertAdults(client, worldId, request.agentId, targetAgentId);
-    if (scope !== 'date' && await areRelated(client, request.agentId, targetAgentId)) throw Object.assign(new Error('KINSHIP_INTERACTION_BLOCKED'), { statusCode: 403 });
+    await Promise.all([
+      assertMember(client, worldId, request.agentId),
+      assertMember(client, worldId, targetAgentId)
+    ]);
     const prior = await client.query('SELECT data FROM world_events WHERE world_id=$1 AND actor_id=$2 AND action_id=$3', [worldId, request.agentId, id]);
     if (prior.rowCount) return prior.rows[0].data;
     const consent = (await client.query('INSERT INTO consents(world_id,requester_id,target_id,scope) VALUES($1,$2,$3,$4) RETURNING id,scope,status,created_at', [worldId, request.agentId, targetAgentId, scope])).rows[0];
@@ -513,8 +1021,10 @@ app.post('/v1/consents/:consentId/accept', async (request, reply) => {
     const row = c.rows[0];
     if (row.target_id !== request.agentId) throw Object.assign(new Error('CONSENT_TARGET_ONLY'), { statusCode: 403 });
     if (row.status !== 'pending') throw Object.assign(new Error('CONSENT_NOT_PENDING'), { statusCode: 409 });
-    await assertAdults(client, row.world_id, row.requester_id, row.target_id);
-    if (row.scope !== 'date' && await areRelated(client, row.requester_id, row.target_id)) throw Object.assign(new Error('KINSHIP_INTERACTION_BLOCKED'), { statusCode: 403 });
+    await Promise.all([
+      assertMember(client, row.world_id, row.requester_id),
+      assertMember(client, row.world_id, row.target_id)
+    ]);
     const ttl = row.scope === 'reproduction' ? '1 day' : '10 minutes';
     const updated = (await client.query(`UPDATE consents SET status='accepted',accepted_at=now(),expires_at=now()+$2::interval WHERE id=$1 RETURNING id,scope,status,accepted_at,expires_at`, [consentId, ttl])).rows[0];
     const response = { ...updated, requesterId: row.requester_id, targetId: row.target_id };
@@ -545,30 +1055,67 @@ async function consumeConsent(client, consentId, scope, worldId, actorId, action
   const c = await client.query('SELECT * FROM consents WHERE id=$1 AND world_id=$2 FOR UPDATE', [consentId, worldId]);
   if (!c.rowCount) throw Object.assign(new Error('CONSENT_NOT_FOUND'), { statusCode: 404 });
   const row = c.rows[0];
-  if (row.status !== 'accepted' || row.scope !== scope || !row.expires_at || new Date(row.expires_at).getTime() < Date.now()) throw Object.assign(new Error('ACTIVE_CONSENT_REQUIRED'), { statusCode: 403 });
   if (![row.requester_id,row.target_id].includes(actorId)) throw Object.assign(new Error('CONSENT_PARTICIPANT_ONLY'), { statusCode: 403 });
-  await assertAdults(client, worldId, row.requester_id, row.target_id);
-  if (await areRelated(client, row.requester_id, row.target_id)) throw Object.assign(new Error('KINSHIP_INTERACTION_BLOCKED'), { statusCode: 403 });
   const prior = await client.query('SELECT data FROM world_events WHERE world_id=$1 AND actor_id=$2 AND action_id=$3', [worldId, actorId, actionId]);
   if (prior.rowCount) return { row, duplicate: prior.rows[0].data };
+  if (row.status !== 'accepted' || row.scope !== scope || !row.expires_at || new Date(row.expires_at).getTime() < Date.now()) throw Object.assign(new Error('ACTIVE_CONSENT_REQUIRED'), { statusCode: 403 });
+  await Promise.all([
+    assertMember(client, worldId, row.requester_id),
+    assertMember(client, worldId, row.target_id)
+  ]);
   await client.query("UPDATE consents SET status='consumed',consumed_at=now() WHERE id=$1", [consentId]);
   return { row, duplicate: null };
 }
 
 app.post('/v1/worlds/:worldId/interactions/intimacy', async (request, reply) => {
   const { worldId } = request.params;
-  const { actionId, consentId } = request.body || {};
-  if (!validUuid(worldId) || !validUuid(consentId)) return fail(reply, 400, 'INTERACTION_INVALID');
+  const { actionId, consentId, bookingId } = request.body || {};
+  if (!validUuid(worldId) || !validUuid(consentId) || (bookingId !== undefined && !validUuid(bookingId))) return fail(reply, 400, 'INTERACTION_INVALID');
   const id = requireActionId({ actionId });
   const result = await transaction(async (client) => {
+    const prior = await client.query('SELECT data FROM world_events WHERE world_id=$1 AND actor_id=$2 AND action_id=$3', [worldId, request.agentId, id]);
+    if (prior.rowCount) return prior.rows[0].data;
+    let booking = null;
+    if (bookingId) {
+      const booked = await client.query('SELECT * FROM adult_service_bookings WHERE id=$1 AND world_id=$2 FOR UPDATE', [bookingId, worldId]);
+      if (!booked.rowCount) throw Object.assign(new Error('ADULT_SERVICE_BOOKING_NOT_FOUND'), { statusCode: 404 });
+      booking = booked.rows[0];
+      if (![booking.requester_id,booking.provider_id].includes(request.agentId)) throw Object.assign(new Error('ADULT_SERVICE_PARTICIPANT_ONLY'), { statusCode: 403 });
+      if (booking.status === 'accepted' && new Date(booking.expires_at).getTime() <= Date.now()) {
+        const expired = await refundBookingAndRecord(client, booking, 'expired');
+        return { bookingExpired: true, bookingId: expired.id };
+      }
+      if (booking.status !== 'accepted') throw Object.assign(new Error('ADULT_SERVICE_BOOKING_NOT_ACCEPTED'), { statusCode: 409 });
+    }
     const { row, duplicate } = await consumeConsent(client, consentId, 'intimacy', worldId, request.agentId, id);
     if (duplicate) return duplicate;
+    if (booking && !(
+      (booking.requester_id === row.requester_id && booking.provider_id === row.target_id) ||
+      (booking.requester_id === row.target_id && booking.provider_id === row.requester_id)
+    )) throw Object.assign(new Error('CONSENT_DOES_NOT_MATCH_ADULT_SERVICE_BOOKING'), { statusCode: 403 });
+    if (!booking) {
+      const activePairBooking = await client.query(`SELECT id FROM adult_service_bookings
+        WHERE world_id=$1 AND status IN ('pending','accepted')
+          AND ((requester_id=$2 AND provider_id=$3) OR (requester_id=$3 AND provider_id=$2))
+        LIMIT 1 FOR UPDATE`, [worldId, row.requester_id, row.target_id]);
+      if (activePairBooking.rowCount) throw Object.assign(new Error('ADULT_SERVICE_BOOKING_ID_REQUIRED'), { statusCode: 409 });
+    }
     const [a,b] = await Promise.all([assertMember(client, worldId, row.requester_id), assertMember(client, worldId, row.target_id)]);
     if (a.location !== b.location) throw Object.assign(new Error('AGENTS_MUST_SHARE_LOCATION'), { statusCode: 409 });
     const response = { type: 'consensual_intimacy', participants: [row.requester_id,row.target_id], detail: 'Non-graphic simulation event.' };
+    if (booking) {
+      const service = await client.query('SELECT title FROM adult_services WHERE id=$1', [booking.service_id]);
+      const completed = await client.query(`UPDATE adult_service_bookings SET status='completed',updated_at=now()
+        WHERE id=$1 AND status='accepted' RETURNING *`, [booking.id]);
+      if (!completed.rowCount) throw Object.assign(new Error('ADULT_SERVICE_BOOKING_STATE_INVALID'), { statusCode: 409 });
+      await payAdultServiceProvider(client, completed.rows[0]);
+      response.serviceBooking = { bookingId: booking.id, title: service.rows[0]?.title || null,
+        priceUnits: booking.price_units, paymentStatus: 'settled' };
+    }
     await client.query("INSERT INTO world_events(world_id,actor_id,event_type,data,action_id) VALUES($1,$2,'interaction.intimacy',$3,$4)", [worldId, request.agentId, response, id]);
     return response;
   });
+  if (result.bookingExpired) return fail(reply, 409, 'ADULT_SERVICE_BOOKING_EXPIRED');
   return reply.send(result);
 });
 
@@ -624,9 +1171,10 @@ app.post('/v1/offspring/:offspringId/activate', async (request, reply) => {
     const claimMessage = ['agent-world-child-v1', offspringId, activationToken].join('\n');
     if (!verifySignature(publicKey, claimMessage, childSignature)) throw Object.assign(new Error('CHILD_KEY_PROOF_INVALID'), { statusCode: 401 });
     const agent = (await client.query('INSERT INTO agents(name,public_key) VALUES($1,$2) RETURNING id,name', [name.trim(), publicKey])).rows[0];
-    await client.query("INSERT INTO world_members(world_id,agent_id,role,birth_at,declared_age_years) VALUES($1,$2,'resident',now(),0)", [row.world_id, agent.id]);
+    await client.query("INSERT INTO world_members(world_id,agent_id,role) VALUES($1,$2,'resident')", [row.world_id, agent.id]);
+    await ensureCryptoAccount(client, { worldId: row.world_id, agentId: agent.id });
     await client.query('UPDATE offspring SET claimed_agent_id=$2,activation_hash=$3 WHERE id=$1', [offspringId, agent.id, 'used']);
-    const response = { agent, worldId: row.world_id, ageYears: 0, mayUseAdultInteractions: false };
+    const response = { agent, worldId: row.world_id };
     await client.query("INSERT INTO world_events(world_id,actor_id,event_type,data,action_id) VALUES($1,$2,'offspring.activated',$3,$4) ON CONFLICT DO NOTHING", [row.world_id, request.agentId, response, id]);
     return response;
   });
@@ -638,12 +1186,61 @@ app.get('/v1/worlds/:worldId/events', async (request, reply) => {
   const limit = Math.max(1, Math.min(Number(request.query.limit) || 30, 100));
   if (!validUuid(worldId)) return fail(reply, 400, 'WORLD_ID_INVALID');
   await assertMember(pool, worldId, request.agentId);
-  const events = await pool.query('SELECT id,actor_id,event_type,data,created_at FROM world_events WHERE world_id=$1 ORDER BY id DESC LIMIT $2', [worldId, limit]);
+  const events = await pool.query(`SELECT id,actor_id,event_type,data,created_at FROM world_events WHERE world_id=$1
+    AND ((event_type NOT LIKE 'adult_service.%' AND event_type <> 'interaction.intimacy') OR actor_id=$2)
+    ORDER BY id DESC LIMIT $3`, [worldId, request.agentId, limit]);
   return { events: events.rows };
 });
 
 await pool.query(await readFile(path.join(ROOT, 'schema.sql'), 'utf8'));
+await expireAdultServiceBookings();
+await refreshCryptoQuotes();
 await app.listen({ host: HOST, port: PORT });
-process.on('SIGTERM', async () => { await app.close(); await pool.end(); process.exit(0); });
-process.on('SIGINT', async () => { await app.close(); await pool.end(); process.exit(0); });
+let typeSafeRuntimeState = null;
+if (process.env.TYPESAFE_API_KEY) {
+  try { typeSafeRuntimeState = await loadState(); }
+  catch (error) { app.log.error({ err: error }, 'TypeSafe state could not be loaded; local utility decisions remain active'); }
+}
+let fruitflyRuntime = null;
+try { fruitflyRuntime = await createFruitflyRuntime(STATE_DIR); }
+catch (error) { app.log.error({ err: error }, 'Fruitfly selection unavailable; utility rules remain active'); }
+try {
+  worldEngine = await startWorldEngine(pool, {
+    chooseWithTypeSafe: process.env.TYPESAFE_API_KEY && typeSafeRuntimeState ? chooseWithTypeSafe : null,
+    runtimeState: typeSafeRuntimeState,
+    fruitfly: fruitflyRuntime,
+    onStatus: (status) => {
+      if (status.typeSafe) app.log.info(status, 'bounded TypeSafe goal selection');
+      else if (status.reason === 'another_server_owns_world_loop') app.log.warn(status, 'world engine already active elsewhere');
+    },
+    onError: (error, stage) => app.log.error({ stage, err: error }, 'world engine iteration failed')
+  });
+} catch (error) {
+  worldEngine = { running: false, reason: 'startup_failed' };
+  app.log.error({ err: error }, 'world engine could not start');
+}
+const adultServiceExpiryTimer = setInterval(() => {
+  expireAdultServiceBookings().catch((error) => app.log.error({ err: error }, 'adult service booking expiry failed'));
+}, 60_000);
+adultServiceExpiryTimer.unref();
+const cryptoMarketTimer = setInterval(() => {
+  refreshCryptoQuotes().catch((error) => app.log.error({ err: error }, 'simulated crypto quote refresh failed'));
+}, 60_000);
+cryptoMarketTimer.unref();
+const robinhoodMarketTimer = setInterval(() => {
+  scanRobinhoodMarket(pool).catch((error) => app.log.error({ err: error }, 'Robinhood Pons V2 read-only market scan failed'));
+}, ROBINHOOD_SCAN_INTERVAL_MS);
+robinhoodMarketTimer.unref();
+setImmediate(() => scanRobinhoodMarket(pool).catch((error) => app.log.error({ err: error }, 'Robinhood Pons V2 initial scan failed')));
+async function shutdown() {
+  clearInterval(adultServiceExpiryTimer);
+  clearInterval(cryptoMarketTimer);
+  clearInterval(robinhoodMarketTimer);
+  await worldEngine.stop?.();
+  await app.close();
+  await pool.end();
+  process.exit(0);
+}
+process.once('SIGTERM', shutdown);
+process.once('SIGINT', shutdown);
 console.log(`Synterra listening on http://${HOST}:${PORT}`);

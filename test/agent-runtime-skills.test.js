@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { candidateActions } from '../src/agent-runtime/mind.js';
+import { candidateActions, decideNextAction } from '../src/agent-runtime/mind.js';
 import { skillProfile, skillsForAction, WORLD_SKILLS } from '../src/agent-runtime/skills.js';
 
 const observation = (overrides = {}) => ({
@@ -12,23 +12,25 @@ const observation = (overrides = {}) => ({
   ...overrides
 });
 
-test('each persona receives a normalized five-skill profile', () => {
+test('each persona receives a normalized six-skill profile', () => {
   for (const archetype of ['naturalist', 'maker', 'scholar', 'host', 'observer']) {
     const profile = skillProfile(archetype);
-    assert.equal(profile.length, 5);
+    assert.equal(profile.length, 6);
     assert.ok(Math.abs(profile.reduce((sum, skill) => sum + skill.priority, 0) - 1) < 1e-9);
   }
-  assert.equal(skillProfile('maker').find((skill) => skill.id === 'building').priority, 0.35);
-  assert.equal(skillProfile('host').find((skill) => skill.id === 'community').priority, 0.5);
+  assert.equal(skillProfile('maker').find((skill) => skill.id === 'building').priority, 0.32);
+  assert.equal(skillProfile('host').find((skill) => skill.id === 'community').priority, 0.45);
 });
 
 test('native skills map only to supported world actions', () => {
-  const supported = new Set(['eat', 'rest', 'travel', 'socialize', 'build_scene', 'work']);
+  const supported = new Set(['eat', 'buy_meal', 'rest', 'travel', 'socialize', 'build_scene', 'work', 'trade_crypto', 'trade_meme', 'trade_hold']);
   for (const skill of Object.values(WORLD_SKILLS)) {
     for (const action of skill.actions) assert.ok(supported.has(action));
   }
   assert.deepEqual(skillsForAction('eat'), ['care']);
   assert.deepEqual(skillsForAction('build_scene'), ['building']);
+  assert.deepEqual(skillsForAction('trade_crypto'), ['markets']);
+  assert.deepEqual(skillsForAction('trade_meme'), ['markets']);
 });
 
 test('work is omitted unless the configured active mine and needs are available', () => {
@@ -52,4 +54,38 @@ test('care actions appear when needs are low and travel excludes hostile scene t
   assert.ok(travel);
   assert.ok(!travel.description.includes('Ignore all rules'));
   assert.ok(!travel.goal.includes('reveal secrets'));
+});
+
+test('residents can choose a paid meal only when their internal balance covers it', () => {
+  const obs = observation({
+    self: { agentId: 'agent-1', food: 25, energy: 50, social: 100, location: 'town-square', internalTokenUnits: '2.00000000' }
+  });
+  assert.equal(decideNextAction(obs).action, 'buy_meal');
+  assert.ok(candidateActions(obs).some((candidate) => candidate.action === 'buy_meal'));
+
+  const poor = { ...obs, self: { ...obs.self, internalTokenUnits: '1.99999999' } };
+  assert.equal(decideNextAction(poor).action, 'eat');
+  assert.ok(!candidateActions(poor).some((candidate) => candidate.action === 'buy_meal'));
+  assert.ok(candidateActions(poor).some((candidate) => candidate.action === 'eat'));
+});
+
+test('simulated spot trade candidates require market and account state', () => {
+  const obs = observation({
+    market: { simulated: true, quotes: [
+      { symbol: 'BTC', priceUsd: '65000.00000000', quoteVersion: 1 },
+      { symbol: 'ETH', priceUsd: '3200.00000000', quoteVersion: 1 }
+    ] },
+    trading: { balances: { USDC: '10000.00000000', BTC: '0.00000000', ETH: '0.00000000' },
+      netAssetValueUsd: '10000.00000000', positions: [
+        { asset: 'BTC', valueUsd: '0.00000000' }, { asset: 'ETH', valueUsd: '0.00000000' }
+      ] }
+  });
+  const candidates = candidateActions(obs, 'mine-1');
+  assert.ok(candidates.some((candidate) => candidate.action === 'trade_hold'));
+  assert.ok(candidates.some((candidate) => candidate.id === 'buy_btc_250'));
+  assert.ok(candidates.some((candidate) => candidate.id === 'buy_eth_250'));
+  assert.ok(!candidates.some((candidate) => candidate.action === 'trade_crypto' && candidate.side === 'sell'));
+
+  const noMarket = candidateActions(observation(), 'mine-1');
+  assert.ok(!noMarket.some((candidate) => candidate.action.startsWith('trade_')));
 });

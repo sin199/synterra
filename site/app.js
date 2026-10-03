@@ -1,3 +1,5 @@
+import { createWorld3D } from './world3d.js';
+
 const worldCount = document.querySelector('#world-count');
 const residentCount = document.querySelector('#resident-count');
 const chainId = document.querySelector('#chain-id');
@@ -12,7 +14,13 @@ const mapState = document.querySelector('#map-state');
 const mapStatusDot = document.querySelector('#map-status-dot');
 const mapUpdated = document.querySelector('#map-updated');
 const mapError = document.querySelector('#map-error');
+const sceneMap = document.querySelector('#scene-map');
+const marketQuotes = document.querySelector('#market-quotes');
+const marketUpdated = document.querySelector('#market-updated');
+const portfolioSummary = document.querySelector('#portfolio-summary');
+const recentTrades = document.querySelector('#recent-trades');
 const numberFormat = new Intl.NumberFormat('zh-CN');
+const moneyFormat = new Intl.NumberFormat('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const MAP_POINTS = [
   [18, 22], [48, 17], [80, 23], [31, 42], [72, 42],
   [20, 73], [51, 81], [83, 72], [13, 48], [70, 84],
@@ -23,10 +31,27 @@ const SCENE_ICONS = { garden: '❋', studio: '◈', library: '▤', cafe: '◒',
 const ARCHETYPES = { naturalist: '自然观察者', maker: '创造者', scholar: '学者', host: '组织者', observer: '观察者' };
 const EVENT_LABELS = {
   'action.socialize': '社交', 'action.travel': '前往场景', 'action.work': '工作',
-  'action.rest': '休息', 'action.eat': '进食', 'action.build_scene': '建造场景', 'scene.created': '场景建造'
+  'action.rest': '休息', 'action.eat': '进食', 'action.build_scene': '建造场景', 'scene.created': '场景建造',
+  'crypto.trade_filled': '模拟加密货币成交', 'crypto.trade_held': '选择持有',
+  'crypto.robinhood_paper_filled': 'Robinhood meme 币模拟成交',
+  'world.movement_started': '启程', 'world.agent_arrived': '抵达', 'world.action_started': '开始行动',
+  'world.action_completed': '完成行动', 'world.goal_updated': '调整长期目标'
 };
+const ACTION_LABELS = { work: '工作', learn: '学习', rest: '休息', eat: '进食', socialize: '社交', trade: '模拟交易' };
 let latestMapData = null;
 let selectedAgentId = null;
+let world3d = null;
+
+try {
+  world3d = createWorld3D(document.querySelector('#world3d-canvas'), document.querySelector('#world3d-labels'), selectAgentById);
+} catch {
+  world3d = null;
+}
+sceneMap?.classList.toggle('is-fallback', !world3d);
+sceneMap?.classList.toggle('is-3d', Boolean(world3d));
+if (!world3d) {
+  document.querySelector('.world3d-hint')?.replaceChildren(document.createTextNode('WebGL 不可用 · 显示二维地图'));
+}
 
 function displayCount(value) {
   const number = Number(value);
@@ -35,6 +60,15 @@ function displayCount(value) {
 
 function setText(element, value) {
   if (element) element.textContent = value;
+}
+
+function selectAgentById(agentId) {
+  const agent = latestMapData?.residents?.find((resident) => resident.id === agentId);
+  if (!agent) return;
+  selectedAgentId = agentId;
+  renderMap();
+  renderAgentPanel(agent);
+  world3d?.select(agentId);
 }
 
 function formatTime(value, includeDate = false) {
@@ -46,7 +80,8 @@ function formatTime(value, includeDate = false) {
     : { hour: '2-digit', minute: '2-digit' }).format(date);
 }
 
-function eventLabel(eventType) {
+function eventLabel(eventType, action) {
+  if (eventType === 'world.action_started' || eventType === 'world.action_completed') return ACTION_LABELS[action] || EVENT_LABELS[eventType];
   return EVENT_LABELS[eventType] || (typeof eventType === 'string' && eventType.startsWith('action.')
     ? eventType.slice(7) : '世界活动');
 }
@@ -75,9 +110,7 @@ function createAgentMarker(agent, selected = false) {
   button.setAttribute('aria-label', `查看 ${agent.name}`);
   button.title = agent.name;
   button.addEventListener('click', () => {
-    selectedAgentId = agent.id;
-    renderMap();
-    renderAgentPanel(agent);
+    selectAgentById(agent.id);
   });
   return button;
 }
@@ -137,7 +170,25 @@ function renderMap() {
     mapLocations.append(node);
   });
 
-  const unplaced = residents.filter((resident) => !scenes.some((scene) => scene.name === resident.location));
+  const exchangeNode = document.createElement('div');
+  exchangeNode.className = 'map-location map-exchange';
+  exchangeNode.style.left = '50%';
+  exchangeNode.style.top = '50%';
+  exchangeNode.setAttribute('role', 'group');
+  exchangeNode.setAttribute('aria-label', 'Exchange 模拟交易大厅');
+  const exchangeLabel = document.createElement('div');
+  exchangeLabel.className = 'map-place-label';
+  exchangeLabel.textContent = 'Exchange';
+  exchangeNode.append(exchangeLabel);
+  const exchangeMarkers = document.createElement('div');
+  exchangeMarkers.className = 'map-markers';
+  for (const resident of byLocation.get('Exchange') || []) {
+    exchangeMarkers.append(createAgentMarker(resident, resident.id === selectedAgentId));
+  }
+  exchangeNode.append(exchangeMarkers);
+  mapLocations.append(exchangeNode);
+
+  const unplaced = residents.filter((resident) => resident.location !== 'Exchange' && !scenes.some((scene) => scene.name === resident.location));
   if (unplaced.length) {
     const node = document.createElement('div');
     node.className = 'map-location map-unplaced';
@@ -199,10 +250,18 @@ function renderAgentPanel(agent) {
 
   const facts = document.createElement('dl');
   facts.className = 'agent-facts';
+  const activeAction = agent.currentStatus === 'walking'
+    ? `前往 ${agent.targetLocation || '目标地点'}`
+    : agent.currentStatus === 'performing' ? (ACTION_LABELS[agent.currentAction] || agent.currentAction || '行动中') : '待决定';
   for (const [label, value] of [
     ['所在地点', agent.location || '未知'],
+    ['当前行动', activeAction],
+    ['目标地点', agent.targetLocation || '—'],
+    ['现金', `${moneyFormat.format(Number(agent.assets?.USDC || 0))} USDC`],
+    ['BTC / ETH', `${Number(agent.assets?.BTC || 0).toFixed(6)} / ${Number(agent.assets?.ETH || 0).toFixed(5)}`],
+    ['心情 / 知识', `${displayCount(agent.happiness)} / ${displayCount(agent.knowledge)}`],
     ['行动次数', displayCount(agent.actionsTaken)],
-    ['最近行动', agent.lastEventType ? `${eventLabel(agent.lastEventType)} · ${formatTime(agent.lastEventAt)}` : '暂无行动记录']
+    ['最近行动', agent.lastEventType ? `${eventLabel(agent.lastEventType, agent.lastEventAction)} · ${formatTime(agent.lastEventAt)}` : '暂无行动记录']
   ]) {
     const row = document.createElement('div');
     const term = document.createElement('dt');
@@ -247,7 +306,9 @@ function renderActivity() {
     const title = document.createElement('strong');
     title.textContent = event.agentName || '居民';
     const detail = document.createElement('span');
-    detail.textContent = `${eventLabel(event.eventType)}${event.place ? ` · ${event.place}` : ''}`;
+    const trade = event.eventType === 'crypto.trade_filled' && event.side && event.asset
+      ? ` · ${event.side === 'buy' ? '买入' : '卖出'} ${event.asset}` : '';
+    detail.textContent = `${eventLabel(event.eventType, event.action)}${trade}${event.place ? ` · ${event.place}` : ''}`;
     copy.append(title, detail);
     const time = document.createElement('time');
     time.dateTime = event.createdAt || '';
@@ -264,8 +325,110 @@ function renderSummary() {
   const women = residents.filter((resident) => resident.gender === 'female').length;
   const men = residents.filter((resident) => resident.gender === 'male').length;
   setText(document.querySelector('#map-resident-total'), displayCount(residents.length));
-  setText(document.querySelector('#map-scene-total'), displayCount(scenes.length));
+  setText(document.querySelector('#map-scene-total'), displayCount(scenes.length + 1));
   setText(document.querySelector('#map-gender-count'), `${women} / ${men}`);
+  const engine = latestMapData.world?.engine;
+  if (engine) {
+    const hour = String(engine.hour || 0).padStart(2, '0');
+    const minute = String(engine.minute || 0).padStart(2, '0');
+    setText(document.querySelector('#world-time'), `${hour}:${minute}`);
+    setText(document.querySelector('#world-day'), `SIM DAY ${displayCount(engine.day || 1)}`);
+    setText(document.querySelector('#world-engine-state'), engine.running ? 'RUNNING' : 'PAUSED');
+    document.querySelector('#world-engine-state')?.classList.toggle('is-offline', !engine.running);
+  }
+}
+
+function renderTrading() {
+  if (!latestMapData?.trading) return;
+  const trading = latestMapData.trading;
+  marketQuotes?.replaceChildren();
+  for (const quote of trading.quotes || []) {
+    const row = document.createElement('div');
+    row.className = 'market-quote-row';
+    const asset = document.createElement('div');
+    asset.className = 'market-asset';
+    const symbol = document.createElement('strong');
+    symbol.textContent = quote.symbol;
+    const name = document.createElement('span');
+    name.textContent = quote.name;
+    asset.append(symbol, name);
+    const price = document.createElement('strong');
+    price.className = 'market-price';
+    price.textContent = `$${Number(quote.priceUsd).toLocaleString('en-US', { minimumFractionDigits: quote.symbol === 'USDC' ? 4 : 2, maximumFractionDigits: quote.symbol === 'USDC' ? 4 : 2 })}`;
+    row.append(asset, price);
+    marketQuotes?.append(row);
+  }
+  const robinhood = trading.robinhood || {};
+  const scanner = robinhood.scanner || {};
+  const chainHeading = document.createElement('p');
+  chainHeading.className = 'market-updated';
+  chainHeading.textContent = `Robinhood 主网 · Pons V2 · 扫描 ${scanner.healthy ? (scanner.fresh ? '正常' : '数据偏旧') : '不可用'} · 区块 ${scanner.scannedToBlock ?? '—'}`;
+  marketQuotes?.append(chainHeading);
+  for (const token of (robinhood.tokens || []).slice(0, 8)) {
+    const row = document.createElement('div');
+    row.className = 'market-quote-row';
+    const asset = document.createElement('div');
+    asset.className = 'market-asset';
+    const symbol = document.createElement('strong');
+    symbol.textContent = `0x${String(token.tokenAddress || '').slice(2, 10)}`;
+    const status = document.createElement('span');
+    status.textContent = token.tradable ? '曲线可模拟交易' : token.graduated ? '已毕业，暂停该曲线成交' : '仅记录';
+    asset.append(symbol, status);
+    const price = document.createElement('strong');
+    price.className = 'market-price';
+    const numericPrice = Number(token.priceUsd);
+    price.textContent = Number.isFinite(numericPrice) && numericPrice > 0
+      ? `$${numericPrice.toLocaleString('en-US', { maximumFractionDigits: 8 })}` : '—';
+    row.append(asset, price);
+    marketQuotes?.append(row);
+  }
+  setText(marketUpdated, `内部模拟行情 ${formatTime(trading.quotes?.[0]?.asOf, true)} · BTC / ETH / USDC`);
+
+  portfolioSummary?.replaceChildren();
+  const portfolios = [...(trading.portfolios || [])].sort((a, b) => Number(b.netAssetValueUsd) - Number(a.netAssetValueUsd));
+  if (!portfolios.length) {
+    const empty = document.createElement('p');
+    empty.className = 'market-empty';
+    empty.textContent = '还没有已初始化的 agent 账户。';
+    portfolioSummary?.append(empty);
+  }
+  for (const portfolio of portfolios) {
+    const row = document.createElement('div');
+    row.className = 'portfolio-row';
+    const agent = document.createElement('span');
+    agent.textContent = portfolio.name;
+    const value = document.createElement('strong');
+    value.textContent = `$${Number(portfolio.netAssetValueUsd).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+    row.append(agent, value);
+    portfolioSummary?.append(row);
+  }
+
+  recentTrades?.replaceChildren();
+  const trades = (trading.recentTrades || []).slice(0, 12);
+  if (!trades.length) {
+    const empty = document.createElement('li');
+    empty.className = 'market-empty';
+    empty.textContent = 'agent 尚未完成模拟交易。';
+    recentTrades?.append(empty);
+  }
+  for (const trade of trades) {
+    const row = document.createElement('li');
+    const details = document.createElement('div');
+    details.className = 'trade-details';
+    const headline = document.createElement('strong');
+    headline.textContent = `${trade.agentName} · ${trade.side === 'buy' ? '买入' : '卖出'} ${trade.asset}${trade.simulatedMeme ? ' (模拟)' : ''}`;
+    const meta = document.createElement('span');
+    const price = Number(trade.priceUsd);
+    meta.textContent = trade.simulatedMeme
+      ? `${trade.quantity} token · 名义金额 $${Number(trade.notionalUsd).toFixed(4)} · 手续费 ${Number(trade.feeUsdc).toFixed(4)} USDC · Pons V2`
+      : `${Number(trade.quantity).toFixed(8)} ${trade.asset} · $${price.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} · 手续费 ${Number(trade.feeUsdc).toFixed(4)} USDC`;
+    details.append(headline, meta);
+    const time = document.createElement('time');
+    time.dateTime = trade.createdAt || '';
+    time.textContent = formatTime(trade.createdAt, true);
+    row.append(details, time);
+    recentTrades?.append(row);
+  }
 }
 
 function renderMapData(data) {
@@ -274,8 +437,10 @@ function renderMapData(data) {
   if (!residents.some((resident) => resident.id === selectedAgentId)) selectedAgentId = residents[0]?.id || null;
   renderSummary();
   renderMap();
+  world3d?.update(data, selectedAgentId);
   renderAgentPanel(residents.find((resident) => resident.id === selectedAgentId));
   renderActivity();
+  renderTrading();
 }
 
 async function loadMapData() {
@@ -302,7 +467,7 @@ loadStats();
 loadMapData();
 window.setInterval(() => {
   if (document.visibilityState === 'visible') {
-    loadStats();
     loadMapData();
   }
-}, 30_000);
+}, 2_000);
+window.setInterval(() => { if (document.visibilityState === 'visible') loadStats(); }, 30_000);

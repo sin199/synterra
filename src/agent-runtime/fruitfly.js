@@ -8,7 +8,7 @@ export const FRUITFLY_POLICY_VERSION = 'synterra-fruitfly-candidate-policy-v1';
 
 // One stable action family per output neuron. The mapping is an experimental
 // software convention, not a claim about the fly's biological action semantics.
-const ACTIONS = ['eat', 'rest', 'socialize', 'work', 'build_scene', 'travel'];
+const ACTIONS = ['eat', 'rest', 'socialize', 'work', 'build_scene', 'travel', 'trade_crypto', 'trade_hold'];
 const SENSORS = [
   ['synterra:state:food:low', 'synterra:state:food:high'],
   ['synterra:state:energy:low', 'synterra:state:energy:high'],
@@ -84,8 +84,14 @@ function stimulateState(model, observation) {
 };
 
 function feasibleActions(candidates) {
-  const present = new Set(candidates.map((candidate) => candidate.action));
+  const present = new Set(candidates.map((candidate) => actionFamily(candidate.action)));
   return ACTIONS.filter((action) => present.has(action));
+}
+
+function actionFamily(action) {
+  if (['trade','trade_meme'].includes(action)) return 'trade_crypto';
+  if (action === 'learn') return 'travel';
+  return action;
 }
 
 function configureOutputs(model, actions) {
@@ -107,7 +113,7 @@ function pickCandidate(model, observation, candidates, preferredDecision) {
     if (draw < cumulative) { index = i; break; }
   }
   const action = actions[index];
-  const options = candidates.filter((candidate) => candidate.action === action);
+  const options = candidates.filter((candidate) => actionFamily(candidate.action) === action);
   const preferred = options.find((candidate) => candidate.sceneId && candidate.sceneId === preferredDecision?.sceneId)
     || options.find((candidate) => candidate.id === preferredDecision?.id)
     || options[0];
@@ -116,14 +122,15 @@ function pickCandidate(model, observation, candidates, preferredDecision) {
 
 function prepareLearning(model, observation, candidates, selected) {
   const actions = feasibleActions(candidates);
-  if (!actions.includes(selected.action)) throw new Error('Fruitfly selection is outside the feasible candidate set.');
+  const selectedFamily = actionFamily(selected.action);
+  if (!actions.includes(selectedFamily)) throw new Error('Fruitfly selection is outside the feasible candidate set.');
   stimulateState(model, observation);
   configureOutputs(model, actions);
   const probabilities = Array.from(model.learner.probabilities());
-  const chosenIndex = actions.indexOf(selected.action);
+  const chosenIndex = actions.indexOf(selectedFamily);
   const draw = probabilities.slice(0, chosenIndex).reduce((sum, value) => sum + value, 0) + probabilities[chosenIndex] / 2;
   const result = model.learner.act(false, draw);
-  if (result.action !== selected.action) throw new Error('Fruitfly learner action did not match the validated choice.');
+  if (result.action !== selectedFamily) throw new Error('Fruitfly learner action did not match the validated choice.');
 }
 
 function outcomeReward(observation, candidate, result) {
@@ -132,7 +139,8 @@ function outcomeReward(observation, candidate, result) {
     + (unit(result.energy) - unit(before.energy))
     + (unit(result.social) - unit(before.social));
   let contribution = 0;
-  if (candidate.action === 'work' && result.mineId) contribution = 0.15;
+  if (candidate.action === 'work' && (result.mineId || result.income)) contribution = 0.15;
+  else if (candidate.action === 'learn' && result.learning) contribution = 0.1;
   else if (candidate.action === 'build_scene' && result.scene?.id) contribution = 0.15;
   else if (candidate.action === 'travel' && candidate.sceneId
       && !(observation.mind?.memories || []).some((memory) => memory.kind === 'travel' && memory.sceneId === candidate.sceneId)) contribution = 0.15;

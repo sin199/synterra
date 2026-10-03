@@ -6,11 +6,25 @@ import { candidateActions, decideNextAction } from './mind.js';
 import { chooseWithTypeSafe } from './typesafe.js';
 import { skillsForAction } from './skills.js';
 import { createFruitflyRuntime } from './fruitfly.js';
+import { communicationCandidates } from './messaging.js';
 
 const LOCK_FILE = path.join(STATE_DIR, 'runtime.lock');
 const configuredTick = Number(process.env.SYNTERRA_AGENT_TICK_MS || 900_000);
 const TICK_MS = Number.isFinite(configuredTick) ? Math.max(60_000, configuredTick) : 900_000;
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+if (process.env.SYNTERRA_ALLOW_LEGACY_AGENT_RUNTIME !== '1') {
+  try {
+    const response = await fetch(`${API_BASE}/local/map-data`, { headers: { Accept: 'application/json' } });
+    if (response.ok) {
+      const map = await response.json();
+      if (map.world?.engine?.running) {
+        console.log('The persistent World Engine is active; the legacy 15-minute agent loop is disabled to prevent duplicate actions.');
+        process.exit(0);
+      }
+    }
+  } catch {}
+}
 
 await ensurePrivateDirs();
 const state = await loadState();
@@ -61,8 +75,12 @@ async function actOnce(agent) {
   const privateKey = createPrivateKey(await readFile(agent.privateKeyFile, 'utf8'));
   const identity = { agentId: agent.agentId, privateKey };
   const observation = await apiRequest(identity, 'GET', `/v1/worlds/${state.worldId}/observe`);
+  const inboxState = await apiRequest(identity, 'GET', `/v1/worlds/${state.worldId}/messages/inbox?unreadOnly=true&limit=8`);
+  const inbox = inboxState.messages || [];
   let decision = decideNextAction(observation);
-  const candidates = candidateActions(observation, state.mineId);
+  const baseCandidates = candidateActions(observation, state.mineId);
+  const candidates = [...baseCandidates, ...communicationCandidates(observation, inbox, inboxState.recentlyContactedIds || [])]
+    .filter((candidate, index, all) => all.findIndex((item) => item.id === candidate.id) === index);
   let fruitflyChoice = null;
   let decisionSource = 'local';
   let typesafe = null;
@@ -80,7 +98,12 @@ async function actOnce(agent) {
   }
   if (process.env.TYPESAFE_API_KEY) {
     try {
-      const selection = await chooseWithTypeSafe(observation, candidates, state);
+      const socialCandidates = candidates.filter((candidate) => candidate.action === 'socialize');
+      const messagingAllowed = decision.action === 'socialize' && socialCandidates.length > 0;
+      const offeredCandidates = messagingAllowed
+        ? socialCandidates
+        : candidates.filter((candidate) => !candidate.message);
+      const selection = await chooseWithTypeSafe(observation, offeredCandidates, state, messagingAllowed ? inbox : []);
       if (selection.decision) {
         decision = { ...selection.decision, mindUpdate: { currentGoal: selection.decision.goal } };
         decisionSource = 'typesafe';
@@ -94,18 +117,39 @@ async function actOnce(agent) {
   }
   const activeMine = observation.mines?.find((mine) => mine.id === state.mineId && mine.status === 'active');
   if (decision.action === 'work' && !activeMine) throw new Error('Configured Genesis Mine is unavailable; refusing unassigned work.');
-  const body = { action: decision.action, actionId: cryptoRandomId(), mindUpdate: decision.mindUpdate };
-  if (decision.action === 'work') body.mineId = activeMine.id;
-  if (decision.action === 'travel') {
-    if (decision.sceneId) body.sceneId = decision.sceneId;
-    else body.place = 'town-square';
+  const actionId = cryptoRandomId();
+  let result;
+  if (decision.message) {
+    result = await apiRequest(identity, 'POST', `/v1/worlds/${state.worldId}/messages`, {
+      actionId, ...decision.message, mindUpdate: decision.mindUpdate
+    });
+  } else if (decision.action === 'trade_meme') {
+    result = await apiRequest(identity, 'POST', `/v1/worlds/${state.worldId}/trading/robinhood-orders`, {
+      actionId, side: decision.side, tokenAddress: decision.tokenAddress,
+      quoteUnits: decision.quoteUnits, tokenAmountRaw: decision.tokenAmountRaw,
+      quoteVersion: decision.quoteVersion, mindUpdate: decision.mindUpdate
+    });
+  } else if (decision.action === 'trade_crypto') {
+    result = await apiRequest(identity, 'POST', `/v1/worlds/${state.worldId}/trading/orders`, {
+      actionId, side: decision.side, asset: decision.asset, quoteUnits: decision.quoteUnits,
+      quoteVersion: decision.quoteVersion, mindUpdate: decision.mindUpdate
+    });
+  } else if (decision.action === 'trade_hold') {
+    result = await apiRequest(identity, 'POST', `/v1/worlds/${state.worldId}/trading/hold`, {
+      actionId, quoteVersion: decision.quoteVersion, mindUpdate: decision.mindUpdate
+    });
+  } else {
+    const body = { action: decision.action, actionId, mindUpdate: decision.mindUpdate };
+    if (decision.action === 'work') body.mineId = activeMine.id;
+    if (decision.action === 'travel') {
+      if (decision.sceneId) body.sceneId = decision.sceneId;
+      else body.place = 'town-square';
+    }
+    if (decision.action === 'build_scene') body.scene = decision.scene;
+    result = await apiRequest(identity, 'POST', `/v1/worlds/${state.worldId}/actions`, body);
   }
-  if (decision.action === 'build_scene') body.scene = decision.scene;
-  const result = await apiRequest(identity, 'POST', `/v1/worlds/${state.worldId}/actions`, {
-    ...body
-  });
-  const selectedCandidate = candidates.find((candidate) => candidate.action === decision.action
-    && (!decision.sceneId || candidate.sceneId === decision.sceneId)) || null;
+  const selectedCandidate = candidates.find((candidate) => candidate.id === decision.id)
+    || candidates.find((candidate) => candidate.action === decision.action && (!decision.sceneId || candidate.sceneId === decision.sceneId)) || null;
   let fruitflyLearning = null;
   if (fruitfly && fruitflyChoice && selectedCandidate) {
     try {
@@ -117,10 +161,14 @@ async function actOnce(agent) {
   }
   console.log(JSON.stringify({ time: new Date().toISOString(), agent: agent.name, gender: agent.gender, action: result.action,
     goal: decision.goal, place: result.place, scene: result.scene?.name || null, energy: result.energy, food: result.food,
-    social: result.social, rewardUnits: result.rewardUnits, mineId: result.mineId || null, decisionSource,
+    social: result.social, rewardUnits: result.rewardUnits, spentUnits: result.spentUnits || null,
+    balanceUnits: result.balanceUnits || null, mineId: result.mineId || null, decisionSource,
+    ...(decision.action === 'trade_meme' ? { paperOrderId: result.orderId, tokenAddress: result.tokenAddress,
+      side: result.side, notionalUsd: result.notionalUsd, feeUsdc: result.feeUsdc, simulated: result.simulated } : {}),
     ...(fruitflyChoice ? { fruitfly: { chosenFamily: fruitflyChoice.action, confidence: fruitflyChoice.confidence,
       updatesBefore: fruitflyChoice.updates, ...(fruitflyLearning || {}) } } : {}),
     skills: decision.skillIds || skillsForAction(decision.action),
+    ...(decision.message ? { messageId: result.id, messageTemplate: result.templateId, recipientId: result.recipientId } : {}),
     ...(typesafe ? { model: typesafe.model, confidence: typesafe.confidence, inputTokens: typesafe.inputTokens,
       inputCostUsd: typesafe.costUsd, monthlySpendUsd: typesafe.monthlySpendUsd } : {}),
     ...(typesafe?.reason ? { typesafeFallback: typesafe.reason } : {}) }));
