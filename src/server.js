@@ -326,7 +326,7 @@ app.get('/local/map-data', async (_request, reply) => {
   const recentTrades = [...cryptoTrades.rows, ...recentMemeTrades]
     .sort((left, right) => new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime()).slice(0, 50);
   const worldMinutes = Number(clock?.worldMinutes) || 0;
-  const emergence = await readEmergenceReport(pool, { worldId: world.id, worldMinutes });
+  const emergence = await readEmergenceReport(pool, { worldId, worldMinutes });
   const [counts, opportunities, projects, organizations, history, internalUnits] = await Promise.all([
     pool.query(`SELECT
         (SELECT count(*)::int FROM world_members WHERE world_id=$1) AS residents,
