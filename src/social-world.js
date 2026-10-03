@@ -448,7 +448,7 @@ export function fruitflyFamily(action) {
   if (action === 'learn') return 'travel';
   if (['opportunity', 'opportunity_reject'].includes(action)) return 'travel';
   if (['opportunity_propose', 'project_propose', 'project_join', 'project_reject', 'project_contribute',
-    'project_leave', 'place_create'].includes(action)) return 'cooperate';
+    'project_leave', 'place_create', 'goal_review'].includes(action)) return 'cooperate';
   if (['organization_found', 'organization_join', 'organization_reject', 'organization_leave',
     'organization_invite', 'organization_contribute', 'information_share', 'information_accept',
     'information_ignore', 'information_doubt'].includes(action)) return 'socialize';

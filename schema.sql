@@ -490,6 +490,11 @@ ALTER TABLE world_agent_states ADD COLUMN IF NOT EXISTS planned_partner_id uuid 
 ALTER TABLE world_agent_states ADD COLUMN IF NOT EXISTS fruitfly_observation jsonb NOT NULL DEFAULT '{}'::jsonb;
 ALTER TABLE world_agent_states ADD COLUMN IF NOT EXISTS fruitfly_candidates jsonb NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE world_agent_states ADD COLUMN IF NOT EXISTS fruitfly_selected jsonb NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE world_agent_states ADD COLUMN IF NOT EXISTS next_strategic_decision_world_minutes bigint;
+ALTER TABLE world_agent_states ADD COLUMN IF NOT EXISTS strategic_goal_category text;
+ALTER TABLE world_agent_states ADD COLUMN IF NOT EXISTS strategic_goal_progress numeric(5,2);
+ALTER TABLE world_agent_states ADD COLUMN IF NOT EXISTS strategic_goal_progress_world_minutes bigint;
+ALTER TABLE world_agent_states ADD COLUMN IF NOT EXISTS strategic_goal_stagnation_cycles integer NOT NULL DEFAULT 0;
 DO $$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_agent_states'::regclass
@@ -502,6 +507,29 @@ BEGIN
 END $$;
 
 CREATE INDEX IF NOT EXISTS world_agent_states_due_idx ON world_agent_states(world_id, status, next_decision_at);
+
+CREATE TABLE IF NOT EXISTS world_emergence_events (
+  id bigserial PRIMARY KEY,
+  world_id uuid NOT NULL REFERENCES worlds(id) ON DELETE CASCADE,
+  agent_id uuid,
+  world_minutes bigint NOT NULL CHECK (world_minutes >= 0),
+  tick_count bigint NOT NULL DEFAULT 0 CHECK (tick_count >= 0),
+  system text NOT NULL CHECK (system IN ('opportunity','project','organization','information','place','goal')),
+  stage text NOT NULL CHECK (char_length(stage) BETWEEN 2 AND 48),
+  reason_code text NOT NULL DEFAULT 'NONE' CHECK (char_length(reason_code) BETWEEN 2 AND 64),
+  event_key text NOT NULL,
+  candidate_id text,
+  action text,
+  utility_score numeric(12,4),
+  details jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(details)='object'),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (world_id,event_key),
+  FOREIGN KEY (world_id,agent_id) REFERENCES world_members(world_id,agent_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS world_emergence_recent_idx
+  ON world_emergence_events(world_id,world_minutes DESC,id DESC);
+CREATE INDEX IF NOT EXISTS world_emergence_reason_idx
+  ON world_emergence_events(world_id,reason_code,world_minutes DESC);
 
 -- Durable social simulation state. Existing world_agent_states.risk_tolerance
 -- remains the resident's risk personality dimension; these rows add the other
@@ -641,7 +669,7 @@ CREATE TABLE IF NOT EXISTS world_agent_goals (
   priority numeric(5,4) NOT NULL DEFAULT 0.5000 CHECK (priority BETWEEN 0 AND 1),
   progress numeric(5,2) NOT NULL DEFAULT 0 CHECK (progress BETWEEN 0 AND 100),
   status text NOT NULL DEFAULT 'active' CHECK (status IN ('active','completed','paused','abandoned')),
-  source text NOT NULL DEFAULT 'seed' CHECK (source IN ('seed','experience','memory','relationship','opportunity','strategy','self_generated')),
+  source text NOT NULL DEFAULT 'seed' CHECK (source IN ('seed','experience','memory','relationship','opportunity','strategy','self_generated','stagnation')),
   parent_goal_id bigint REFERENCES world_agent_goals(id) ON DELETE SET NULL,
   created_world_minutes bigint NOT NULL DEFAULT 0 CHECK (created_world_minutes >= 0),
   updated_world_minutes bigint NOT NULL DEFAULT 0 CHECK (updated_world_minutes >= 0),
@@ -656,6 +684,15 @@ CREATE UNIQUE INDEX IF NOT EXISTS world_agent_goals_active_category_idx
   ON world_agent_goals(world_id,agent_id,goal_type,category) WHERE status='active';
 CREATE INDEX IF NOT EXISTS world_agent_goals_active_idx
   ON world_agent_goals(world_id,agent_id,goal_type,priority DESC,updated_world_minutes DESC) WHERE status='active';
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_agent_goals'::regclass
+      AND conname='world_agent_goals_source_check' AND pg_get_constraintdef(oid) LIKE '%stagnation%') THEN
+    ALTER TABLE world_agent_goals DROP CONSTRAINT IF EXISTS world_agent_goals_source_check;
+    ALTER TABLE world_agent_goals ADD CONSTRAINT world_agent_goals_source_check
+      CHECK (source IN ('seed','experience','memory','relationship','opportunity','strategy','self_generated','stagnation'));
+  END IF;
+END $$;
 
 CREATE TABLE IF NOT EXISTS world_agent_beliefs (
   world_id uuid NOT NULL,
@@ -711,6 +748,7 @@ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_agent_states'::regclass
     AND conname='world_agent_states_planned_action_check'
     AND pg_get_constraintdef(oid) LIKE '%information_doubt%'
+    AND pg_get_constraintdef(oid) LIKE '%goal_review%'
     AND pg_get_constraintdef(oid) LIKE '%opportunity_propose%') THEN
     ALTER TABLE world_agent_states DROP CONSTRAINT IF EXISTS world_agent_states_planned_action_check;
     ALTER TABLE world_agent_states ADD CONSTRAINT world_agent_states_planned_action_check
@@ -718,7 +756,7 @@ BEGIN
         'opportunity','opportunity_reject','opportunity_propose','project_propose','project_join','project_reject','project_contribute','project_leave',
         'organization_found','organization_join','organization_leave','organization_invite',
         'organization_reject','organization_contribute','place_create','information_share',
-        'information_accept','information_ignore','information_doubt'));
+        'information_accept','information_ignore','information_doubt','goal_review'));
   END IF;
 END $$;
 

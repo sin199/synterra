@@ -11,7 +11,10 @@ import { createFruitflyRuntime } from '../src/agent-runtime/fruitfly.js';
 import { buildActivityCandidates } from '../src/world-engine.js';
 import { createWorldOpportunity, decideWorldOpportunity, completeOpportunityParticipation,
   expireWorldOpportunities, opportunityFit } from '../src/world-opportunities.js';
-import { deriveProjectProposal, deriveOpportunityProposal, buildWorldInitiativeCandidates } from '../src/world-initiatives.js';
+import { deriveProjectProposal, deriveOpportunityProposal, buildWorldInitiativeCandidates,
+  explainWorldInitiativeGaps } from '../src/world-initiatives.js';
+import { GOAL_STAGNATION_MINUTES, STRATEGIC_DECISION_INTERVAL_MINUTES,
+  deriveWorldNeedSignals, readEmergenceReport, recordEmergenceEvent, updateGoalStagnation } from '../src/world-emergence.js';
 import { createProjectPlace, generatedPlaceName } from '../src/world-places.js';
 import { proposeWorldProject, decideProjectMembership, contributeToProject, failWorldProject } from '../src/world-projects.js';
 import { foundWorldOrganization, inviteWorldOrganization, decideOrganizationMembership,
@@ -116,6 +119,76 @@ test('initiative candidates reflect personal skills, relationships, and decision
   assert.ok(candidates.some((item) => item.action === 'project_propose'));
 });
 
+test('goal stagnation only activates after three unchanged strategic intervals and resets on progress', () => {
+  let state = {};
+  let result = updateGoalStagnation(state, { goalCategory: 'MASTER_RESEARCH', progress: 12, worldMinutes: 0 });
+  state = result.state;
+  for (const minute of [180, 360, 540]) {
+    result = updateGoalStagnation(state, { goalCategory: 'MASTER_RESEARCH', progress: 12, worldMinutes: minute });
+    state = result.state;
+  }
+  assert.equal(STRATEGIC_DECISION_INTERVAL_MINUTES, 180);
+  assert.equal(GOAL_STAGNATION_MINUTES, 720);
+  result = updateGoalStagnation(state, { goalCategory: 'MASTER_RESEARCH', progress: 12, worldMinutes: 720 });
+  assert.equal(result.stagnant, true);
+  const improved = updateGoalStagnation(result.state, { goalCategory: 'MASTER_RESEARCH', progress: 13, worldMinutes: 900 });
+  assert.equal(improved.stagnant, false);
+  assert.equal(improved.state.stagnationCycles, 0);
+});
+
+test('world need signals reflect congestion, shortages, backlog, trust and unused complementary skills', () => {
+  const residents = [{ agent_id: 'a', location: 'Library', primary_goal: 'MASTER_RESEARCH', usdc: '10',
+    skills: { research: 40, engineering: 35 }, relationships: [{ otherAgentId: 'b', trust: 12, familiarity: 30 }],
+    sharedProjectPartnerIds: [] },
+  { agent_id: 'b', location: 'Library', primary_goal: 'MASTER_RESEARCH', usdc: '20', skills: { research: 32 } }];
+  const needs = deriveWorldNeedSignals({ residents, scenes: [{ id: 'library', name: 'Library', sceneType: 'library',
+    status: 'active', capacity: 2 }], projects: [{ status: 'active', project_type: 'RESEARCH', updated_world_time: 10 }],
+  opportunities: [], worldMinutes: 500 });
+  const types = new Set(needs.map((item) => item.type));
+  assert.ok(types.has('scene_congestion'));
+  assert.ok(types.has('skill_opportunity_shortage'));
+  assert.ok(types.has('project_backlog'));
+  assert.ok(types.has('trusted_partner_without_shared_work'));
+  assert.ok(needs.some((item) => item.type === 'income_opportunity_shortage'));
+  const complementary = deriveWorldNeedSignals({ residents, scenes: [], projects: [], opportunities: [], worldMinutes: 500 });
+  assert.ok(complementary.some((item) => item.type === 'unused_complementary_skills'));
+});
+
+test('goal stagnation can add a strategic replanning candidate and reasons explain missing systems', () => {
+  const resident = { agentId: 'resident-a', location: 'Library', energy: 72, food: 65, ambition: 0.8,
+    curiosity: 0.75, discipline: 0.7, primaryGoal: 'MASTER_RESEARCH',
+    skills: { research: 48, engineering: 20, trading: 10, social: 22 },
+    goals: [{ id: 1, goalType: 'primary', category: 'MASTER_RESEARCH', status: 'active', progress: 15 }],
+    relationships: [], activeProjects: [], projectMemberships: [], organizationMemberships: [] };
+  const context = { worldMinutes: 900, activePlaceCount: 6, crowdedPlaces: [], opportunities: [], projects: [],
+    goalStagnation: { stagnant: true, stagnantMinutes: 900, state: { stagnationCycles: 5 } },
+    worldNeeds: [{ type: 'skill_opportunity_shortage', severity: 0.8 }] };
+  const candidates = buildWorldInitiativeCandidates(resident, context);
+  assert.ok(candidates.some((candidate) => candidate.action === 'goal_review'));
+  const gaps = explainWorldInitiativeGaps(resident, context, candidates);
+  assert.ok(gaps.some((item) => item.system === 'information' && item.reasonCode === 'NO_PARTNER'));
+  assert.ok(gaps.some((item) => item.system === 'organization' && item.reasonCode === 'NO_PARTNER'));
+});
+
+test('organization gaps distinguish trust, repeated work, incompatible goals, and existing membership', () => {
+  const resident = { agentId: 'resident-a', primaryGoal: 'MASTER_RESEARCH', relationships: [
+    { otherAgentId: 'resident-b', trust: 12, familiarity: 40 }
+  ], organizationMemberships: [] };
+  const context = { worldMinutes: 180, organizationPartners: [{ partnerId: 'resident-b', sharedProjectCount: 2,
+    partnerGoal: 'BUILD_ENGINEERING', trust: 12, familiarity: 40 }] };
+  assert.equal(explainWorldInitiativeGaps(resident, context).find((item) => item.system === 'organization').reasonCode,
+    'INCOMPATIBLE_GOALS');
+  assert.equal(explainWorldInitiativeGaps({ ...resident, organizationMemberships: [
+    { memberIds: ['resident-b'], status: 'active' }
+  ] }, { ...context, organizationPartners: [
+    { ...context.organizationPartners[0], partnerGoal: 'MASTER_RESEARCH' }
+  ] }).find((item) => item.system === 'organization').reasonCode, 'ALREADY_ORGANIZED');
+  assert.equal(explainWorldInitiativeGaps(resident, { ...context, organizationPartners: [] })
+    .find((item) => item.system === 'organization').reasonCode, 'INSUFFICIENT_SHARED_WORK');
+  assert.equal(explainWorldInitiativeGaps({ ...resident, relationships: [] }, { worldMinutes: 180 })
+    .find((item) => item.system === 'organization').reasonCode, 'NO_PARTNER');
+});
+
 test('residents can autonomously propose bounded opportunities from personal skills and needs', () => {
   const resident = { agentId: 'resident-a', name: 'Resident A', location: 'Library', energy: 75, food: 70,
     primaryGoal: 'MASTER_RESEARCH', skills: { research: 42, engineering: 17, trading: 11, social: 24 },
@@ -141,6 +214,45 @@ test('place fallback names are deterministic but vary by project and ordinal', (
   const project = { id: 'project-a', projectType: 'RESEARCH' };
   assert.equal(generatedPlaceName(project), generatedPlaceName(project));
   assert.notEqual(generatedPlaceName(project, 0), generatedPlaceName(project, 1));
+});
+
+test('emergence audit is idempotent and upgrades the old stagnation source constraint', {
+  skip: !testEnabled,
+  timeout: 30_000
+}, async () => {
+  assertIsolatedTestDatabase(databaseUrl);
+  const pool = new Pool({ connectionString: databaseUrl, max: 2 });
+  const worldId = randomUUID();
+  const agentId = randomUUID();
+  try {
+    const schema = await readFile(path.join(repoRoot, 'schema.sql'), 'utf8');
+    await pool.query(schema);
+    await pool.query(`ALTER TABLE world_agent_goals DROP CONSTRAINT IF EXISTS world_agent_goals_source_check;
+      ALTER TABLE world_agent_goals ADD CONSTRAINT world_agent_goals_source_check
+        CHECK (source IN ('seed','experience','memory','relationship','opportunity','strategy','self_generated'))`);
+    await pool.query(schema);
+    await pool.query(`INSERT INTO agents(id,name,public_key,gender) VALUES($1,'Emergence Test Resident',$2,'female')`,
+      [agentId, `emergence-key-${agentId}`]);
+    await pool.query(`INSERT INTO worlds(id,owner_agent_id,name,chain_id,open) VALUES($1,$2,'Emergence Audit Test',5042,true)`,
+      [worldId, agentId]);
+    await pool.query(`INSERT INTO world_members(world_id,agent_id,location) VALUES($1,$2,'Library')`, [worldId, agentId]);
+    await pool.query(`INSERT INTO world_agent_goals(world_id,agent_id,goal_type,category,description,source)
+      VALUES($1,$2,'short','PRACTICE_RESEARCH','Resume a stalled research direction.','stagnation')`, [worldId, agentId]);
+    const event = { worldId, agentId, worldMinutes: 180, tickCount: 180, system: 'project', stage: 'blocked',
+      reasonCode: 'UTILITY_BELOW_THRESHOLD', eventKey: 'same-event-key', candidateId: 'project-candidate',
+      action: 'project_propose', details: { seed: 1 } };
+    await transaction(pool, (client) => recordEmergenceEvent(client, event));
+    await transaction(pool, (client) => recordEmergenceEvent(client, { ...event, details: { seed: 2 } }));
+    const report = await readEmergenceReport(pool, { worldId, worldMinutes: 180 });
+    assert.deepEqual(report.counts, [{ system: 'project', stage: 'blocked', action: 'project_propose', count: 1 }]);
+    assert.deepEqual(report.blockedReasons, [{ system: 'project', reason_code: 'UTILITY_BELOW_THRESHOLD', count: 1 }]);
+    const saved = await pool.query(`SELECT details FROM world_emergence_events WHERE world_id=$1 AND event_key='same-event-key'`, [worldId]);
+    assert.deepEqual(saved.rows[0].details, { seed: 1 });
+  } finally {
+    await pool.query('DELETE FROM worlds WHERE id=$1', [worldId]).catch(() => {});
+    await pool.query('DELETE FROM agents WHERE id=$1', [agentId]).catch(() => {});
+    await pool.end();
+  }
 });
 
 test('isolated V3 lifecycles settle cooperatively and persist across database reconnects', {

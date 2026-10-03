@@ -44,7 +44,20 @@ export function deriveProjectProposal(agent, context = {}) {
   const category = primaryCategory(agent);
   const places = context.crowdedPlaces || [];
   const crowded = places[0] || null;
-  const createPlace = Boolean(type === 'BUILD' && crowded && crowded.congestion >= 0.75);
+  const createPlace = Boolean(type === 'BUILD' && crowded && crowded.congestion >= 0.75
+    && Number(context.activePlaceCount ?? 0) < 40);
+  const needTypes = new Set((context.worldNeeds || []).map((need) => need.type));
+  const proposalReasons = [];
+  if (context.goalStagnation?.stagnant) proposalReasons.push('GOAL_STAGNATION');
+  if (needTypes.has('skill_opportunity_shortage')) proposalReasons.push('WORLD_SCARCITY');
+  if (context.projectOpportunity) proposalReasons.push('HIGH_VALUE_OPPORTUNITY');
+  if ((context.repeatedCooperationCount || 0) > 0) proposalReasons.push('REPEATED_COOPERATION');
+  if (needTypes.has('unused_complementary_skills')) proposalReasons.push('SKILL_COMPLEMENTARITY');
+  if ((agent.organizationMemberships || []).some((item) => item.memberStatus === 'active')) proposalReasons.push('ORGANIZATION_NEED');
+  if (crowded?.congestion >= 0.75) proposalReasons.push('PLACE_CONGESTION');
+  if ((agent.beliefs || []).some((belief) => Number(belief.confidence) >= 0.4
+      && Number(belief.estimate) > 0.25)) proposalReasons.push('FUTURE_GAIN_BELIEF');
+  if (primaryCategory(agent)) proposalReasons.push('PERSONAL_GOAL');
   const titleSet = {
     RESEARCH: ['Shared Field Study', 'Local Research Notes', 'Open Questions Project'],
     LEARNING: ['Peer Learning Circle', 'Skill Exchange Project', 'Practice and Study Group'],
@@ -68,7 +81,7 @@ export function deriveProjectProposal(agent, context = {}) {
     requiredSkills: { [skill]: Math.min(55, Math.max(12, Number(levels[skill] || 0) * 0.35)) },
     requiredResources: { effortPoints: createPlace ? 45 : 28, maxParticipants: createPlace ? 6 : 4 },
     reward: { skill, skillGain: 2, relationship: 1 },
-    metadata: { createPlace, placeType: sceneType,
+    metadata: { createPlace, placeType: sceneType, proposalReasons,
       placePurpose: createPlace ? `A resident-created alternative for ${crowded.name} that adds capacity for the shared world.` : null,
       placeCapacity: 10, goalCategories: category ? [category] : [], initiativeSource: 'personal_goal_and_environment',
       crowdedSceneId: crowded?.id || null } };
@@ -103,7 +116,86 @@ function relevance(agent, action, context = {}) {
         : action.includes('build') || action.includes('project') ? skill === 'engineering' : false;
   const memoryBoost = (agent.recentMemories || []).some((memory) =>
     String(memory.memoryType || '').includes('project') || String(memory.memoryType || '').includes('cooperation')) ? 3 : 0;
-  return (match ? 12 : 0) + memoryBoost + clamp(context.ambition || agent.ambition || 0, 0, 1) * 6;
+  const stagnationBoost = context.goalStagnation?.stagnant
+    ? Math.min(18, 8 + Math.max(0, Number(context.goalStagnation.stagnantMinutes || 0) / 240)) : 0;
+  const needs = context.worldNeeds || [];
+  const needBoost = Math.min(20, needs.reduce((sum, need) => sum + Number(need.severity || 0)
+    * (action.includes('project') || action.includes('build') ? 10 : 5), 0));
+  const frustrationBoost = (agent.recentMemories || []).some((memory) => memory.memoryType === 'failure'
+    && Number(context.worldMinutes || 0) - Number(memory.worldMinutes || 0) <= 720) ? 4 : 0;
+  return (match ? 12 : 0) + memoryBoost + clamp(context.ambition || agent.ambition || 0, 0, 1) * 6
+    + stagnationBoost + needBoost + frustrationBoost;
+}
+
+export function explainWorldInitiativeGaps(agent, context = {}, candidates = []) {
+  const has = (action) => candidates.some((candidate) => candidate.action === action);
+  const energy = Number(agent.energy) || 0;
+  const food = Number(agent.food) || 0;
+  const worldMinutes = Math.max(0, Number(context.worldMinutes) || 0);
+  const needs = context.worldNeeds || [];
+  const reasons = [];
+  const record = (system, reasonCode, details = {}, action = null) => reasons.push({ system, reasonCode, details, action });
+
+  if (!has('opportunity_propose')) {
+    const reason = energy < 30 ? 'ENERGY_LOW' : food < 20 ? 'FOOD_LOW'
+      : Number(agent.activeOpportunitiesCreated || 0) >= 1 ? 'CAPACITY'
+        : Number(context.activeOpportunityCount || 0) >= 32 ? 'CAPACITY'
+          : worldMinutes - Number(agent.lastOpportunityCreatedWorldTime || 0) < 360
+            && agent.lastOpportunityCreatedWorldTime !== null && agent.lastOpportunityCreatedWorldTime !== undefined
+            ? 'COOLDOWN' : 'NO_COMPATIBLE_GOAL';
+    record('opportunity', reason, { actionCandidateMissing: true }, 'opportunity_propose');
+  }
+  if (!has('project_propose')) {
+    const reason = energy < 35 ? 'ENERGY_LOW' : food < 20 ? 'FOOD_LOW'
+      : (agent.activeProjects || []).length >= 1 ? 'CAPACITY'
+        : Number(agent.activeProjectsCreated || 0) >= 2 ? 'CAPACITY'
+          : (context.projects || []).some((project) => project.status === 'recruiting'
+            && project.creator_agent_id === agent.agentId) ? 'COOLDOWN'
+            : needs.length ? 'UTILITY_BELOW_THRESHOLD' : 'NO_SCARCITY';
+    record('project', reason, { actionCandidateMissing: true }, 'project_propose');
+  }
+  if (!has('organization_found')) {
+    const relationships = Array.isArray(agent.relationships) ? agent.relationships : [];
+    const partners = context.organizationPartners || agent.organizationPartners || [];
+    const existingPartners = (agent.organizationMemberships || []).flatMap((organization) =>
+      organization.status === 'dissolved' ? [] : organization.memberIds || []);
+    const hasTrustedPartner = relationships.some((relation) => Number(relation.trust) >= 5
+      && Number(relation.familiarity) >= 25);
+    const repeatedPartners = partners.filter((partner) => Number(partner.sharedProjectCount || 0) >= 2);
+    const trustedRepeatedPartners = repeatedPartners.filter((partner) => Number(partner.trust) >= 5
+      && Number(partner.familiarity) >= 25);
+    const hasCompatibleRepeatedPartner = partners.some((partner) => {
+      const ownSkill = goalSkill(primaryCategory(agent));
+      const partnerSkill = goalSkill(partner.partnerGoal || '');
+      return Number(partner.sharedProjectCount || 0) >= 2 && Number(partner.trust) >= 5
+        && Number(partner.familiarity) >= 25 && (!ownSkill || !partnerSkill || ownSkill === partnerSkill)
+        && !existingPartners.includes(partner.partnerId || partner.agentId);
+    });
+    const reason = !relationships.length && !partners.length ? 'NO_PARTNER'
+      : !hasTrustedPartner && !trustedRepeatedPartners.length ? 'INSUFFICIENT_TRUST'
+        : !repeatedPartners.length ? 'INSUFFICIENT_SHARED_WORK'
+          : !trustedRepeatedPartners.length ? 'INSUFFICIENT_TRUST'
+            : !hasCompatibleRepeatedPartner ? (trustedRepeatedPartners.some((partner) => {
+            const ownSkill = goalSkill(primaryCategory(agent));
+            const partnerSkill = goalSkill(partner.partnerGoal || '');
+            return Number(partner.sharedProjectCount || 0) >= 2 && ownSkill && partnerSkill && ownSkill !== partnerSkill;
+          }) ? 'INCOMPATIBLE_GOALS' : 'ALREADY_ORGANIZED')
+            : 'INSUFFICIENT_SHARED_WORK';
+    record('organization', reason, { trustedPartner: hasTrustedPartner, repeatedPartnerCount: repeatedPartners.length }, 'organization_found');
+  }
+  if (!has('information_share')) {
+    const relationships = Array.isArray(agent.relationships) ? agent.relationships : [];
+    const hasTrusted = relationships.some((relation) => Number(relation.trust) >= 2
+      && Number(relation.familiarity) >= 10);
+    record('information', hasTrusted ? 'NO_INFORMATION_ASYMMETRY'
+      : relationships.length ? 'INSUFFICIENT_TRUST' : 'NO_PARTNER', { actionCandidateMissing: true, trustedPartner: hasTrusted }, 'information_share');
+  }
+  const proposal = deriveProjectProposal(agent, context);
+  if (!proposal.metadata.createPlace) {
+    record('place', Number(context.activePlaceCount || 0) >= 40 ? 'CAPACITY'
+      : (context.crowdedPlaces || []).length ? 'INSUFFICIENT_RESOURCE' : 'NO_SCARCITY', { actionCandidateMissing: true }, 'project_propose');
+  }
+  return reasons;
 }
 
 export function buildWorldInitiativeCandidates(agent, context = {}) {
@@ -125,7 +217,7 @@ export function buildWorldInitiativeCandidates(agent, context = {}) {
     options.push({ id: `opportunity:propose:${proposal.type}`, action: 'opportunity_propose',
       targetLocation: agent.location, goal: `Offer a small ${proposal.type.toLowerCase()} opportunity shaped by your experience.`,
       opportunityProposal: proposal, score: 21 + (goalSkill(primaryCategory(agent)) === proposalSkill ? 10 : 0)
-        + Number(agent.skills?.[proposalSkill] || 0) * 0.12 + relevance(agent, 'project') });
+        + Number(agent.skills?.[proposalSkill] || 0) * 0.12 + relevance(agent, 'project', context) });
   }
 
   for (const opportunity of context.opportunities || []) {
@@ -139,13 +231,13 @@ export function buildWorldInitiativeCandidates(agent, context = {}) {
           goal: `Evaluate and take part in “${opportunity.title}” if it fits current priorities.`,
           description: opportunity.description, opportunityId: opportunity.id,
           opportunityType: opportunity.opportunity_type, score: 30 + (typeSkill === skill ? 16 : 0)
-            + Number(agent.skills?.[typeSkill] || 0) * 0.12 + relevance(agent, 'project')
+            + Number(agent.skills?.[typeSkill] || 0) * 0.12 + relevance(agent, 'project', context)
             + (Number(opportunity.confidence) || 0) * 2 });
       }
       options.push({ id: `opportunity:reject:${opportunity.id}`, action: 'opportunity_reject',
         targetLocation: agent.location, goal: `Decline ${opportunity.title} if its requirements or timing do not fit.`,
         opportunityId: opportunity.id, opportunityType: opportunity.opportunity_type,
-        score: fits ? 7 + relevance(agent, 'project') * 0.1 : 24 + relevance(agent, 'project') * 0.15 });
+        score: fits ? 7 + relevance(agent, 'project', context) * 0.1 : 24 + relevance(agent, 'project', context) * 0.15 });
     }
   }
 
@@ -158,7 +250,7 @@ export function buildWorldInitiativeCandidates(agent, context = {}) {
       targetLocation: agent.location, goal: proposal.goal, description: proposal.description,
       projectProposal: proposal, score: 26 + (skill === requiredSkill ? 18 : 0)
         + Number(agent.skills?.[requiredSkill] || 0) * 0.2 + (context.projectOpportunity ? 8 : 0)
-        + relevance(agent, 'project') + (proposal.metadata.createPlace ? 5 : 0) });
+        + relevance(agent, 'project', context) + (proposal.metadata.createPlace ? 5 : 0) });
   }
 
   for (const project of context.projects || []) {
@@ -171,7 +263,7 @@ export function buildWorldInitiativeCandidates(agent, context = {}) {
           goal: `Decide whether to join ${project.title} based on its purpose and your current goals.`,
           projectId: project.id, decision: 'accept', score: 28 + (typeSkill === skill ? 18 : 0)
             + Number(agent.skills?.[typeSkill] || 0) * 0.15 + relationshipValue(relation) * 0.16
-            + relevance(agent, 'project') });
+            + relevance(agent, 'project', context) });
       options.push({ id: `project:reject:${project.id}`, action: 'project_reject', targetLocation: agent.location,
         goal: `Consider declining ${project.title} if its timing or purpose does not fit your plans.`,
         projectId: project.id, decision: 'reject', score: (fits && hasRoom ? 5 : 24)
@@ -187,7 +279,7 @@ export function buildWorldInitiativeCandidates(agent, context = {}) {
       projectId: project.id, contributionType: typeSkill === 'research' ? 'research'
         : typeSkill === 'trading' ? 'planning' : typeSkill === 'social' ? 'planning' : 'work',
       score: 35 + (typeSkill === skill ? 18 : 0) + Number(agent.skills?.[typeSkill] || 0) * 0.16
-        + relevance(agent, 'project') + Number(project.progress || 0) * 0.04 });
+        + relevance(agent, 'project', context) + Number(project.progress || 0) * 0.04 });
     if (Number(project.deadline_world_time) - Number(context.worldMinutes || 0) < 120
       && Number(project.progress) < 10) options.push({ id: `project:leave:${project.id}`, action: 'project_leave',
       targetLocation: agent.location, goal: `Reconsider whether ${project.title} still deserves your effort.`,
@@ -197,7 +289,7 @@ export function buildWorldInitiativeCandidates(agent, context = {}) {
   for (const invitation of agent.projectInvitations || []) {
     if (projectFit(invitation, agent)) options.push({ id: `project:invitation:${invitation.id}`, action: 'project_join',
       targetLocation: agent.location, goal: `Decide whether to join the invitation for ${invitation.title}.`,
-      projectId: invitation.id, score: 32 + relevance(agent, 'project') });
+      projectId: invitation.id, score: 32 + relevance(agent, 'project', context) });
   }
 
   for (const organization of agent.organizationInvitations || []) {
@@ -205,7 +297,7 @@ export function buildWorldInitiativeCandidates(agent, context = {}) {
     options.push({ id: `organization:join:${organization.id}`, action: 'organization_join',
       targetLocation: agent.location, goal: `Consider joining ${organization.name} based on its purpose and the inviter you know.`,
       organizationId: organization.id, decision: 'accept', score: 22 + relationshipValue(inviter) * 0.2
-        + relevance(agent, 'organization') + (organization.status === 'active' ? 3 : 0) });
+        + relevance(agent, 'organization', context) + (organization.status === 'active' ? 3 : 0) });
     options.push({ id: `organization:reject:${organization.id}`, action: 'organization_reject',
       targetLocation: agent.location, goal: `Decide whether ${organization.name} is not a good fit for you right now.`,
       organizationId: organization.id, decision: 'reject', score: 12 + (Number(inviter?.trust) < 0 ? 8 : 0)
@@ -216,14 +308,14 @@ export function buildWorldInitiativeCandidates(agent, context = {}) {
     for (const organization of organizationMemberships.filter((item) => item.memberStatus === 'active')) {
       options.push({ id: `organization:contribute:${organization.id}`, action: 'organization_contribute',
         targetLocation: agent.location, goal: `Contribute time and skill effort to ${organization.name}.`,
-        organizationId: organization.id, score: 22 + relevance(agent, 'organization')
+        organizationId: organization.id, score: 22 + relevance(agent, 'organization', context)
           + Math.min(8, Number(organization.reputation) / 10) });
       if (organization.projectOpenings?.length) {
         for (const project of organization.projectOpenings) {
           if (!projectMemberships.has(project.id) && projectFit(project, agent)) options.push({
             id: `project:org-join:${project.id}`, action: 'project_join', targetLocation: agent.location,
             goal: `Join the organization project ${project.title} if it fits your skills.`, projectId: project.id,
-            score: 34 + relevance(agent, 'project') + Number(agent.skills?.[matchedSkill(project.project_type)] || 0) * 0.12
+            score: 34 + relevance(agent, 'project', context) + Number(agent.skills?.[matchedSkill(project.project_type)] || 0) * 0.12
           });
         }
       }
@@ -231,7 +323,7 @@ export function buildWorldInitiativeCandidates(agent, context = {}) {
         options.push({ id: `project:org-propose:${organization.id}:${proposal.projectType}`, action: 'project_propose',
           targetLocation: agent.location, goal: proposal.goal, description: proposal.description,
           organizationId: organization.id, projectProposal: proposal,
-          score: 32 + relevance(agent, 'project') + (Number(organization.resources?.effort) >= 10 ? 5 : 0) });
+          score: 32 + relevance(agent, 'project', context) + (Number(organization.resources?.effort) >= 10 ? 5 : 0) });
       }
       const invitee = (agent.relationships || []).filter((relation) => Number(relation.trust) >= 2
         && Number(relation.familiarity) >= 10 && relation.otherAgentId !== agent.agentId
@@ -243,7 +335,7 @@ export function buildWorldInitiativeCandidates(agent, context = {}) {
         goal: `Invite ${invitee.name} to consider contributing to ${organization.name}.`,
         organizationId: organization.id, inviteeAgentId: invitee.otherAgentId,
         score: 18 + Number(invitee.trust) * 0.3 + Number(invitee.familiarity) * 0.12
-          + relevance(agent, 'organization') });
+          + relevance(agent, 'organization', context) });
       if (organization.memberIds?.length > 1) {
         options.push({ id: `organization:leave:${organization.id}`, action: 'organization_leave',
           targetLocation: agent.location, goal: `Reconsider your ongoing role in ${organization.name}.`,
@@ -254,17 +346,44 @@ export function buildWorldInitiativeCandidates(agent, context = {}) {
   }
 
   for (const partner of context.organizationPartners || []) {
+    const partnerSkill = goalSkill(partner.partnerGoal || '');
+    const goalCompatible = !skill || !partnerSkill || skill === partnerSkill;
+    const partnerId = partner.partnerId || partner.agentId;
     const alreadyShared = (agent.organizationMemberships || []).some((organization) =>
-      organization.memberIds?.includes(partner.agentId) && organization.status !== 'dissolved');
-    if (!alreadyShared && Number(partner.trust) >= 5 && Number(partner.familiarity) >= 25) {
+      organization.memberIds?.includes(partnerId) && organization.status !== 'dissolved');
+    if (!alreadyShared && Number(partner.sharedProjectCount || 0) >= 2 && goalCompatible
+        && Number(partner.trust) >= 5 && Number(partner.familiarity) >= 25) {
       const safeName = partner.projectTitle || 'Shared Work';
-      options.push({ id: `organization:found:${partner.agentId}:${partner.projectId}`, action: 'organization_found',
+      options.push({ id: `organization:found:${partnerId}:${partner.projectId}`, action: 'organization_found',
         targetLocation: agent.location, goal: `Consider making a lasting group with ${partner.name} after shared work.`,
-        organizationProposal: { inviteAgentId: partner.agentId, projectId: partner.projectId,
+        organizationProposal: { inviteAgentId: partnerId, projectId: partner.projectId,
           name: `${safeName.slice(0, 48)} Collective`,
-          purpose: `Continue cooperating on the shared goal: ${partner.projectGoal || 'useful work for the world'}.` },
-        score: 27 + Number(partner.trust) * 0.45 + Number(partner.familiarity) * 0.18 + relevance(agent, 'organization') });
+          purpose: `Continue cooperating on the shared goal: ${partner.projectGoal || 'useful work for the world'}.`,
+          sharedProjectCount: Number(partner.sharedProjectCount), partnerGoal: partner.partnerGoal },
+        score: 27 + Number(partner.trust) * 0.45 + Number(partner.familiarity) * 0.18 + relevance(agent, 'organization', context) });
     }
+  }
+
+  const lastStagnationReview = Math.max(0, ...((agent.goals || []).filter((item) => item.source === 'stagnation')
+    .map((item) => Number(item.updatedWorldMinutes ?? item.updated_world_minutes) || 0)));
+  if (context.goalStagnation?.stagnant
+      && (agent.goals || []).filter((item) => item.goalType === 'short' && item.status === 'active').length < 3
+      && Number(context.worldMinutes || 0) - lastStagnationReview >= 720) {
+    const need = (context.worldNeeds || []).filter((item) => !item.agentId || item.agentId === agent.agentId)
+      .sort((left, right) => Number(right.severity || 0) - Number(left.severity || 0))[0];
+    const skillChoice = Object.entries(agent.skills || {}).sort((left, right) => Number(right[1]) - Number(left[1]))[0]?.[0] || skill || 'research';
+    const proposal = need?.type === 'scene_congestion'
+      ? { category: 'BUILD_ALTERNATIVE_PLACE', description: `Replan the stalled goal around capacity needs at ${need.sceneName}.` }
+      : need?.type === 'trusted_partner_without_shared_work' || need?.type === 'unused_complementary_skills'
+        ? { category: 'START_SHARED_PROJECT', description: 'Replan the stalled goal around a useful project with a trusted, complementary resident.' }
+        : { category: `PRACTICE_${skillChoice.toUpperCase()}`, description: `Replan the stalled goal through a concrete ${skillChoice} subgoal.` };
+    options.push({ id: `goal:review:${agent.agentId}:${Math.floor(Number(context.worldMinutes || 0) / 720)}`,
+      action: 'goal_review', targetLocation: agent.location,
+      goal: 'Review a long-stalled goal and add a concrete next step without discarding the resident’s long-term aim.',
+      goalReviewProposal: proposal,
+      score: 30 + Math.min(14, Number(context.goalStagnation.stagnantMinutes || 0) / 120)
+        + Number(agent.discipline || 0.5) * 7 + Number(agent.curiosity || 0.5) * 6
+        + relevance(agent, 'project', context) });
   }
 
   const share = context.shareProposal;
@@ -272,7 +391,7 @@ export function buildWorldInitiativeCandidates(agent, context = {}) {
     action: 'information_share', targetLocation: agent.location,
     goal: `Decide whether sharing a personal observation would help ${share.recipientName}.`,
     informationProposal: share, score: 16 + Number(share.trust || 0) * 0.3
-      + Number(share.familiarity || 0) * 0.12 + relevance(agent, 'information') });
+      + Number(share.familiarity || 0) * 0.12 + relevance(agent, 'information', context) });
 
   for (const message of agent.informationInbox || []) {
     const relation = (agent.relationships || []).find((item) => item.otherAgentId === message.senderAgentId);
@@ -282,7 +401,7 @@ export function buildWorldInitiativeCandidates(agent, context = {}) {
       : message.informationType === 'opportunity' && message.claim?.status === 'open' ? 5 : 0;
     options.push({ id: `information:accept:${message.id}`, action: 'information_accept', targetLocation: agent.location,
       goal: `Evaluate information from ${message.senderName}; accepting updates only your personal belief.`,
-      shareId: message.id, score: 14 + trust * 0.34 + confidence * 18 + alignment + relevance(agent, 'information') });
+      shareId: message.id, score: 14 + trust * 0.34 + confidence * 18 + alignment + relevance(agent, 'information', context) });
     options.push({ id: `information:ignore:${message.id}`, action: 'information_ignore', targetLocation: agent.location,
       goal: 'Leave this information unadopted for now.', shareId: message.id,
       score: 9 + (trust < 0 ? Math.abs(trust) * 0.18 : 0) + (confidence < 0.35 ? 5 : 0) });
@@ -295,21 +414,43 @@ export function buildWorldInitiativeCandidates(agent, context = {}) {
   return options;
 }
 
-export function environmentOpportunityIdeas({ residents = [], scenes = [], worldMinutes = 0, projects = [] } = {}) {
+export function environmentOpportunityIdeas({ residents = [], scenes = [], worldMinutes = 0, projects = [], opportunities = [] } = {}) {
   const result = [];
   const activeProjects = new Set(projects.filter((project) => ['recruiting','proposed','active'].includes(project.status))
     .map((project) => project.project_type));
+  const researchDemand = residents.filter((resident) => goalSkill(primaryCategory(resident)) === 'research').length;
+  const researchSupply = projects.filter((project) => ['proposed','recruiting','active'].includes(project.status)
+    && ['RESEARCH','LEARNING'].includes(project.project_type)).length
+    + opportunities.filter((item) => ['open','active'].includes(item.status)
+      && ['RESEARCH','LEARNING'].includes(item.opportunity_type)).length;
+  const researchShortage = researchDemand >= 2 && researchSupply < researchDemand;
+  const incomeDemand = residents.filter((resident) => Number(resident.usdc || 0) < 100).length;
+  const incomeSupply = opportunities.filter((item) => ['open','active'].includes(item.status)
+    && ['WORK','INCOME'].includes(item.opportunity_type)).length;
+  const incomeShortage = incomeDemand >= 2 && incomeSupply < incomeDemand;
   for (const scene of scenes.filter((item) => item.status === 'active')) {
     const visitors = residents.filter((resident) => resident.location === scene.name).length;
     const congestion = visitors / Math.max(1, Number(scene.capacity || 8));
-    if (scene.sceneType === 'library' && !activeProjects.has('RESEARCH')) result.push({
+    if (scene.sceneType === 'library' && researchShortage && !activeProjects.has('RESEARCH')
+        && !activeProjects.has('LEARNING')) result.push({
       type: 'RESEARCH', sourceType: 'place', sceneId: scene.id, sourceKey: `${scene.id}:${Math.floor(worldMinutes / 240)}`,
       dedupeKey: `environment:research:${scene.id}:${Math.floor(worldMinutes / 240)}`,
       title: `Investigate a question at ${scene.name}`,
       description: 'Compare resident knowledge and produce a small, useful finding for the world.',
       requirements: { minSkills: { research: 5 }, minEnergy: 10, minFood: 5 }, capacity: 2,
       reward: { skill: 'research', skillGain: 1.5, goalProgress: 3 }, risk: { effort: 'moderate' },
-      expiresWorldTime: worldMinutes + 180
+      expiresWorldTime: worldMinutes + 180, metadata: { needReason: 'research_capacity_shortage',
+        researchDemand, researchSupply }
+    });
+    if (scene.sceneType === 'workshop' && incomeShortage) result.push({
+      type: 'WORK', sourceType: 'environment', sceneId: scene.id,
+      sourceKey: `${scene.id}:${Math.floor(worldMinutes / 240)}:income`,
+      dedupeKey: `environment:income:${scene.id}:${Math.floor(worldMinutes / 240)}`,
+      title: `Find useful paid work near ${scene.name}`,
+      description: 'Residents with low simulated balances have limited income opportunities; identify a bounded useful shift.',
+      requirements: { minEnergy: 15, minFood: 8 }, capacity: Math.min(4, Math.max(2, incomeDemand)),
+      reward: { effortCredit: 1 }, risk: { effort: 'low' }, expiresWorldTime: worldMinutes + 180,
+      metadata: { needReason: 'income_opportunity_shortage', incomeDemand, incomeSupply }
     });
     if (congestion >= 0.75 && scene.capacity) result.push({
       type: scene.sceneType === 'cafe' || scene.sceneType === 'commons' ? 'SOCIAL' : 'BUILD',

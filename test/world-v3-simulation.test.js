@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { randomUUID } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -11,9 +11,29 @@ import { initialMind } from '../src/agent-runtime/mind.js';
 import { startWorldEngine } from '../src/world-engine.js';
 
 const databaseUrl = process.env.SYNTERRA_TEST_DATABASE_URL;
-const hours = Number(process.env.SYNTERRA_V3_SIMULATION_HOURS || 0);
-const enabled = process.env.SYNTERRA_TEST_ISOLATED === '1' && Boolean(databaseUrl) && [24, 72].includes(hours);
+const hours = 24 * 7;
+const simulationSeeds = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+const enabled = process.env.SYNTERRA_TEST_ISOLATED === '1' && Boolean(databaseUrl);
 const repoRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+
+function deterministicUuid(seed, label) {
+  const bytes = createHash('sha256').update(`synterra-v3.1:${seed}:${label}`).digest().subarray(0, 16);
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = bytes.toString('hex');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+function median(values) {
+  const sorted = [...values].sort((left, right) => left - right);
+  if (!sorted.length) return 0;
+  const middle = Math.floor(sorted.length / 2);
+  return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
+}
+
+function summarize(values) {
+  return { median: median(values), min: Math.min(...values), max: Math.max(...values) };
+}
 
 function assertIsolatedDatabase(connectionString) {
   const parsed = new URL(connectionString);
@@ -22,28 +42,32 @@ function assertIsolatedDatabase(connectionString) {
   assert.notEqual(parsed.port, '5432', 'simulation must not use the default PostgreSQL port');
 }
 
-test(`isolated Fruitfly world simulation runs ${hours || 'requested'} world hours`, {
+test(`isolated Fruitfly world simulation runs 10 deterministic seeds for ${hours} world hours each`, {
   skip: !enabled,
-  timeout: hours === 72 ? 300_000 : 180_000
+  timeout: 900_000
 }, async (t) => {
   assertIsolatedDatabase(databaseUrl);
-  const openedAt = performance.now();
-  const simulationId = randomUUID();
-  const worldId = randomUUID();
-  const agentIds = Array.from({ length: 10 }, () => randomUUID());
-  const ownerId = agentIds[0];
-  const stepSeconds = 5;
-  const simulatedMinutes = hours * 60;
-  const steps = simulatedMinutes / stepSeconds;
-  const baseMs = Date.now() + 30_000;
-  let nowMs = baseMs;
-  let pool = new Pool({ connectionString: databaseUrl, max: 4 });
-  let engine = null;
-  let fruitflyDirectory = null;
-  const errors = new Map();
-  const errorSamples = [];
-  try {
-    await pool.query(await readFile(path.join(repoRoot, 'schema.sql'), 'utf8'));
+  const seedSummaries = [];
+  for (const seed of simulationSeeds) {
+    const openedAt = performance.now();
+    const simulationId = `seed-${seed}`;
+    const worldId = deterministicUuid(seed, 'world');
+    const agentIds = Array.from({ length: 10 }, (_, index) => deterministicUuid(seed, `agent-${index + 1}`));
+    const ownerId = agentIds[0];
+    const stepSeconds = 5;
+    const simulatedMinutes = hours * 60;
+    const steps = simulatedMinutes / stepSeconds;
+    const baseMs = Date.UTC(2026, 9, 4) + seed * 60_000;
+    let nowMs = baseMs;
+    let pool = new Pool({ connectionString: databaseUrl, max: 4 });
+    let engine = null;
+    let fruitflyDirectory = null;
+    const errors = new Map();
+    const errorSamples = [];
+    try {
+      await pool.query(await readFile(path.join(repoRoot, 'schema.sql'), 'utf8'));
+      await pool.query('DELETE FROM worlds WHERE id=$1', [worldId]);
+      await pool.query('DELETE FROM agents WHERE id=ANY($1::uuid[])', [agentIds]);
     await pool.query(`INSERT INTO agents(id,name,public_key,gender) VALUES ${agentIds.map((_, index) =>
       `($${index * 3 + 1},$${index * 3 + 2},$${index * 3 + 3},'${index % 2 ? 'male' : 'female'}')`).join(',')}`,
     agentIds.flatMap((id, index) => [id, `Simulation ${simulationId.slice(0, 6)} Resident ${String(index + 1).padStart(2, '0')}`, `sim-key-${id}`]));
@@ -71,7 +95,7 @@ test(`isolated Fruitfly world simulation runs ${hours || 'requested'} world hour
       await pool.query(`INSERT INTO world_members(world_id,agent_id,role,energy,food,social,location)
         VALUES($1,$2,$3,100,100,100,$4)`,
       [worldId, agentId, index === 0 ? 'owner' : 'resident', placeNames[index % placeNames.length]]);
-      const mind = initialMind(index + 1);
+      const mind = initialMind((index + seed - 1) % 10 + 1);
       await pool.query(`INSERT INTO agent_minds(world_id,agent_id,archetype,traits,current_goal)
         VALUES($1,$2,$3,$4::jsonb,$5)`,
       [worldId, agentId, mind.archetype, JSON.stringify(mind.traits), mind.currentGoal]);
@@ -84,7 +108,7 @@ test(`isolated Fruitfly world simulation runs ${hours || 'requested'} world hour
     await pool.query(`INSERT INTO world_runtime_state(world_id,tick_count,world_minutes,last_tick_at,typesafe_next_at)
       VALUES($1,0,0,$2,$3)`, [worldId, new Date(baseMs - stepSeconds * 1_000), new Date(baseMs + 24 * 60 * 60 * 1_000)]);
 
-    fruitflyDirectory = await mkdtemp(path.join(os.tmpdir(), `synterra-v3-${hours}h-`));
+    fruitflyDirectory = await mkdtemp(path.join(os.tmpdir(), `synterra-v31-${seed}-`));
     const fruitfly = await createFruitflyRuntime(fruitflyDirectory);
     engine = await startWorldEngine(pool, { schedule: false, fruitfly, nowProvider: () => nowMs,
       onError(error, phase) {
@@ -119,14 +143,6 @@ test(`isolated Fruitfly world simulation runs ${hours || 'requested'} world hour
     const actionDistribution = await pool.query(`SELECT data->>'action' AS action,count(*)::int AS count
       FROM world_events WHERE world_id=$1 AND event_type='world.action_completed'
       GROUP BY data->>'action' ORDER BY count(*) DESC,data->>'action'`, [worldId]);
-    const initiativeOutcomes = await pool.query(`SELECT data->>'action' AS action,data->>'abandoned' AS abandoned,
-        data->'initiative'->>'status' AS initiative_status,data->'initiative'->>'created' AS initiative_created,
-        count(*)::int AS count FROM world_events WHERE world_id=$1 AND event_type='world.action_completed'
-        AND data->>'action' IN ('opportunity_propose','project_propose','project_join','project_contribute')
-        GROUP BY data->>'action',data->>'abandoned',data->'initiative'->>'status',data->'initiative'->>'created'
-        ORDER BY data->>'action',data->>'abandoned'`, [worldId]);
-    const history = await pool.query(`SELECT world_time AS "worldTime",event_type AS "eventType",title,detail,entity_id AS "entityId"
-      FROM world_history WHERE world_id=$1 ORDER BY world_time,id LIMIT 100`, [worldId]);
     const residentActivity = await pool.query(`SELECT agent.name,count(event.id)::int AS actions,
         count(DISTINCT event.data->>'action')::int AS distinct_actions,
         count(DISTINCT COALESCE(event.data->>'place',event.data->>'to'))::int AS distinct_places
@@ -144,12 +160,47 @@ test(`isolated Fruitfly world simulation runs ${hours || 'requested'} world hour
     const duplicatePlaces = await pool.query(`SELECT count(*)::int AS count FROM (
       SELECT created_by_project_id FROM world_scenes WHERE world_id=$1 AND created_by_project_id IS NOT NULL
       GROUP BY created_by_project_id HAVING count(*)>1) duplicates`, [worldId]);
-    const summary = { simulationId, worldId, simulatedHours: hours, worldMinutes: final.rows[0].world_minutes,
+    const emergenceRows = await pool.query(`SELECT system,stage,reason_code AS "reasonCode",action,count(*)::int AS count
+      FROM world_emergence_events WHERE world_id=$1 GROUP BY system,stage,reason_code,action
+      ORDER BY system,stage,reason_code,action`, [worldId]);
+    const emergenceFunnel = emergenceRows.rows;
+    const metric = (system, stage) => emergenceFunnel
+      .filter((item) => item.system === system && item.stage === stage)
+      .reduce((sum, item) => sum + Number(item.count), 0);
+    const actionMetric = (system, stage, action) => emergenceFunnel
+      .filter((item) => item.system === system && item.stage === stage && item.action === action)
+      .reduce((sum, item) => sum + Number(item.count), 0);
+    const emergenceMetrics = {
+      opportunitiesCreated: metric('opportunity', 'created'),
+      opportunityAccepted: metric('opportunity', 'accepted'),
+      opportunitiesExpired: metric('opportunity', 'expired'),
+      projectProposed: metric('project', 'proposed'),
+      projectJoined: metric('project', 'joined'),
+      projectsActive: metric('project', 'active'),
+      projectsCompleted: metric('project', 'completed'),
+      projectsFailed: metric('project', 'failed'),
+      projectsAbandoned: metric('project', 'abandoned'),
+      organizationsProposed: metric('organization', 'proposed'),
+      organizationsFormed: metric('organization', 'formed'),
+      organizationsRejected: metric('organization', 'rejected'),
+      informationCandidates: actionMetric('information', 'considered', 'information_share'),
+      informationShared: metric('information', 'shared'),
+      informationAccepted: metric('information', 'accepted'),
+      informationIgnored: metric('information', 'ignored'),
+      placesProposed: metric('place', 'proposal'),
+      placesBuildStarted: metric('place', 'build_started'),
+      placesCreated: metric('place', 'created'),
+      goalReviews: metric('goal', 'replanned')
+    };
+    const blockerCounts = emergenceFunnel.filter((item) => item.stage === 'blocked' && item.reasonCode !== 'NONE')
+      .map((item) => ({ system: item.system, reasonCode: item.reasonCode, count: Number(item.count) }))
+      .sort((left, right) => right.count - left.count || left.system.localeCompare(right.system));
+    const summary = { seed, simulationId, worldId, simulatedHours: hours, worldMinutes: final.rows[0].world_minutes,
       elapsedSeconds: Math.round((performance.now() - openedAt) / 1_000), fruitfly: 'local bundled runtime',
       typesafe: 'disabled; no provider/network call', errors: Object.fromEntries(errors), errorSamples,
-      state: final.rows[0], actionDistribution: actionDistribution.rows, initiativeOutcomes: initiativeOutcomes.rows,
+      state: final.rows[0], actionDistribution: actionDistribution.rows,
       residentActivity: residentActivity.rows, maxActiveProjectsPerResident: activeProjectMax.rows[0].max_active_projects_per_resident,
-      duplicateGeneratedPlaces: duplicatePlaces.rows[0].count, history: history.rows };
+      duplicateGeneratedPlaces: duplicatePlaces.rows[0].count, emergenceMetrics, emergenceFunnel, blockerCounts };
 
     await pool.end();
     pool = new Pool({ connectionString: databaseUrl, max: 2 });
@@ -159,7 +210,9 @@ test(`isolated Fruitfly world simulation runs ${hours || 'requested'} world hour
         (SELECT count(*)::int FROM world_scenes WHERE world_id=$1 AND created_by_project_id IS NOT NULL) AS generated_places,
         (SELECT world_minutes::int FROM world_runtime_state WHERE world_id=$1) AS world_minutes`, [worldId]);
     summary.persistenceAfterReconnect = afterReconnect.rows[0];
-    t.diagnostic(JSON.stringify(summary));
+    seedSummaries.push(summary);
+    t.diagnostic(JSON.stringify({ seed, worldMinutes: summary.worldMinutes,
+      completedActions: summary.state.completed_actions, emergenceMetrics, topBlockers: blockerCounts.slice(0, 5) }));
 
     assert.equal(summary.state.world_minutes, simulatedMinutes, 'simulation must advance the exact requested world time');
     assert.equal(Object.values(errors).reduce((sum, count) => sum + count, 0), 0, 'simulation should complete without engine errors');
@@ -172,13 +225,45 @@ test(`isolated Fruitfly world simulation runs ${hours || 'requested'} world hour
     assert.deepEqual(summary.persistenceAfterReconnect.organizations, summary.state.organizations);
     assert.deepEqual(summary.persistenceAfterReconnect.generated_places, summary.state.generated_places);
     assert.ok(summary.residentActivity.every((resident) => resident.actions > 0), 'all residents should remain active');
-  } finally {
-    if (engine) await engine.stop();
-    if (pool) {
-      await pool.query('DELETE FROM worlds WHERE id=$1', [worldId]).catch(() => {});
-      await pool.query('DELETE FROM agents WHERE id=ANY($1::uuid[])', [agentIds]).catch(() => {});
-      await pool.end();
+    } finally {
+      if (engine) await engine.stop();
+      if (pool) {
+        await pool.query('DELETE FROM worlds WHERE id=$1', [worldId]).catch(() => {});
+        await pool.query('DELETE FROM agents WHERE id=ANY($1::uuid[])', [agentIds]).catch(() => {});
+        await pool.end();
+      }
+      if (fruitflyDirectory) await rm(fruitflyDirectory, { recursive: true, force: true });
     }
-    if (fruitflyDirectory) await rm(fruitflyDirectory, { recursive: true, force: true });
+  }
+
+  const metricKeys = Object.keys(seedSummaries[0].emergenceMetrics);
+  const aggregate = Object.fromEntries(metricKeys.map((key) => [key, summarize(seedSummaries.map((summary) =>
+    summary.emergenceMetrics[key]))]));
+  const thresholds = { opportunitiesCreated: 8, projectProposed: 8, informationShared: 5,
+    organizationsFormed: 3, placesCreated: 3 };
+  const seedsWithOutcomes = Object.fromEntries(Object.entries(thresholds).map(([key]) => [key,
+    seedSummaries.filter((summary) => summary.emergenceMetrics[key] > 0).length]));
+  const commonBlockers = new Map();
+  for (const summary of seedSummaries) for (const blocker of summary.blockerCounts) {
+    const key = `${blocker.system}:${blocker.reasonCode}`;
+    commonBlockers.set(key, (commonBlockers.get(key) || 0) + blocker.count);
+  }
+  const topBlockers = [...commonBlockers.entries()].map(([key, count]) => ({ key, count }))
+    .sort((left, right) => right.count - left.count || left.key.localeCompare(right.key)).slice(0, 12);
+  const funnelKeys = new Set(seedSummaries.flatMap((summary) => summary.emergenceFunnel.map((item) =>
+    JSON.stringify([item.system, item.stage, item.action]))));
+  const funnelAggregate = Object.fromEntries([...funnelKeys].map((key) => {
+    const [system, stage, action] = JSON.parse(key);
+    const perSeed = seedSummaries.map((summary) => summary.emergenceFunnel
+      .filter((item) => item.system === system && item.stage === stage && item.action === action)
+      .reduce((sum, item) => sum + Number(item.count), 0));
+    return [`${system}.${stage}.${action || 'none'}`, summarize(perSeed)];
+  }));
+  t.diagnostic(JSON.stringify({ simulation: '10 seeds x 7 world days', aggregate, seedsWithOutcomes,
+    funnelAggregate, topBlockers, elapsedSeconds: seedSummaries.reduce((sum, item) => sum + item.elapsedSeconds, 0),
+    utilityThresholdRatio: 0.75, fruitflySelection: 'unchanged; selects within Utility-qualified candidate set' }));
+  for (const [key, minimumSeeds] of Object.entries(thresholds)) {
+    assert.ok(seedsWithOutcomes[key] >= minimumSeeds,
+      `${key} must occur in at least ${minimumSeeds}/10 seeds; observed ${seedsWithOutcomes[key]}/10`);
   }
 });

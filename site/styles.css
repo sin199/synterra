@@ -170,4 +170,5 @@
 .world-evolution-card li strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#dbe4d4;font-size:10px;font-weight:600}
 .world-evolution-card li span{color:#879380;font:8px/1.55 var(--mono);overflow-wrap:anywhere}
 .world-evolution-empty{grid-column:1/-1;margin:0;padding:9px 0;color:#798574;font-size:10px;line-height:1.6}
-@media(max-width:620px){.world-evolution{padding:16px}.evolution-heading{align-items:flex-start;flex-direction:column;gap:8px}.evolution-heading>span{text-align:left}.world-evolution-stats{grid-template-columns:repeat(2,minmax(0,1fr))}.world-evolution-grid{grid-template-columns:1fr}.world-evolution-stat{padding:11px}}
+.emergence-audit-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin-top:10px}
+@media(max-width:620px){.world-evolution{padding:16px}.evolution-heading{align-items:flex-start;flex-direction:column;gap:8px}.evolution-heading>span{text-align:left}.world-evolution-stats{grid-template-columns:repeat(2,minmax(0,1fr))}.world-evolution-grid,.emergence-audit-grid{grid-template-columns:1fr}.world-evolution-stat{padding:11px}}

@@ -24,6 +24,8 @@ const opportunityList = document.querySelector('#world-opportunity-list');
 const projectList = document.querySelector('#world-project-list');
 const organizationList = document.querySelector('#world-organization-list');
 const historyList = document.querySelector('#world-history-list');
+const emergenceCountsList = document.querySelector('#world-emergence-counts');
+const emergenceBlockersList = document.querySelector('#world-emergence-blockers');
 const numberFormat = new Intl.NumberFormat('zh-CN');
 const moneyFormat = new Intl.NumberFormat('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const MAP_POINTS = [
@@ -591,6 +593,35 @@ function renderWorldEvolution() {
   });
   renderEvolutionList(historyList, evolution.history, '世界还没有留下重要历史。', (item) =>
     `${item.detail || item.eventType || ''} · 第 ${Math.max(1, Math.floor(Number(item.worldTime || 0) / 1_440) + 1)} 天`);
+  const systemLabels = { opportunity: '机会', project: '项目', organization: '组织', information: '信息分享', place: '新地点', goal: '目标' };
+  const stageLabels = { considered: '已考虑', eligible: '符合资格', blocked: '被阻塞', not_selected: 'Fruitfly 未选',
+    fruitfly_selected: 'Fruitfly 已选', created: '已创建', accepted: '已接受', expired: '已过期', proposed: '已提案',
+    joined: '已加入', rejected: '已拒绝', active: '进行中', completed: '已完成', failed: '失败', abandoned: '已放弃',
+    formed: '已成立', shared: '已分享', ignored: '已忽略', proposal: '建造提案', build_started: '开始建造',
+    progress_check: '停滞检查', replanned: '已重规划', progressed: '有进展', doubted: '已质疑' };
+  const actionLabels = { opportunity_propose: '发起机会', opportunity: '参与机会', project_propose: '发起项目',
+    project_join: '加入项目', project_contribute: '项目投入', organization_found: '发起组织',
+    organization_join: '加入组织', information_share: '分享信息', information_accept: '采纳信息',
+    goal_review: '目标复盘' };
+  const reasonLabels = { NONE: '无阻塞', UTILITY_BELOW_THRESHOLD: 'Utility 低于门槛', FRUITFLY_NOT_SELECTED: 'Fruitfly 选择了其他候选',
+    NO_COMPATIBLE_GOAL: '没有兼容目标', INSUFFICIENT_TRUST: '信任不足', INSUFFICIENT_SHARED_WORK: '共同工作不足',
+    NO_PARTNER: '没有合适伙伴', NO_INFORMATION_ASYMMETRY: '没有信息差', NO_SCARCITY: '没有真实短缺',
+    SCENE_CONGESTION: '场景拥挤', GOAL_STAGNANT: '目标长期停滞', GOAL_PROGRESSING: '目标仍在推进',
+    ENERGY_LOW: '精力不足', FOOD_LOW: '食物不足', CAPACITY: '容量已满', COOLDOWN: '冷却中',
+    NEEDS_HARD_GATE: '需求硬约束阻止', INCOMPATIBLE_GOALS: '目标不兼容', DEADLINE_PASSED: '项目逾期' };
+  const emergence = evolution.emergence || {};
+  const counts = (emergence.counts || []).map((item) => ({ ...item,
+    title: `${systemLabels[item.system] || item.system} · ${stageLabels[item.stage] || item.stage}`
+      + `${item.action ? ` · ${actionLabels[item.action] || item.action}` : ''} · ${item.count}` }));
+  const latestDecision = (emergence.recent || []).find((item) => item.stage === 'fruitfly_selected');
+  if (latestDecision) counts.unshift({ title: `最近战略选择 · ${latestDecision.action || '—'}`,
+    system: latestDecision.system, worldMinutes: latestDecision.worldMinutes });
+  renderEvolutionList(emergenceCountsList, counts, '最近 7 个世界日内尚无战略周期记录。', (item) =>
+    `${systemLabels[item.system] || item.system}${item.worldMinutes ? ` · 世界分钟 ${item.worldMinutes}` : ''}`);
+  const blockers = (emergence.blockedReasons || []).map((item) => ({ ...item,
+    title: reasonLabels[item.reasonCode] || item.reasonCode }));
+  renderEvolutionList(emergenceBlockersList, blockers, '最近 7 个世界日没有记录到阻塞原因。', (item) =>
+    `${systemLabels[item.system] || item.system} · ${item.count} 次`);
 }
 
 function renderSummary() {

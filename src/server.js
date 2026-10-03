@@ -20,6 +20,7 @@ import { proposeWorldProject, decideProjectMembership, contributeToProject, list
 import { foundWorldOrganization, inviteWorldOrganization, decideOrganizationMembership,
   contributeOrganizationEffort, listWorldOrganizations } from './world-organizations.js';
 import { shareWorldInformation, decideWorldInformationShare, listInformationInbox } from './world-information.js';
+import { readEmergenceReport } from './world-emergence.js';
 
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const SITE_ROOT = path.join(ROOT, 'site');
@@ -325,6 +326,7 @@ app.get('/local/map-data', async (_request, reply) => {
   const recentTrades = [...cryptoTrades.rows, ...recentMemeTrades]
     .sort((left, right) => new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime()).slice(0, 50);
   const worldMinutes = Number(clock?.worldMinutes) || 0;
+  const emergence = await readEmergenceReport(pool, { worldId: world.id, worldMinutes });
   const [counts, opportunities, projects, organizations, history, internalUnits] = await Promise.all([
     pool.query(`SELECT
         (SELECT count(*)::int FROM world_members WHERE world_id=$1) AS residents,
@@ -358,6 +360,7 @@ app.get('/local/map-data', async (_request, reply) => {
       totalSimulatedWealthUsd: cryptoPortfolios.rows.reduce((sum, row) => sum + Number(row.netAssetValueUsd || 0), 0).toFixed(2),
       totalInternalUnits: internalUnits.rows[0].units }, opportunities: opportunities.rows, projects,
     organizations, history: history.rows };
+  worldEvolution.emergence = emergence;
   return { world: { ...world.rows[0], engine: clock || { running: false } }, scenes: scenes.rows, residents: residents.rows, events: events.rows,
     dataCenterLogs: dataCenterLogs.rows, trading: { simulated: true, quotes: cryptoQuotes, robinhood: robinhoodMarket,
       portfolios: cryptoPortfolios.rows, recentTrades }, worldEvolution, generatedAt: new Date().toISOString() };

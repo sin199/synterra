@@ -10,7 +10,10 @@ import {
   memoryForCompletedAction, recentMemoryUtility, reflectionDue, reflectionProposal, seededGoalSet,
   skillGainForAction
 } from './social-world.js';
-import { buildWorldInitiativeCandidates, environmentOpportunityIdeas } from './world-initiatives.js';
+import { buildWorldInitiativeCandidates, environmentOpportunityIdeas,
+  explainWorldInitiativeGaps } from './world-initiatives.js';
+import { GOAL_STAGNATION_MINUTES, STRATEGIC_DECISION_INTERVAL_MINUTES,
+  deriveWorldNeedSignals, recordEmergenceEvent, updateGoalStagnation } from './world-emergence.js';
 import { createWorldOpportunity, decideWorldOpportunity, completeOpportunityParticipation,
   expireWorldOpportunities, listAvailableOpportunities } from './world-opportunities.js';
 import { proposeWorldProject, decideProjectMembership, contributeToProject, failWorldProject,
@@ -27,7 +30,7 @@ const ACTION_SECONDS = Object.freeze({ work: 16, cooperate: 16, learn: 11, rest:
   opportunity: 12, opportunity_reject: 8, opportunity_propose: 10, project_propose: 12, project_join: 10, project_reject: 8, project_contribute: 16,
   project_leave: 8, organization_found: 14, organization_join: 10, organization_reject: 8,
   organization_leave: 8, organization_invite: 10, organization_contribute: 12, information_share: 10,
-  information_accept: 8, information_ignore: 6, information_doubt: 8 });
+  information_accept: 8, information_ignore: 6, information_doubt: 8, goal_review: 10 });
 const GOALS = Object.freeze(['wealth','learn','community','wellbeing','balanced','wealth','learn','community','wellbeing','balanced']);
 const RISK_TOLERANCE = Object.freeze([0.78,0.28,0.52,0.22,0.68,0.35,0.82,0.47,0.70,0.40]);
 const ALLOWED_GOALS = new Set(['wealth','learn','community','wellbeing','balanced']);
@@ -35,6 +38,15 @@ const FINITE_STAT_KEYS = ['energy','food','social','happiness','knowledge'];
 
 function stableInt(input) {
   return createHash('sha256').update(String(input)).digest().readUInt32BE(0);
+}
+
+function initiativeSystem(action) {
+  if (action === 'goal_review') return 'goal';
+  if (action.startsWith('opportunity')) return 'opportunity';
+  if (action.startsWith('project')) return 'project';
+  if (action.startsWith('organization')) return 'organization';
+  if (action.startsWith('information')) return 'information';
+  return 'place';
 }
 
 function finite(value, fallback = 0) {
@@ -244,7 +256,7 @@ async function querySequentially(queries) {
 }
 
 async function loadWorldInitiatives(client, worldId, worldMinutes, residents, scenes) {
-  const [opportunities, projects, projectMembers, organizations, inbox, completedPairs, recentShares, creatorOpportunityStats] = await querySequentially([
+  const [opportunities, projects, projectMembers, organizations, inbox, completedPairs, recentShares, creatorOpportunityStats, beliefs] = await querySequentially([
     () => client.query(`SELECT opportunity.*,scene.name AS "sceneName",
         count(participant.agent_id) FILTER (WHERE participant.status='accepted')::int AS "acceptedCount",
         COALESCE(array_agg(participant.agent_id) FILTER (WHERE participant.agent_id IS NOT NULL),'{}') AS "participantIds"
@@ -270,7 +282,11 @@ async function loadWorldInitiatives(client, worldId, worldMinutes, residents, sc
       WHERE share.world_id=$1 AND share.status='offered' AND share.expires_world_time>$2
       ORDER BY share.shared_world_time DESC,share.id LIMIT 200`, [worldId, worldMinutes]),
     () => client.query(`SELECT left_member.agent_id AS "agentId",right_member.agent_id AS "partnerId",other.name AS "partnerName",
-        project.id AS "projectId",project.title AS "projectTitle",project.goal AS "projectGoal",
+        (array_agg(project.id ORDER BY project.updated_world_time DESC,project.id))[1] AS "projectId",
+        (array_agg(project.title ORDER BY project.updated_world_time DESC,project.id))[1] AS "projectTitle",
+        (array_agg(project.goal ORDER BY project.updated_world_time DESC,project.id))[1] AS "projectGoal",
+        COALESCE(partner_profile.primary_goal,'') AS "partnerGoal",
+        count(DISTINCT project.id)::int AS "sharedProjectCount",
         COALESCE(relation.familiarity,0)::text AS familiarity,COALESCE(relation.trust,0)::text AS trust
       FROM world_projects project
       JOIN world_project_members left_member ON left_member.world_id=project.world_id
@@ -279,11 +295,15 @@ async function loadWorldInitiatives(client, worldId, worldMinutes, residents, sc
         AND right_member.project_id=project.id AND right_member.status='completed'
         AND right_member.agent_id<>left_member.agent_id
       JOIN agents other ON other.id=right_member.agent_id
+      LEFT JOIN world_social_profiles partner_profile ON partner_profile.world_id=project.world_id
+        AND partner_profile.agent_id=right_member.agent_id
       LEFT JOIN world_relationships relation ON relation.world_id=project.world_id
         AND relation.agent_a_id=LEAST(left_member.agent_id,right_member.agent_id)
         AND relation.agent_b_id=GREATEST(left_member.agent_id,right_member.agent_id)
       WHERE project.world_id=$1 AND project.status='completed'
-      ORDER BY project.updated_world_time DESC,project.id LIMIT 500`, [worldId]),
+      GROUP BY left_member.agent_id,right_member.agent_id,other.name,partner_profile.primary_goal,relation.familiarity,relation.trust
+      HAVING count(DISTINCT project.id)>=2
+      ORDER BY count(DISTINCT project.id) DESC,left_member.agent_id,right_member.agent_id LIMIT 500`, [worldId]),
     () => client.query(`SELECT sender_agent_id AS "senderAgentId",recipient_agent_id AS "recipientAgentId",
         max(shared_world_time)::bigint AS "lastShareWorldTime"
       FROM world_information_shares WHERE world_id=$1 GROUP BY sender_agent_id,recipient_agent_id`, [worldId]),
@@ -291,11 +311,14 @@ async function loadWorldInitiatives(client, worldId, worldMinutes, residents, sc
         count(*) FILTER (WHERE status IN ('open','active') AND (expires_world_time IS NULL OR expires_world_time>$2))::int AS "activeCount",
         max(created_world_time)::bigint AS "lastCreatedWorldTime"
       FROM world_opportunities WHERE world_id=$1 AND creator_agent_id IS NOT NULL GROUP BY creator_agent_id`,
-    [worldId, worldMinutes])
+    [worldId, worldMinutes]),
+    () => client.query(`SELECT agent_id AS "agentId",subject_type AS "subjectType",subject_key AS "subjectKey",
+        belief_key AS "beliefKey",estimate::text AS estimate,confidence::text AS confidence,sample_count AS "sampleCount"
+      FROM world_agent_beliefs WHERE world_id=$1 AND sample_count>0`, [worldId])
   ]);
   const byAgent = new Map(residents.map((resident) => [resident.agent_id, {
     projectMemberships: [], projectInvitations: [], activeProjects: [], organizationMemberships: [],
-    organizationInvitations: [], informationInbox: [], organizationPartners: []
+    organizationInvitations: [], informationInbox: [], organizationPartners: [], beliefs: [], sharedProjectPartnerIds: []
   }]));
   const projectsById = new Map(projects.rows.map((project) => [project.id, project]));
   for (const member of projectMembers.rows) {
@@ -332,6 +355,8 @@ async function loadWorldInitiatives(client, worldId, worldMinutes, residents, sc
     sharedWorldTime: Number(share.shared_world_time), expiresWorldTime: Number(share.expires_world_time)
   });
   for (const pair of completedPairs.rows) byAgent.get(pair.agentId)?.organizationPartners.push(pair);
+  for (const pair of completedPairs.rows) byAgent.get(pair.agentId)?.sharedProjectPartnerIds.push(pair.partnerId);
+  for (const belief of beliefs.rows) byAgent.get(belief.agentId)?.beliefs.push(belief);
   const residentById = new Map(residents.map((resident) => [resident.agent_id, resident]));
   const recentlyShared = new Map(recentShares.rows.map((share) =>
     [`${share.senderAgentId}:${share.recipientAgentId}`, Number(share.lastShareWorldTime)]));
@@ -343,6 +368,11 @@ async function loadWorldInitiatives(client, worldId, worldMinutes, residents, sc
     const visitors = residents.filter((resident) => resident.location === scene.name).length;
     return { ...scene, congestion: visitors / Math.max(1, Number(scene.capacity || 8)) };
   }).filter((scene) => scene.congestion >= 0.75);
+  const residentViews = residents.map((resident) => ({ ...resident, ...byAgent.get(resident.agent_id),
+    skills: safeJson(resident.skills), sharedProjectPartnerIds: byAgent.get(resident.agent_id)?.sharedProjectPartnerIds || [] }));
+  const worldNeeds = deriveWorldNeedSignals({ residents: residentViews, scenes, projects: activeProjects,
+    opportunities: activeOpportunities, worldMinutes });
+  const beliefsByAgent = new Map(residents.map((resident) => [resident.agent_id, byAgent.get(resident.agent_id)?.beliefs || []]));
   for (const resident of residents) {
     const data = byAgent.get(resident.agent_id);
     data.activeProjectsCreated = activeProjects.filter((project) => project.creator_agent_id === resident.agent_id).length;
@@ -358,22 +388,33 @@ async function loadWorldInitiatives(client, worldId, worldMinutes, residents, sc
       .filter((relation) => worldMinutes - (recentlyShared.get(`${resident.agent_id}:${relation.otherAgentId}`) ?? -Infinity) >= 60)
       .sort((left, right) => Number(right.trust) - Number(left.trust)
         || Number(right.familiarity) - Number(left.familiarity));
-    const recipient = trusted[stableInt(`${resident.agent_id}:${Math.floor(worldMinutes / 60)}:share-target`)
-      % Math.max(1, trusted.length)];
-    if (recipient && activeOpportunities.length) {
-      const opportunity = activeOpportunities[stableInt(`${resident.agent_id}:${worldMinutes}:share-opportunity`) % activeOpportunities.length];
-      data.shareProposal = { recipientAgentId: recipient.otherAgentId, recipientName: recipient.name,
-        trust: Number(recipient.trust), familiarity: Number(recipient.familiarity), informationType: 'opportunity',
-        subjectType: 'opportunity', subjectKey: opportunity.id };
-    } else if (recipient && activeProjects.length) {
-      const project = activeProjects[stableInt(`${resident.agent_id}:${worldMinutes}:share-project`) % activeProjects.length];
-      data.shareProposal = { recipientAgentId: recipient.otherAgentId, recipientName: recipient.name,
-        trust: Number(recipient.trust), familiarity: Number(recipient.familiarity), informationType: 'project',
-        subjectType: 'project', subjectKey: project.id };
+    const ownBeliefs = beliefsByAgent.get(resident.agent_id) || [];
+    const asymmetricShareOptions = [];
+    for (const recipient of trusted) {
+      const recipientBeliefs = beliefsByAgent.get(recipient.otherAgentId) || [];
+      for (const belief of ownBeliefs) {
+        const recipientKnows = recipientBeliefs.some((item) => item.subjectType === belief.subjectType
+          && item.subjectKey === belief.subjectKey && item.beliefKey === belief.beliefKey
+          && Number(item.confidence) >= Number(belief.confidence) - 0.1);
+        if (!recipientKnows && Number(belief.confidence) >= 0.2) asymmetricShareOptions.push({
+          recipientAgentId: recipient.otherAgentId, recipientName: recipient.name,
+          trust: Number(recipient.trust), familiarity: Number(recipient.familiarity), informationType: 'belief',
+          subjectType: belief.subjectType, subjectKey: belief.subjectKey, beliefKey: belief.beliefKey,
+          sourceConfidence: Number(belief.confidence)
+        });
+      }
+    }
+    if (asymmetricShareOptions.length) {
+      data.shareProposal = asymmetricShareOptions[stableInt(`${resident.agent_id}:${Math.floor(worldMinutes / 180)}:share-asymmetry`)
+        % asymmetricShareOptions.length];
     }
     data.opportunities = activeOpportunities;
     data.projects = activeProjects;
     data.crowdedPlaces = crowdedPlaces;
+    data.worldNeeds = worldNeeds.filter((need) => !need.agentId || need.agentId === resident.agent_id
+      || need.partnerId === resident.agent_id);
+    data.activePlaceCount = scenes.filter((scene) => scene.status === 'active').length;
+    data.completedProjectPartnerCount = data.organizationPartners.length;
     data.projectOpportunity = activeOpportunities.some((opportunity) => opportunity.opportunity_type === 'BUILD'
       || opportunity.opportunity_type === 'COOPERATION');
     data.organizationPartners = data.organizationPartners.map((partner) => ({ ...partner,
@@ -382,8 +423,9 @@ async function loadWorldInitiatives(client, worldId, worldMinutes, residents, sc
     data.organizationPartners = data.organizationPartners.filter((partner) => !partner.alreadySharedOrganization);
     data.residentNames = residentById;
   }
-  return { byAgent, opportunities: activeOpportunities, projects: activeProjects,
-    newIdeas: environmentOpportunityIdeas({ residents, scenes, worldMinutes, projects: activeProjects }) };
+  return { byAgent, opportunities: activeOpportunities, projects: activeProjects, worldNeeds,
+    newIdeas: environmentOpportunityIdeas({ residents, scenes, worldMinutes, projects: activeProjects,
+      opportunities: activeOpportunities }) };
 }
 
 async function recordWorldEvent(client, worldId, agentId, tick, type, data) {
@@ -740,7 +782,30 @@ async function completeWorldInitiativeActivity(client, worldId, agent, runtime, 
   const key = actionId(agent.agentId, runtime.tick_count, `v3:${activity}`);
   let detail = null;
   try {
-    if (activity === 'opportunity_propose') {
+    if (activity === 'goal_review') {
+      const proposal = safeJson(context.goalReviewProposal);
+      const primary = await client.query(`SELECT id,category FROM world_agent_goals
+        WHERE world_id=$1 AND agent_id=$2 AND goal_type='primary' AND status='active'
+        ORDER BY priority DESC,id LIMIT 1`, [worldId, agent.agentId]);
+      if (!primary.rowCount) throw Object.assign(new Error('ACTIVE_PRIMARY_GOAL_REQUIRED'), { statusCode: 409 });
+      const activeShort = await client.query(`SELECT count(*)::int AS count FROM world_agent_goals
+        WHERE world_id=$1 AND agent_id=$2 AND goal_type='short' AND status='active'`, [worldId, agent.agentId]);
+      if (Number(activeShort.rows[0].count) >= 3) throw Object.assign(new Error('SHORT_GOAL_CAPACITY_REACHED'), { statusCode: 409 });
+      const inserted = await client.query(`INSERT INTO world_agent_goals(world_id,agent_id,goal_type,category,description,
+          priority,parent_goal_id,created_world_minutes,updated_world_minutes,source,metadata)
+        VALUES($1,$2,'short',$3,$4,0.62,$5,$6,$6,'stagnation',$7::jsonb)
+        ON CONFLICT DO NOTHING RETURNING id,category,description`,
+      [worldId, agent.agentId, String(proposal.category || 'REVIEW_GOAL').slice(0, 64),
+        String(proposal.description || 'Choose a new concrete step toward the active primary goal.').slice(0, 240),
+        primary.rows[0].id, nowWorld, JSON.stringify({ trigger: 'goal_stagnation', stagnationCycles: agent.goalStagnation?.state?.stagnationCycles || 0,
+          worldNeedCount: agent.worldNeeds?.length || 0 })]);
+      if (inserted.rowCount) await recordWorldEvent(client, worldId, agent.agentId, runtime.tick_count, 'world.goal_replanned', {
+        goalId: primary.rows[0].id, goalCategory: primary.rows[0].category, subgoalId: inserted.rows[0].id,
+        subgoalCategory: inserted.rows[0].category, worldMinutes: nowWorld, trigger: 'goal_stagnation'
+      });
+      detail = inserted.rowCount ? { replanned: true, goalCategory: primary.rows[0].category,
+        subgoal: inserted.rows[0] } : { replanned: false, reason: 'SUBGOAL_ALREADY_EXISTS' };
+    } else if (activity === 'opportunity_propose') {
       const proposal = safeJson(context.opportunityProposal);
       const created = await createWorldOpportunity(client, { ...proposal, worldId, creatorAgentId: agent.agentId,
         sourceType: 'resident', sourceKey: agent.agentId, worldTime: nowWorld,
@@ -803,7 +868,8 @@ async function completeWorldInitiativeActivity(client, worldId, agent, runtime, 
       const proposal = safeJson(context.informationProposal);
       detail = await shareWorldInformation(client, { worldId, senderAgentId: agent.agentId,
         recipientAgentId: proposal.recipientAgentId, informationType: proposal.informationType,
-        subjectType: proposal.subjectType, subjectKey: proposal.subjectKey, actionId: key, worldTime: nowWorld });
+        subjectType: proposal.subjectType, subjectKey: proposal.subjectKey, beliefKey: proposal.beliefKey,
+        actionId: key, worldTime: nowWorld });
     } else if (['information_accept','information_ignore','information_doubt'].includes(activity)) {
       const decision = activity === 'information_accept' ? 'accept'
         : activity === 'information_doubt' ? 'doubt' : 'ignore';
@@ -814,6 +880,81 @@ async function completeWorldInitiativeActivity(client, worldId, agent, runtime, 
   } catch (error) {
     if (error.statusCode >= 400 && error.statusCode < 500) return { detail: null, error: error.message };
     throw error;
+  }
+}
+
+async function recordInitiativeOutcome(client, { worldId, agent, activity, result, tickCount, worldMinutes }) {
+  const details = result.initiative || {};
+  const action = activity;
+  const system = action === 'goal_review' ? 'goal'
+    : action.startsWith('opportunity') ? 'opportunity'
+    : action.startsWith('project') ? 'project'
+      : action.startsWith('organization') ? 'organization'
+        : action.startsWith('information') ? 'information' : null;
+  if (!system && action !== 'project_contribute') return;
+  const stageForAction = {
+    goal_review: details.replanned ? 'replanned' : 'blocked',
+    opportunity_propose: details.created ? 'created' : 'proposed',
+    opportunity: 'accepted', opportunity_reject: 'rejected',
+    project_propose: 'proposed', project_join: details.status === 'rejected' ? 'rejected' : 'joined',
+    project_reject: 'rejected', project_contribute: details.completed ? 'completed' : 'progressed',
+    project_leave: 'abandoned', organization_found: details.status === 'active' ? 'formed' : 'proposed',
+    organization_join: 'joined',
+    organization_reject: 'rejected', information_share: 'shared',
+    information_accept: 'accepted', information_ignore: 'ignored'
+  };
+  const stage = result.abandoned ? 'blocked' : stageForAction[action];
+  if (!stage) return;
+  const reasonCode = result.abandoned ? String(result.abandoned).toUpperCase().replace(/[^A-Z0-9_]/g, '_').slice(0, 64) : 'NONE';
+  const entityId = details.id || details.project?.id || details.opportunity?.id || null;
+  await recordEmergenceEvent(client, { worldId, agentId: agent.agentId, worldMinutes, tickCount, system, stage,
+    reasonCode, eventKey: `initiative-outcome:${agent.agentId}:${tickCount}:${action}:${stage}`,
+    candidateId: String(entityId || agent.planned_context?.projectId || agent.planned_context?.opportunityId || action),
+    action, details: { ...details, abandoned: result.abandoned || null } });
+
+  if (action === 'project_join' && details.projectStatus === 'active') {
+    await recordEmergenceEvent(client, { worldId, agentId: agent.agentId, worldMinutes, tickCount,
+      system: 'project', stage: 'active', eventKey: `project-active:${details.id}:${tickCount}`,
+      candidateId: String(details.id || ''), action, details: { projectStatus: details.projectStatus } });
+  }
+
+  if (action === 'organization_join' && details.organizationStatus === 'active') {
+    await recordEmergenceEvent(client, { worldId, agentId: agent.agentId, worldMinutes, tickCount,
+      system: 'organization', stage: 'formed', eventKey: `organization-formed:${details.id}`,
+      candidateId: String(details.id || ''), action,
+      details: { organizationStatus: details.organizationStatus } });
+  }
+
+  if (action === 'opportunity' && result.opportunity?.status === 'completed') {
+    await recordEmergenceEvent(client, { worldId, agentId: agent.agentId, worldMinutes, tickCount,
+      system: 'opportunity', stage: result.opportunity.status,
+      eventKey: `opportunity-result:${agent.agentId}:${tickCount}:${result.opportunity.id}:completed`,
+      candidateId: String(result.opportunity.id), action, details: result.opportunity });
+  }
+  if (action === 'opportunity' && result.opportunity?.status === 'failed') {
+    await recordEmergenceEvent(client, { worldId, agentId: agent.agentId, worldMinutes, tickCount,
+      system: 'opportunity', stage: 'failed', eventKey: `opportunity-result:${agent.agentId}:${tickCount}:${result.opportunity.id}:failed`,
+      candidateId: String(result.opportunity.id), action, details: result.opportunity });
+  }
+  if (action === 'project_propose' && agent.planned_context?.projectProposal?.metadata?.createPlace) {
+    await recordEmergenceEvent(client, { worldId, agentId: agent.agentId, worldMinutes, tickCount,
+      system: 'place', stage: 'proposal', eventKey: `place-proposal:${agent.planned_context?.projectId || agent.agentId}:${tickCount}`,
+      candidateId: String(entityId || action), action, details: {
+        proposalReasons: agent.planned_context.projectProposal.metadata.proposalReasons || []
+      } });
+  }
+  if (action === 'project_join' && details.projectStatus === 'active') {
+    const project = (agent.projects || []).find((item) => item.id === agent.planned_context?.projectId);
+    if (project?.metadata?.createPlace) await recordEmergenceEvent(client, { worldId, agentId: agent.agentId,
+      worldMinutes, tickCount, system: 'place', stage: 'build_started',
+      eventKey: `place-build-started:${project.id}`, candidateId: project.id, action,
+      details: { projectTitle: project.title } });
+  }
+  if (action === 'project_contribute' && details.completed && details.place?.created) {
+    await recordEmergenceEvent(client, { worldId, agentId: agent.agentId, worldMinutes, tickCount,
+      system: 'place', stage: 'created', eventKey: `place-created:${details.place.id}`,
+      candidateId: String(details.place.id), action, details: { name: details.place.name,
+        projectId: agent.planned_context?.projectId || null } });
   }
 }
 
@@ -934,7 +1075,7 @@ async function completeActivity(client, worldId, agent, runtime, quotes, now, sc
         [worldId, agent.agentId, now]);
       needs.energy = -1;
     }
-  } else if (['opportunity','opportunity_reject','opportunity_propose','project_propose','project_join','project_reject','project_contribute','project_leave',
+  } else if (['goal_review','opportunity','opportunity_reject','opportunity_propose','project_propose','project_join','project_reject','project_contribute','project_leave',
     'organization_found','organization_join','organization_reject','organization_leave','organization_invite',
     'organization_contribute','information_share','information_accept','information_ignore','information_doubt'].includes(activity)) {
     const initiative = await completeWorldInitiativeActivity(client, worldId, agent, runtime, activity);
@@ -978,6 +1119,8 @@ async function completeActivity(client, worldId, agent, runtime, quotes, now, sc
   const completionEventId = await recordWorldEvent(client, worldId, agent.agentId, runtime.tick_count, 'world.action_completed', {
     ...result, needs: next, status: 'completed', worldMinutes: finite(runtime.world_minutes)
   });
+  if (result.initiativeAction) await recordInitiativeOutcome(client, { worldId, agent, activity,
+    result, tickCount: runtime.tick_count, worldMinutes: runtime.world_minutes });
   if (activity === 'cooperate' && result.cooperation) {
     cooperativePartnerEventId = await recordWorldEvent(client, worldId, result.cooperation.partnerId,
       runtime.tick_count, 'world.action_completed', {
@@ -1364,7 +1507,11 @@ export async function startWorldEngine(pool, { onError = () => {}, onStatus = ()
             am.archetype,am.traits,am.memories,am.current_goal,am.actions_taken,
             s.goal,s.risk_tolerance AS risk_tolerance,s.happiness,s.knowledge,s.status,s.planned_action,s.target_location,
             s.planned_partner_id AS planned_partner_id,s.planned_side,s.planned_asset,s.planned_quote_units::text AS planned_quote_units,s.planned_paid_meal,
-            s.planned_context,
+            s.planned_context,s.next_strategic_decision_world_minutes AS next_strategic_decision_world_minutes,
+            s.strategic_goal_category AS strategic_goal_category,
+            s.strategic_goal_progress::text AS strategic_goal_progress,
+            s.strategic_goal_progress_world_minutes AS strategic_goal_progress_world_minutes,
+            s.strategic_goal_stagnation_cycles AS strategic_goal_stagnation_cycles,
             s.fruitfly_observation,s.fruitfly_candidates,s.fruitfly_selected,
             s.movement_started_at,s.movement_ends_at,s.action_started_at,s.action_ends_at,s.next_decision_at,s.last_trade_at,
             p.sociability::text AS sociability,p.curiosity::text AS curiosity,p.discipline::text AS discipline,
@@ -1417,14 +1564,39 @@ export async function startWorldEngine(pool, { onError = () => {}, onStatus = ()
           && new Date(member.next_decision_at).getTime() <= now.getTime());
         let initiativeState = null;
         if (newHour > oldHour) {
-          await expireWorldOpportunities(client, worldId, worldMinutes);
-          await expireWorldProjects(client, worldId, worldMinutes);
+          const expiredOpportunities = await expireWorldOpportunities(client, worldId, worldMinutes);
+          for (const opportunity of expiredOpportunities) await recordEmergenceEvent(client, { worldId,
+            worldMinutes, tickCount, system: 'opportunity', stage: 'expired',
+            eventKey: `opportunity-expired:${opportunity.id}`, candidateId: opportunity.id,
+            details: { title: opportunity.title } });
+          const failedProjects = await expireWorldProjects(client, worldId, worldMinutes);
+          for (const projectId of failedProjects) await recordEmergenceEvent(client, { worldId,
+            worldMinutes, tickCount, system: 'project', stage: 'failed',
+            reasonCode: 'DEADLINE_PASSED', eventKey: `project-failed:${projectId}`, candidateId: projectId });
+          const expiringShares = await client.query(`SELECT id,sender_agent_id,recipient_agent_id FROM world_information_shares
+            WHERE world_id=$1 AND status='offered' AND expires_world_time IS NOT NULL AND expires_world_time<=$2`,
+          [worldId, worldMinutes]);
           await expireInformationShares(client, worldId, worldMinutes);
+          for (const share of expiringShares.rows) await recordEmergenceEvent(client, { worldId,
+            agentId: share.sender_agent_id, worldMinutes, tickCount, system: 'information', stage: 'expired',
+            reasonCode: 'RECIPIENT_DID_NOT_RESPOND', eventKey: `information-expired:${share.id}`,
+            candidateId: share.id, details: { recipientAgentId: share.recipient_agent_id } });
         }
         if (dueResidents.length || newHour > oldHour) {
           initiativeState = await loadWorldInitiatives(client, worldId, worldMinutes, membersResult.rows, scenes);
           if (newHour > oldHour) for (const idea of initiativeState.newIdeas) {
-            await createWorldOpportunity(client, { worldId, ...idea, worldTime: worldMinutes });
+            const key = `environment-idea:${idea.dedupeKey}`;
+            await recordEmergenceEvent(client, { worldId, worldMinutes, tickCount, system: 'opportunity',
+              stage: 'considered', eventKey: `${key}:considered`, candidateId: idea.dedupeKey,
+              details: { type: idea.type, title: idea.title, needReason: idea.metadata?.needReason || null } });
+            await recordEmergenceEvent(client, { worldId, worldMinutes, tickCount, system: 'opportunity',
+              stage: 'eligible', eventKey: `${key}:eligible`, candidateId: idea.dedupeKey,
+              details: { type: idea.type, needReason: idea.metadata?.needReason || null } });
+            const created = await createWorldOpportunity(client, { worldId, ...idea, worldTime: worldMinutes });
+            await recordEmergenceEvent(client, { worldId, worldMinutes, tickCount, system: 'opportunity',
+              stage: created.created ? 'created' : 'blocked', reasonCode: created.created ? 'NONE' : 'COOLDOWN',
+              eventKey: `${key}:${created.created ? 'created' : 'blocked'}`, candidateId: created.id || idea.dedupeKey,
+              details: { type: idea.type, title: idea.title } });
           }
         }
         const placeCounts = Object.fromEntries(membersResult.rows.map((member) => [member.location,
@@ -1489,12 +1661,97 @@ export async function startWorldEngine(pool, { onError = () => {}, onStatus = ()
                     energy: other.energy, food: other.food, skills: safeJson(other.skills), relationship,
                     lastInteractionWorldMinutes: relationship?.lastInteractionWorldMinutes };
                 })]));
-            const utilityCandidates = buildActivityCandidates(agent, scenes, { tick: tickCount, worldMinutes, nowMs, quotes,
+          const utilityCandidates = buildActivityCandidates(agent, scenes, { tick: tickCount, worldMinutes, nowMs, quotes,
               previousQuotes: priorSnapshot, residentsAt: placeCounts, residentsAtLocation });
-            const initiativeCandidates = buildWorldInitiativeCandidates(agent, { ...initiativeData,
-              worldMinutes, crowdedPlaces: initiativeData.crowdedPlaces || [],
-              opportunities: initiativeData.opportunities || [], projects: initiativeData.projects || [] });
-            const candidates = qualifyUtilityCandidates([...utilityCandidates, ...initiativeCandidates]);
+            let strategicDue = false;
+            let nextStrategicAt = agent.next_strategic_decision_world_minutes === null
+              || agent.next_strategic_decision_world_minutes === undefined
+              ? worldMinutes + stableInt(`${agent.agentId}:strategic-phase`) % STRATEGIC_DECISION_INTERVAL_MINUTES
+              : Number(agent.next_strategic_decision_world_minutes);
+            if (nextStrategicAt <= worldMinutes) {
+              strategicDue = true;
+              nextStrategicAt = worldMinutes + STRATEGIC_DECISION_INTERVAL_MINUTES;
+            }
+            if (agent.next_strategic_decision_world_minutes === null
+                || agent.next_strategic_decision_world_minutes === undefined || strategicDue) {
+              await client.query(`UPDATE world_agent_states SET next_strategic_decision_world_minutes=$3,updated_at=$4
+                WHERE world_id=$1 AND agent_id=$2`, [worldId, agent.agentId, nextStrategicAt, now]);
+            }
+            if (strategicDue) {
+              const primaryGoal = agent.goals.find((goal) => goal.goalType === 'primary' && goal.status === 'active');
+              const goalCategory = primaryGoal?.category || agent.primaryGoal || '';
+              const progress = Number(primaryGoal?.progress ?? agent.goal_progress) || 0;
+              const stagnation = updateGoalStagnation({
+                goalCategory: agent.strategic_goal_category,
+                progress: agent.strategic_goal_progress,
+                lastProgressAt: agent.strategic_goal_progress_world_minutes,
+                stagnationCycles: agent.strategic_goal_stagnation_cycles
+              }, { goalCategory, progress, worldMinutes });
+              agent.goalStagnation = { ...stagnation, sinceWorldMinutes: stagnation.state.lastProgressAt };
+              await client.query(`UPDATE world_agent_states SET strategic_goal_category=$3,strategic_goal_progress=$4,
+                  strategic_goal_progress_world_minutes=$5,strategic_goal_stagnation_cycles=$6,updated_at=$7
+                WHERE world_id=$1 AND agent_id=$2`, [worldId, agent.agentId, goalCategory || null,
+                stagnation.state.progress, stagnation.state.lastProgressAt, stagnation.state.stagnationCycles, now]);
+              await recordEmergenceEvent(client, { worldId, agentId: agent.agentId, worldMinutes, tickCount,
+                system: 'goal', stage: 'progress_check', reasonCode: stagnation.stagnant ? 'GOAL_STAGNANT' : 'GOAL_PROGRESSING',
+                eventKey: `goal-check:${agent.agentId}:${tickCount}`, candidateId: String(primaryGoal?.id || goalCategory),
+                details: { goalCategory, progress, stagnantMinutes: stagnation.stagnantMinutes,
+                  stagnationCycles: stagnation.state.stagnationCycles } });
+            }
+            const initiativeContext = { ...initiativeData, worldMinutes,
+              crowdedPlaces: initiativeData.crowdedPlaces || [], opportunities: initiativeData.opportunities || [],
+              projects: initiativeData.projects || [], goalStagnation: agent.goalStagnation || { stagnant: false },
+              activePlaceCount: initiativeData.activePlaceCount || scenes.filter((scene) => scene.status === 'active').length };
+            const initiativeCandidates = strategicDue
+              ? buildWorldInitiativeCandidates(agent, initiativeContext) : [];
+            let candidates;
+            let decisionLayer = 'tactical';
+            let qualifiedStrategicCandidates = [];
+            if (strategicDue) {
+              const minimumEnergy = 15;
+              const minimumFood = 8;
+              const needsBlocked = agent.energy < minimumEnergy || agent.food < minimumFood;
+              const permittedInitiatives = needsBlocked ? [] : initiativeCandidates.filter((candidate) => {
+                if (candidate.action === 'project_contribute' && (agent.energy < 20 || agent.food < 10)) return false;
+                return true;
+              });
+              qualifiedStrategicCandidates = qualifyUtilityCandidates(permittedInitiatives);
+              for (const candidate of initiativeCandidates) {
+                const eligible = qualifiedStrategicCandidates.some((item) => item.id === candidate.id);
+                const reasonCode = needsBlocked ? (agent.energy < minimumEnergy ? 'ENERGY_LOW' : 'FOOD_LOW')
+                  : eligible ? 'NONE' : candidate.action === 'project_contribute'
+                    && (agent.energy < 20 || agent.food < 10) ? 'NEEDS_HARD_GATE' : 'UTILITY_BELOW_THRESHOLD';
+                await recordEmergenceEvent(client, { worldId, agentId: agent.agentId, worldMinutes, tickCount,
+                  system: initiativeSystem(candidate.action),
+                  stage: eligible ? 'eligible' : 'blocked', reasonCode,
+                  eventKey: `strategic-candidate:${agent.agentId}:${tickCount}:${candidate.id}:${eligible ? 'eligible' : 'blocked'}`,
+                  candidateId: candidate.id, action: candidate.action, utilityScore: candidate.score,
+                  details: { goalStagnant: Boolean(agent.goalStagnation?.stagnant),
+                    worldNeedCount: initiativeContext.worldNeeds?.length || 0,
+                    proposalReasons: candidate.projectProposal?.metadata?.proposalReasons || [] } });
+                await recordEmergenceEvent(client, { worldId, agentId: agent.agentId, worldMinutes, tickCount,
+                  system: initiativeSystem(candidate.action),
+                  stage: 'considered', eventKey: `strategic-considered:${agent.agentId}:${tickCount}:${candidate.id}`,
+                  candidateId: candidate.id, action: candidate.action, utilityScore: candidate.score,
+                  details: { proposalReasons: candidate.projectProposal?.metadata?.proposalReasons || [] } });
+              }
+              const gapReasons = explainWorldInitiativeGaps(agent, initiativeContext, initiativeCandidates);
+              for (const [index, gap] of gapReasons.entries()) {
+                const gapKey = `strategic-gap:${agent.agentId}:${tickCount}:${gap.system}:${index}`;
+                await recordEmergenceEvent(client, { worldId, agentId: agent.agentId, worldMinutes, tickCount,
+                  system: gap.system, stage: 'considered', action: gap.action,
+                  eventKey: `${gapKey}:considered`, details: { ...gap.details, actionCandidateMissing: true } });
+                await recordEmergenceEvent(client, { worldId, agentId: agent.agentId, worldMinutes, tickCount,
+                  system: gap.system, stage: 'blocked', reasonCode: needsBlocked
+                    ? (agent.energy < minimumEnergy ? 'ENERGY_LOW' : 'FOOD_LOW') : gap.reasonCode,
+                  eventKey: `${gapKey}:blocked`, action: gap.action,
+                  details: gap.details });
+              }
+              if (qualifiedStrategicCandidates.length) {
+                candidates = qualifiedStrategicCandidates;
+                decisionLayer = 'strategic';
+              } else candidates = qualifyUtilityCandidates(utilityCandidates);
+            } else candidates = qualifyUtilityCandidates(utilityCandidates);
             let activity = null;
             let flyObservation = null;
             let flyCandidates = [];
@@ -1530,6 +1787,22 @@ export async function startWorldEngine(pool, { onError = () => {}, onStatus = ()
                 WHERE world_id=$1 AND agent_id=$2`, [worldId, agent.agentId, new Date(now.getTime() + 30_000), now]);
               continue;
             }
+            if (decisionLayer === 'strategic') {
+              for (const candidate of qualifiedStrategicCandidates) {
+                if (candidate.id === activity.id) continue;
+                await recordEmergenceEvent(client, { worldId, agentId: agent.agentId, worldMinutes, tickCount,
+                  system: initiativeSystem(candidate.action),
+                  stage: 'not_selected', reasonCode: 'FRUITFLY_NOT_SELECTED',
+                  eventKey: `fruitfly-not-selected:${agent.agentId}:${tickCount}:${candidate.id}`,
+                  candidateId: candidate.id, action: candidate.action, utilityScore: candidate.score });
+              }
+              const chosenSystem = initiativeSystem(activity.action);
+              await recordEmergenceEvent(client, { worldId, agentId: agent.agentId, worldMinutes, tickCount,
+                system: chosenSystem, stage: 'fruitfly_selected',
+                eventKey: `fruitfly-selected:${agent.agentId}:${tickCount}`,
+                candidateId: activity.id, action: activity.action, utilityScore: activity.score,
+                details: { decisionLayer, candidateCount: candidates.length } });
+            }
             flySelected = { ...activity,
               behaviorProbability: Number(decision?.behaviorProbability) || 0,
               fruitflyProbability: Number(decision?.fruitflyProbability) || 0,
@@ -1551,8 +1824,9 @@ export async function startWorldEngine(pool, { onError = () => {}, onStatus = ()
                 short: agent.goals.filter((goal) => goal.goalType === 'short') }),
               JSON.stringify({ selectedGoal: activity.goal, selectedDescription: activity.description,
                 topFamilies, learnedBeliefs: agent.beliefs.length, memoryCount: agent.recentMemories.length,
-                relationshipCount: agent.relationships.length, source: 'utility_qualified_fruitfly_choice',
+                relationshipCount: agent.relationships.length, source: 'utility_qualified_fruitfly_choice', decisionLayer,
                 utilityCandidatePolicy: { thresholdRatio: 0.75, minimum: 3, maximum: 8 },
+                strategicIntervalMinutes: STRATEGIC_DECISION_INTERVAL_MINUTES,
                 eligibleCandidateCount: candidates.length })]);
             await client.query(`DELETE FROM world_decision_traces WHERE id IN (
               SELECT id FROM world_decision_traces WHERE world_id=$1 AND agent_id=$2
@@ -1560,7 +1834,7 @@ export async function startWorldEngine(pool, { onError = () => {}, onStatus = ()
             const duration = ACTION_SECONDS[activity.action] || 10;
             const tradeFields = activity.action === 'trade'
               ? [activity.side, activity.asset, activity.quoteUnits] : [null, null, null];
-            const plannedContext = Object.fromEntries(['opportunityId','opportunityProposal','projectId','decision','projectProposal',
+            const plannedContext = Object.fromEntries(['opportunityId','opportunityProposal','projectId','decision','projectProposal','goalReviewProposal',
               'organizationId','organizationProposal','inviteeAgentId','shareId','informationProposal','contributionType']
               .filter((key) => activity[key] !== undefined).map((key) => [key, activity[key]]));
             if (activity.targetLocation !== agent.location) {
