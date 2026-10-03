@@ -465,6 +465,7 @@ CREATE TABLE IF NOT EXISTS world_agent_states (
   status text NOT NULL DEFAULT 'idle' CHECK (status IN ('idle','walking','performing')),
   planned_action text CHECK (planned_action IS NULL OR planned_action IN ('work','learn','rest','eat','socialize','trade')),
   target_location text,
+  planned_partner_id uuid REFERENCES agents(id) ON DELETE SET NULL,
   planned_side text CHECK (planned_side IS NULL OR planned_side IN ('buy','sell')),
   planned_asset text CHECK (planned_asset IS NULL OR planned_asset IN ('BTC','ETH')),
   planned_quote_units numeric(30,8) CHECK (planned_quote_units IS NULL OR planned_quote_units > 0),
@@ -485,11 +486,222 @@ CREATE TABLE IF NOT EXISTS world_agent_states (
   CHECK (status <> 'performing' OR (planned_action IS NOT NULL AND action_started_at IS NOT NULL AND action_ends_at IS NOT NULL))
 );
 ALTER TABLE world_agent_states ADD COLUMN IF NOT EXISTS planned_paid_meal boolean NOT NULL DEFAULT false;
+ALTER TABLE world_agent_states ADD COLUMN IF NOT EXISTS planned_partner_id uuid REFERENCES agents(id) ON DELETE SET NULL;
 ALTER TABLE world_agent_states ADD COLUMN IF NOT EXISTS fruitfly_observation jsonb NOT NULL DEFAULT '{}'::jsonb;
 ALTER TABLE world_agent_states ADD COLUMN IF NOT EXISTS fruitfly_candidates jsonb NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE world_agent_states ADD COLUMN IF NOT EXISTS fruitfly_selected jsonb NOT NULL DEFAULT '{}'::jsonb;
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_agent_states'::regclass
+    AND conname='world_agent_states_planned_action_check'
+    AND pg_get_constraintdef(oid) LIKE '%cooperate%') THEN
+    ALTER TABLE world_agent_states DROP CONSTRAINT IF EXISTS world_agent_states_planned_action_check;
+    ALTER TABLE world_agent_states ADD CONSTRAINT world_agent_states_planned_action_check
+      CHECK (planned_action IS NULL OR planned_action IN ('work','learn','rest','eat','socialize','trade','cooperate'));
+  END IF;
+END $$;
 
 CREATE INDEX IF NOT EXISTS world_agent_states_due_idx ON world_agent_states(world_id, status, next_decision_at);
+
+-- Durable social simulation state. Existing world_agent_states.risk_tolerance
+-- remains the resident's risk personality dimension; these rows add the other
+-- stable traits and a finite, progress-bearing long-term goal.
+CREATE TABLE IF NOT EXISTS world_social_profiles (
+  world_id uuid NOT NULL,
+  agent_id uuid NOT NULL,
+  sociability numeric(4,3) NOT NULL DEFAULT 0.500 CHECK (sociability BETWEEN 0 AND 1),
+  curiosity numeric(4,3) NOT NULL DEFAULT 0.500 CHECK (curiosity BETWEEN 0 AND 1),
+  discipline numeric(4,3) NOT NULL DEFAULT 0.500 CHECK (discipline BETWEEN 0 AND 1),
+  ambition numeric(4,3) NOT NULL DEFAULT 0.500 CHECK (ambition BETWEEN 0 AND 1),
+  primary_goal text NOT NULL DEFAULT 'BALANCED_LIFE'
+    CHECK (primary_goal IN ('BUILD_WEALTH','MASTER_TRADING','MASTER_RESEARCH','MASTER_ENGINEERING','BUILD_RELATIONSHIPS','BALANCED_LIFE')),
+  goal_progress numeric(5,2) NOT NULL DEFAULT 0 CHECK (goal_progress BETWEEN 0 AND 100),
+  goal_milestones integer NOT NULL DEFAULT 0 CHECK (goal_milestones >= 0),
+  goal_started_world_minutes bigint NOT NULL DEFAULT 0 CHECK (goal_started_world_minutes >= 0),
+  goal_last_updated_world_minutes bigint CHECK (goal_last_updated_world_minutes IS NULL OR goal_last_updated_world_minutes >= 0),
+  dominant_role text NOT NULL DEFAULT 'generalist'
+    CHECK (dominant_role IN ('researcher','engineer','trader','worker','socialite','generalist')),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (world_id, agent_id),
+  FOREIGN KEY (world_id, agent_id) REFERENCES world_members(world_id, agent_id) ON DELETE CASCADE
+);
+ALTER TABLE world_social_profiles ADD COLUMN IF NOT EXISTS personality_modifiers jsonb NOT NULL DEFAULT
+  '{"sociability":0,"curiosity":0,"discipline":0,"ambition":0}'::jsonb;
+ALTER TABLE world_social_profiles ADD COLUMN IF NOT EXISTS risk_modifier numeric(4,3) NOT NULL DEFAULT 0;
+ALTER TABLE world_social_profiles ADD COLUMN IF NOT EXISTS last_reflection_world_minutes bigint;
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_social_profiles'::regclass
+    AND conname='world_social_profiles_primary_goal_check' AND pg_get_constraintdef(oid) LIKE '%~%') THEN
+    ALTER TABLE world_social_profiles DROP CONSTRAINT IF EXISTS world_social_profiles_primary_goal_check;
+    ALTER TABLE world_social_profiles ADD CONSTRAINT world_social_profiles_primary_goal_check
+      CHECK (primary_goal ~ '^[A-Z][A-Z0-9_]{1,63}$');
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_social_profiles'::regclass
+    AND conname='world_social_profiles_personality_modifiers_check') THEN
+    ALTER TABLE world_social_profiles ADD CONSTRAINT world_social_profiles_personality_modifiers_check
+      CHECK (jsonb_typeof(personality_modifiers) = 'object' AND
+        COALESCE((personality_modifiers->>'sociability')::numeric BETWEEN -0.150 AND 0.150,FALSE) AND
+        COALESCE((personality_modifiers->>'curiosity')::numeric BETWEEN -0.150 AND 0.150,FALSE) AND
+        COALESCE((personality_modifiers->>'discipline')::numeric BETWEEN -0.150 AND 0.150,FALSE) AND
+        COALESCE((personality_modifiers->>'ambition')::numeric BETWEEN -0.150 AND 0.150,FALSE));
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_social_profiles'::regclass
+    AND conname='world_social_profiles_risk_modifier_check') THEN
+    ALTER TABLE world_social_profiles ADD CONSTRAINT world_social_profiles_risk_modifier_check
+      CHECK (risk_modifier BETWEEN -0.150 AND 0.150);
+  END IF;
+END $$;
+
+CREATE TABLE IF NOT EXISTS world_agent_skills (
+  world_id uuid NOT NULL,
+  agent_id uuid NOT NULL,
+  skill_name text NOT NULL CHECK (skill_name ~ '^[a-z][a-z0-9_]{1,47}$'),
+  skill_value numeric(5,2) NOT NULL DEFAULT 0 CHECK (skill_value BETWEEN 0 AND 100),
+  actions_completed integer NOT NULL DEFAULT 0 CHECK (actions_completed >= 0),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (world_id, agent_id, skill_name),
+  FOREIGN KEY (world_id, agent_id) REFERENCES world_members(world_id, agent_id) ON DELETE CASCADE
+);
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_agent_skills'::regclass
+    AND conname='world_agent_skills_skill_name_check' AND pg_get_constraintdef(oid) LIKE '%~%') THEN
+    ALTER TABLE world_agent_skills DROP CONSTRAINT IF EXISTS world_agent_skills_skill_name_check;
+    ALTER TABLE world_agent_skills ADD CONSTRAINT world_agent_skills_skill_name_check
+      CHECK (skill_name ~ '^[a-z][a-z0-9_]{1,47}$');
+  END IF;
+END $$;
+
+-- Decision memories are derived from completed, already-audited world events.
+-- Important memories have a separate small retention allowance from the most
+-- recent detailed memories; pruning never removes world_events audit history.
+CREATE TABLE IF NOT EXISTS agent_memories (
+  id bigserial PRIMARY KEY,
+  world_id uuid NOT NULL,
+  agent_id uuid NOT NULL,
+  memory_type text NOT NULL CHECK (memory_type ~ '^[a-z][a-z0-9_]{1,47}$'),
+  summary text NOT NULL CHECK (char_length(summary) BETWEEN 1 AND 240),
+  importance numeric(4,3) NOT NULL DEFAULT 0.200 CHECK (importance BETWEEN 0 AND 1),
+  world_minutes bigint NOT NULL CHECK (world_minutes >= 0),
+  location text,
+  related_agent_id uuid REFERENCES agents(id) ON DELETE SET NULL,
+  metadata jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(metadata) = 'object'),
+  source_event_id bigint REFERENCES world_events(id) ON DELETE SET NULL,
+  consolidation_key text,
+  long_term boolean NOT NULL DEFAULT false,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  FOREIGN KEY (world_id, agent_id) REFERENCES world_members(world_id, agent_id) ON DELETE CASCADE
+);
+ALTER TABLE agent_memories ADD COLUMN IF NOT EXISTS consolidation_key text;
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='agent_memories'::regclass
+    AND conname='agent_memories_memory_type_check' AND pg_get_constraintdef(oid) LIKE '%~%') THEN
+    ALTER TABLE agent_memories DROP CONSTRAINT IF EXISTS agent_memories_memory_type_check;
+    ALTER TABLE agent_memories ADD CONSTRAINT agent_memories_memory_type_check
+      CHECK (memory_type ~ '^[a-z][a-z0-9_]{1,47}$');
+  END IF;
+END $$;
+
+CREATE TABLE IF NOT EXISTS world_relationships (
+  world_id uuid NOT NULL,
+  agent_a_id uuid NOT NULL,
+  agent_b_id uuid NOT NULL,
+  familiarity numeric(5,2) NOT NULL DEFAULT 0 CHECK (familiarity BETWEEN 0 AND 100),
+  trust numeric(6,2) NOT NULL DEFAULT 0 CHECK (trust BETWEEN -100 AND 100),
+  affinity numeric(6,2) NOT NULL DEFAULT 0 CHECK (affinity BETWEEN -100 AND 100),
+  last_interaction_world_minutes bigint CHECK (last_interaction_world_minutes IS NULL OR last_interaction_world_minutes >= 0),
+  interaction_count integer NOT NULL DEFAULT 0 CHECK (interaction_count >= 0),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (world_id, agent_a_id, agent_b_id),
+  CHECK (agent_a_id < agent_b_id),
+  FOREIGN KEY (world_id, agent_a_id) REFERENCES world_members(world_id, agent_id) ON DELETE CASCADE,
+  FOREIGN KEY (world_id, agent_b_id) REFERENCES world_members(world_id, agent_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS agent_memories_recent_idx ON agent_memories(world_id, agent_id, world_minutes DESC, id DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS agent_memories_source_event_idx
+  ON agent_memories(world_id, agent_id, source_event_id) WHERE source_event_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS agent_memories_consolidation_key_idx
+  ON agent_memories(world_id,agent_id,consolidation_key) WHERE consolidation_key IS NOT NULL;
+CREATE INDEX IF NOT EXISTS world_relationships_reverse_idx ON world_relationships(world_id, agent_b_id, agent_a_id);
+CREATE INDEX IF NOT EXISTS world_agent_skills_rank_idx ON world_agent_skills(world_id, agent_id, skill_value DESC);
+
+-- Goals are open-ended records. Existing profile goal values remain as
+-- compatibility seeds; these rows are the planning system's durable source.
+CREATE TABLE IF NOT EXISTS world_agent_goals (
+  id bigserial PRIMARY KEY,
+  world_id uuid NOT NULL,
+  agent_id uuid NOT NULL,
+  goal_type text NOT NULL CHECK (goal_type IN ('primary','secondary','short')),
+  category text NOT NULL CHECK (category ~ '^[A-Z][A-Z0-9_]{1,63}$'),
+  description text NOT NULL CHECK (char_length(description) BETWEEN 3 AND 240),
+  priority numeric(5,4) NOT NULL DEFAULT 0.5000 CHECK (priority BETWEEN 0 AND 1),
+  progress numeric(5,2) NOT NULL DEFAULT 0 CHECK (progress BETWEEN 0 AND 100),
+  status text NOT NULL DEFAULT 'active' CHECK (status IN ('active','completed','paused','abandoned')),
+  source text NOT NULL DEFAULT 'seed' CHECK (source IN ('seed','experience','memory','relationship','opportunity','strategy','self_generated')),
+  parent_goal_id bigint REFERENCES world_agent_goals(id) ON DELETE SET NULL,
+  created_world_minutes bigint NOT NULL DEFAULT 0 CHECK (created_world_minutes >= 0),
+  updated_world_minutes bigint NOT NULL DEFAULT 0 CHECK (updated_world_minutes >= 0),
+  metadata jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(metadata) = 'object'),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  FOREIGN KEY (world_id, agent_id) REFERENCES world_members(world_id, agent_id) ON DELETE CASCADE
+);
+CREATE UNIQUE INDEX IF NOT EXISTS world_agent_goals_active_primary_idx
+  ON world_agent_goals(world_id,agent_id) WHERE goal_type='primary' AND status='active';
+CREATE UNIQUE INDEX IF NOT EXISTS world_agent_goals_active_category_idx
+  ON world_agent_goals(world_id,agent_id,goal_type,category) WHERE status='active';
+CREATE INDEX IF NOT EXISTS world_agent_goals_active_idx
+  ON world_agent_goals(world_id,agent_id,goal_type,priority DESC,updated_world_minutes DESC) WHERE status='active';
+
+CREATE TABLE IF NOT EXISTS world_agent_beliefs (
+  world_id uuid NOT NULL,
+  agent_id uuid NOT NULL,
+  subject_type text NOT NULL CHECK (subject_type IN ('action','place','resident','asset')),
+  subject_key text NOT NULL CHECK (char_length(subject_key) BETWEEN 1 AND 120),
+  belief_key text NOT NULL CHECK (char_length(belief_key) BETWEEN 1 AND 80),
+  estimate numeric(10,4) NOT NULL,
+  confidence numeric(4,3) NOT NULL DEFAULT 0.100 CHECK (confidence BETWEEN 0 AND 1),
+  sample_count integer NOT NULL DEFAULT 0 CHECK (sample_count >= 0),
+  updated_world_minutes bigint NOT NULL DEFAULT 0 CHECK (updated_world_minutes >= 0),
+  evidence jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(evidence) = 'object'),
+  PRIMARY KEY (world_id,agent_id,subject_type,subject_key,belief_key),
+  FOREIGN KEY (world_id,agent_id) REFERENCES world_members(world_id,agent_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS world_agent_reflections (
+  id bigserial PRIMARY KEY,
+  world_id uuid NOT NULL,
+  agent_id uuid NOT NULL,
+  world_minutes bigint NOT NULL CHECK (world_minutes >= 0),
+  trigger text NOT NULL CHECK (trigger IN ('cadence','important_event')),
+  rationale jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(rationale) = 'object'),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (world_id,agent_id,world_minutes),
+  FOREIGN KEY (world_id,agent_id) REFERENCES world_members(world_id,agent_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS world_decision_traces (
+  id bigserial PRIMARY KEY,
+  world_id uuid NOT NULL,
+  agent_id uuid NOT NULL,
+  tick_count bigint NOT NULL CHECK (tick_count >= 0),
+  world_minutes bigint NOT NULL CHECK (world_minutes >= 0),
+  chosen_candidate_id text NOT NULL,
+  chosen_action text NOT NULL,
+  behavior_probability numeric(9,8) NOT NULL CHECK (behavior_probability BETWEEN 0 AND 1),
+  distribution jsonb NOT NULL CHECK (jsonb_typeof(distribution) = 'object'),
+  utility_scores jsonb NOT NULL CHECK (jsonb_typeof(utility_scores) = 'object'),
+  goal_snapshot jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(goal_snapshot) = 'object'),
+  rationale jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(rationale) = 'object'),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  FOREIGN KEY (world_id,agent_id) REFERENCES world_members(world_id,agent_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS world_decision_traces_recent_idx
+  ON world_decision_traces(world_id,agent_id,tick_count DESC,id DESC);
 
 -- Jobs and meals are simulated USDC ledger entries; no wallet or chain calls.
 DO $$

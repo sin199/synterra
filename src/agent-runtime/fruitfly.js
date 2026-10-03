@@ -3,12 +3,13 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { SettlingBrain } from './vendor/fruitfly/brain.js';
 import { ActorCriticLearner } from './vendor/fruitfly/learner.js';
+import { DECISION_MIX, chooseMixedCandidate } from '../social-world.js';
 
-export const FRUITFLY_POLICY_VERSION = 'synterra-fruitfly-candidate-policy-v1';
+export const FRUITFLY_POLICY_VERSION = 'synterra-fruitfly-candidate-policy-v2';
 
 // One stable action family per output neuron. The mapping is an experimental
 // software convention, not a claim about the fly's biological action semantics.
-const ACTIONS = ['eat', 'rest', 'socialize', 'work', 'build_scene', 'travel', 'trade_crypto', 'trade_hold'];
+const ACTIONS = ['eat', 'rest', 'socialize', 'work', 'cooperate', 'travel', 'trade_crypto', 'trade_hold'];
 const SENSORS = [
   ['synterra:state:food:low', 'synterra:state:food:high'],
   ['synterra:state:energy:low', 'synterra:state:energy:high'],
@@ -104,20 +105,13 @@ function pickCandidate(model, observation, candidates, preferredDecision) {
   if (!actions.length) return null;
   stimulateState(model, observation);
   configureOutputs(model, actions);
-  const probabilities = Array.from(model.learner.probabilities());
-  const draw = nextRandom(model);
-  let cumulative = 0;
-  let index = probabilities.length - 1;
-  for (let i = 0; i < probabilities.length; i++) {
-    cumulative += probabilities[i];
-    if (draw < cumulative) { index = i; break; }
-  }
-  const action = actions[index];
-  const options = candidates.filter((candidate) => actionFamily(candidate.action) === action);
-  const preferred = options.find((candidate) => candidate.sceneId && candidate.sceneId === preferredDecision?.sceneId)
-    || options.find((candidate) => candidate.id === preferredDecision?.id)
-    || options[0];
-  return { candidate: preferred, action, confidence: probabilities[index], probabilities: Object.fromEntries(actions.map((key, i) => [key, probabilities[i]])) };
+  const baseValues = Array.from(model.learner.probabilities());
+  const fruitflyProbabilities = Object.fromEntries(actions.map((key, i) => [key, baseValues[i]]));
+  const choice = chooseMixedCandidate(candidates, fruitflyProbabilities, {
+    actionDraw: nextRandom(model), candidateDraw: nextRandom(model), config: DECISION_MIX
+  });
+  return { ...choice, fruitflyProbabilities, utilityProbabilities: choice.components.utility,
+    distributionComponents: choice.components };
 }
 
 function prepareLearning(model, observation, candidates, selected) {
@@ -140,6 +134,7 @@ function outcomeReward(observation, candidate, result) {
     + (unit(result.social) - unit(before.social));
   let contribution = 0;
   if (candidate.action === 'work' && (result.mineId || result.income)) contribution = 0.15;
+  else if (candidate.action === 'cooperate' && result.cooperation) contribution = 0.15;
   else if (candidate.action === 'learn' && result.learning) contribution = 0.1;
   else if (candidate.action === 'build_scene' && result.scene?.id) contribution = 0.15;
   else if (candidate.action === 'travel' && candidate.sceneId
@@ -200,9 +195,13 @@ export async function createFruitflyRuntime(stateDir) {
       const model = getModel(agentId);
       prepareLearning(model, observation, candidates, selected);
       const reward = outcomeReward(observation, selected, result);
-      const update = model.learner.learn(reward, true);
+      const behaviorProbability = Number(selected.behaviorProbability);
+      const fruitflyProbability = Number(selected.fruitflyProbability);
+      const actorWeight = behaviorProbability > 0 && fruitflyProbability >= 0
+        ? Math.min(4, fruitflyProbability / behaviorProbability) : 1;
+      const update = model.learner.learn(reward, true, { actorWeight });
       await persist(agentId, model);
-      return { reward, updates: update?.updates ?? model.learner.updates };
+      return { reward, actorWeight: update?.actorWeight ?? 1, updates: update?.updates ?? model.learner.updates };
     }
   };
 }

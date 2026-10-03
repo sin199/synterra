@@ -29,6 +29,10 @@ const MAP_POINTS = [
 ];
 const SCENE_ICONS = { garden: '❋', studio: '◈', library: '▤', cafe: '◒', workshop: '⌘', observatory: '⊙', commons: '✳', data_center: '▥' };
 const ARCHETYPES = { naturalist: '自然观察者', maker: '创造者', scholar: '学者', host: '组织者', observer: '观察者' };
+const ROLE_LABELS = { researcher: '研究者', engineer: '工程师', trader: '交易者', worker: '建设者', socialite: '社交者', generalist: '通才' };
+const GOAL_LABELS = { BUILD_WEALTH: '积累财富', MASTER_TRADING: '精通交易', MASTER_RESEARCH: '精通研究',
+  MASTER_ENGINEERING: '精通工程', BUILD_RELATIONSHIPS: '建立关系', BALANCED_LIFE: '平衡生活' };
+const SKILL_LABELS = { trading: '交易', research: '研究', engineering: '工程', social: '社交' };
 const EVENT_LABELS = {
   'action.socialize': '社交', 'action.travel': '前往场景', 'action.work': '工作',
   'action.rest': '休息', 'action.eat': '进食', 'action.build_scene': '建造场景', 'scene.created': '场景建造',
@@ -37,9 +41,11 @@ const EVENT_LABELS = {
   'world.movement_started': '启程', 'world.agent_arrived': '抵达', 'world.action_started': '开始行动',
   'world.action_completed': '完成行动', 'world.goal_updated': '调整长期目标'
 };
-const ACTION_LABELS = { work: '工作', learn: '学习', rest: '休息', eat: '进食', socialize: '社交', trade: '模拟交易' };
+const ACTION_LABELS = { work: '工作', cooperate: '合作工作', learn: '学习', rest: '休息', eat: '进食', socialize: '社交', trade: '模拟交易' };
 let latestMapData = null;
 let selectedAgentId = null;
+let selectedResidentDetail = null;
+let detailRequestToken = 0;
 let world3d = null;
 
 try {
@@ -66,8 +72,10 @@ function selectAgentById(agentId) {
   const agent = latestMapData?.residents?.find((resident) => resident.id === agentId);
   if (!agent) return;
   selectedAgentId = agentId;
+  selectedResidentDetail = null;
   renderMap();
-  renderAgentPanel(agent);
+  renderAgentPanel(agent, null);
+  loadResidentDetail(agentId);
   world3d?.select(agentId);
 }
 
@@ -206,7 +214,7 @@ function renderMap() {
   }
 }
 
-function renderAgentPanel(agent) {
+function renderAgentPanel(agent, detail = selectedResidentDetail) {
   if (!agentPanel || !agent) return;
   agentPanel.replaceChildren();
   const card = document.createElement('div');
@@ -224,7 +232,7 @@ function renderAgentPanel(agent) {
   title.textContent = agent.name;
   const subtitle = document.createElement('p');
   subtitle.className = 'agent-detail-subtitle';
-  subtitle.textContent = `${agent.gender === 'female' ? '女' : agent.gender === 'male' ? '男' : '未设定'} · ${ARCHETYPES[agent.archetype] || '尚无类型'}`;
+  subtitle.textContent = `${agent.gender === 'female' ? '女' : agent.gender === 'male' ? '男' : '未设定'} · ${ROLE_LABELS[agent.dominantRole] || ARCHETYPES[agent.archetype] || '尚无类型'}`;
   identity.append(eyebrow, title, subtitle);
   header.append(avatar, identity);
   card.append(header);
@@ -276,12 +284,190 @@ function renderAgentPanel(agent) {
   const goal = document.createElement('div');
   goal.className = 'agent-goal';
   const goalLabel = document.createElement('span');
-  goalLabel.textContent = '当前目标';
+  goalLabel.textContent = '长期目标';
   const goalText = document.createElement('p');
-  goalText.textContent = agent.currentGoal || '尚未设定';
+  const goalProgress = Math.max(0, Math.min(100, Number(agent.goalProgress) || 0));
+  goalText.textContent = `${GOAL_LABELS[agent.primaryGoal] || detail?.resident?.primaryGoalDescription || agent.primaryGoal || '平衡生活'} · ${Math.round(goalProgress)}%`;
   goal.append(goalLabel, goalText);
+  const goalDescription = document.createElement('small');
+  goalDescription.textContent = detail?.resident?.currentIntent || agent.currentGoal || '持续依据居民经历推进';
+  goal.append(goalDescription);
   card.append(goal);
+
+  const planning = document.createElement('section');
+  planning.className = 'agent-social-section';
+  const planningHeading = document.createElement('h4');
+  planningHeading.textContent = '长期与短期规划';
+  const planningList = document.createElement('ul');
+  planningList.className = 'agent-memory-list';
+  for (const item of (detail?.goals || []).filter((goalItem) => goalItem.goalType !== 'primary')) {
+    const row = document.createElement('li');
+    row.textContent = `${item.goalType === 'short' ? '短期' : '次级'} · ${item.description} · ${Math.round(Number(item.progress) || 0)}%`;
+    planningList.append(row);
+  }
+  if (!planningList.children.length) {
+    const item = document.createElement('li');
+    item.className = 'agent-social-empty';
+    item.textContent = detail ? '暂无子目标' : '正在读取目标…';
+    planningList.append(item);
+  }
+  planning.append(planningHeading, planningList);
+  card.append(planning);
+
+  const personality = document.createElement('section');
+  personality.className = 'agent-social-section';
+  const personalityHeading = document.createElement('h4');
+  personalityHeading.textContent = '人格与适应';
+  const personalityList = document.createElement('ul');
+  personalityList.className = 'agent-memory-list';
+  const modifiers = detail?.resident?.personalityModifiers || {};
+  const effectiveTraits = [
+    ['社交', 'sociability'], ['好奇', 'curiosity'], ['自律', 'discipline'], ['进取', 'ambition']
+  ].map(([label, key]) => `${label} ${Math.round(Math.max(0, Math.min(1, Number(agent[key] || detail?.resident?.[key] || 0.5) + Number(modifiers[key] || 0))) * 100)}`);
+  const traitItem = document.createElement('li');
+  traitItem.textContent = `${effectiveTraits.join(' · ')} · 风险适应 ${Math.round(Number(agent.riskTolerance || 0) * 100)}%`;
+  personalityList.append(traitItem);
+  const reflectionItem = document.createElement('li');
+  reflectionItem.textContent = detail?.reflections?.[0]
+    ? `最近反思：世界时间 ${displayCount(detail.reflections[0].worldMinutes)} · ${detail.reflections[0].trigger === 'important_event' ? '重要经历触发' : '周期复盘'}`
+    : detail ? '尚无反思记录' : '正在读取反思…';
+  personalityList.append(reflectionItem);
+  personality.append(personalityHeading, personalityList);
+  card.append(personality);
+
+  const detailSkills = detail?.skills?.length
+    ? detail.skills : Object.entries(agent.skills || {}).map(([skill, value]) => ({ skill, value }));
+  const skillsSection = document.createElement('section');
+  skillsSection.className = 'agent-social-section';
+  const skillsHeading = document.createElement('h4');
+  skillsHeading.textContent = '技能';
+  const skillsList = document.createElement('div');
+  skillsList.className = 'agent-skill-list';
+  for (const skill of detailSkills) {
+    const row = document.createElement('div');
+    row.className = 'agent-skill-row';
+    const name = document.createElement('span');
+    name.textContent = SKILL_LABELS[skill.skill] || skill.skill;
+    const meter = document.createElement('progress');
+    meter.max = 100;
+    meter.value = Math.max(0, Math.min(100, Number(skill.value) || 0));
+    meter.setAttribute('aria-label', `${name.textContent} ${Math.round(meter.value)}`);
+    const value = document.createElement('strong');
+    value.textContent = String(Math.round(meter.value));
+    row.append(name, meter, value);
+    skillsList.append(row);
+  }
+  if (!detailSkills.length) {
+    const placeholder = document.createElement('p');
+    placeholder.className = 'agent-social-empty';
+    placeholder.textContent = '正在读取技能记录…';
+    skillsList.append(placeholder);
+  }
+  skillsSection.append(skillsHeading, skillsList);
+  card.append(skillsSection);
+
+  const relationshipsSection = document.createElement('section');
+  relationshipsSection.className = 'agent-social-section';
+  const relationshipsHeading = document.createElement('h4');
+  relationshipsHeading.textContent = '关系';
+  const relationshipsList = document.createElement('ul');
+  relationshipsList.className = 'agent-memory-list';
+  for (const relation of detail?.relationships || []) {
+    const item = document.createElement('li');
+    item.textContent = `${relation.name} · 熟悉 ${Math.round(Number(relation.familiarity) || 0)} · 信任 ${Math.round(Number(relation.trust) || 0)}`;
+    relationshipsList.append(item);
+  }
+  if (!relationshipsList.children.length) {
+    const item = document.createElement('li');
+    item.className = 'agent-social-empty';
+    item.textContent = detail ? '还没有形成关系' : '正在读取关系记录…';
+    relationshipsList.append(item);
+  }
+  relationshipsSection.append(relationshipsHeading, relationshipsList);
+  card.append(relationshipsSection);
+
+  const beliefsSection = document.createElement('section');
+  beliefsSection.className = 'agent-social-section';
+  const beliefsHeading = document.createElement('h4');
+  beliefsHeading.textContent = '个人经验判断';
+  const beliefsList = document.createElement('ul');
+  beliefsList.className = 'agent-memory-list';
+  for (const belief of (detail?.beliefs || []).slice(0, 6)) {
+    const item = document.createElement('li');
+    const estimate = Number(belief.estimate) || 0;
+    item.textContent = `${belief.subjectKey} · ${estimate >= 0 ? '偏正向' : '偏负向'} ${Math.round(Math.abs(estimate) * 100)}% · 置信 ${Math.round(Number(belief.confidence) * 100)}% · ${displayCount(belief.sampleCount)} 次经历`;
+    beliefsList.append(item);
+  }
+  if (!beliefsList.children.length) {
+    const item = document.createElement('li');
+    item.className = 'agent-social-empty';
+    item.textContent = detail ? '还在积累个人判断' : '正在读取经验判断…';
+    beliefsList.append(item);
+  }
+  beliefsSection.append(beliefsHeading, beliefsList);
+  card.append(beliefsSection);
+
+  const decisionsSection = document.createElement('section');
+  decisionsSection.className = 'agent-social-section';
+  const decisionsHeading = document.createElement('h4');
+  decisionsHeading.textContent = '最近决策';
+  const decisionsList = document.createElement('ul');
+  decisionsList.className = 'agent-memory-list';
+  for (const decision of (detail?.decisions || []).slice(0, 4)) {
+    const item = document.createElement('li');
+    const probability = Math.round(Number(decision.probability || 0) * 100);
+    item.textContent = `${ACTION_LABELS[decision.action] || decision.action} · 行为概率 ${probability}% · ${decision.rationale?.selectedGoal || decision.candidateId}`;
+    decisionsList.append(item);
+  }
+  if (!decisionsList.children.length) {
+    const item = document.createElement('li');
+    item.className = 'agent-social-empty';
+    item.textContent = detail ? '还没有决策记录' : '正在读取决策记录…';
+    decisionsList.append(item);
+  }
+  decisionsSection.append(decisionsHeading, decisionsList);
+  card.append(decisionsSection);
+
+  const memoriesSection = document.createElement('section');
+  memoriesSection.className = 'agent-social-section';
+  const memoriesHeading = document.createElement('h4');
+  memoriesHeading.textContent = '近期记忆';
+  const memoriesList = document.createElement('ul');
+  memoriesList.className = 'agent-memory-list';
+  for (const memory of detail?.recentMemories || []) {
+    const item = document.createElement('li');
+    item.textContent = `${memory.summary}${memory.longTerm ? ' · 重要' : ''}`;
+    memoriesList.append(item);
+  }
+  if (!memoriesList.children.length) {
+    const item = document.createElement('li');
+    item.className = 'agent-social-empty';
+    item.textContent = detail ? '还没有近期记忆' : '正在读取记忆记录…';
+    memoriesList.append(item);
+  }
+  memoriesSection.append(memoriesHeading, memoriesList);
+  card.append(memoriesSection);
   agentPanel.append(card);
+}
+
+async function loadResidentDetail(agentId = selectedAgentId) {
+  if (!agentId) return;
+  const token = ++detailRequestToken;
+  try {
+    const response = await fetch(`/local/map-data/residents/${encodeURIComponent(agentId)}`, {
+      headers: { Accept: 'application/json' }, cache: 'no-store'
+    });
+    if (!response.ok) throw new Error(`Resident detail request failed (${response.status})`);
+    const detail = await response.json();
+    if (token !== detailRequestToken || selectedAgentId !== agentId) return;
+    selectedResidentDetail = detail;
+    const agent = latestMapData?.residents?.find((resident) => resident.id === agentId);
+    if (agent) renderAgentPanel(agent, detail);
+  } catch {
+    if (token !== detailRequestToken || selectedAgentId !== agentId) return;
+    const agent = latestMapData?.residents?.find((resident) => resident.id === agentId);
+    if (agent) renderAgentPanel(agent, null);
+  }
 }
 
 function renderActivity() {
@@ -470,4 +656,7 @@ window.setInterval(() => {
     loadMapData();
   }
 }, 2_000);
+window.setInterval(() => {
+  if (document.visibilityState === 'visible' && selectedAgentId) loadResidentDetail(selectedAgentId);
+}, 30_000);
 window.setInterval(() => { if (document.visibilityState === 'visible') loadStats(); }, 30_000);

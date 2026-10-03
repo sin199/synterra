@@ -2,11 +2,18 @@ import { createHash } from 'node:crypto';
 import { chargeMeal, MEAL_COST_UNITS, canAffordUnits } from './economy.js';
 import { formatUnits, multiplyUnits, parsePositiveUnits, parseSignedUnits } from './crypto-market.js';
 import { ensureCryptoAccount, executeCryptoTrade } from './crypto-trading.js';
+import {
+  DECISION_MIX, SOCIAL_COOLDOWN_WORLD_MINUTES, SOCIAL_SKILLS, addSkillGain, canCooperatePair, canSocializePair,
+  chooseSocialPartner, clampPersonality, canonicalPair, clampSkill, deriveDominantRole, effectivePersonality,
+  goalActionUtility, goalDescription, goalProgress, initialSkillValues, initialSocialProfile, lastRealizedSalePnl,
+  memoryForCompletedAction, recentMemoryUtility, reflectionDue, reflectionProposal, seededGoalSet,
+  skillGainForAction
+} from './social-world.js';
 
 export const WORLD_TICK_MS = 1_000;
 const TYPE_SAFE_INTERVAL_MS = 30 * 60_000;
 const MAX_CATCH_UP_SECONDS = 30;
-const ACTION_SECONDS = Object.freeze({ work: 16, learn: 11, rest: 9, eat: 8, socialize: 12, trade: 7 });
+const ACTION_SECONDS = Object.freeze({ work: 16, cooperate: 16, learn: 11, rest: 9, eat: 8, socialize: 12, trade: 7 });
 const GOALS = Object.freeze(['wealth','learn','community','wellbeing','balanced','wealth','learn','community','wellbeing','balanced']);
 const RISK_TOLERANCE = Object.freeze([0.78,0.28,0.52,0.22,0.68,0.35,0.82,0.47,0.70,0.40]);
 const ALLOWED_GOALS = new Set(['wealth','learn','community','wellbeing','balanced']);
@@ -48,9 +55,10 @@ function sceneOptions(scenes, types) {
   return scenes.filter((scene) => scene.status === 'active' && types.includes(scene.sceneType));
 }
 
-function candidate({ id, action, place, goal, description = goal, score, plannedPaidMeal = false, side, asset, quoteUnits }) {
+function candidate({ id, action, place, goal, description = goal, score, plannedPaidMeal = false, side, asset, quoteUnits,
+  socialPartnerId = null, socialPartnerName = null }) {
   return { id, action, targetLocation: place, goal, description, score, plannedPaidMeal, side: side || null,
-    asset: asset || null, quoteUnits: quoteUnits || null };
+    asset: asset || null, quoteUnits: quoteUnits || null, socialPartnerId, socialPartnerName };
 }
 
 export function buildActivityCandidates(agent, scenes, context = {}) {
@@ -58,15 +66,20 @@ export function buildActivityCandidates(agent, scenes, context = {}) {
   const energy = clamp(agent.energy), food = clamp(agent.food), social = clamp(agent.social);
   const happiness = clamp(agent.happiness), knowledge = clamp(agent.knowledge);
   const goal = ALLOWED_GOALS.has(agent.goal) ? agent.goal : 'balanced';
+  const activePrimary = agent.goals?.find((item) => item.goalType === 'primary' && item.status === 'active');
+  const primaryGoal = activePrimary?.category || agent.primaryGoal || 'BALANCED_LIFE';
+  const personality = effectivePersonality({ ...agent, personalityModifiers: agent.personalityModifiers || {} });
+  const skills = Object.fromEntries(SOCIAL_SKILLS.map((skill) => [skill, clampSkill(agent.skills?.[skill])]));
   const units = String(agent.internalUnits ?? '0');
   const cash = finite(agent.usdc);
   const btc = finite(agent.btc), eth = finite(agent.eth);
   const btcQuote = finite(context.quotes?.find((item) => item.symbol === 'BTC')?.priceUsd);
   const ethQuote = finite(context.quotes?.find((item) => item.symbol === 'ETH')?.priceUsd);
   const nav = cash + btc * btcQuote + eth * ethQuote;
-  const recentTradeMs = agent.lastTradeAt ? Date.now() - new Date(agent.lastTradeAt).getTime() : Infinity;
-  const canTrade = finite(agent.riskTolerance) >= 0.65 && ['wealth','balanced'].includes(goal) &&
-    recentTradeMs >= 180_000 && cash >= 75 && nav > 0;
+  const recentTradeMs = agent.lastTradeAt ? finite(context.nowMs, Date.now()) - new Date(agent.lastTradeAt).getTime() : Infinity;
+  const canTrade = energy >= 20 && food >= 10 && finite(agent.riskTolerance) >= 0.65
+    && (['wealth','balanced'].includes(goal) || ['BUILD_WEALTH','MASTER_TRADING','RECOVER_FINANCIAL_STABILITY'].includes(primaryGoal))
+    && recentTradeMs >= 180_000 && cash >= 75 && nav > 0;
 
   const workshops = sceneOptions(scenes, ['workshop']);
   const dataCenters = sceneOptions(scenes, ['data_center']);
@@ -75,17 +88,23 @@ export function buildActivityCandidates(agent, scenes, context = {}) {
   const gardens = sceneOptions(scenes, ['garden']);
   const cafes = sceneOptions(scenes, ['cafe']);
 
-  for (const place of [...workshops, ...dataCenters]) {
+  if (energy >= 20 && food >= 12) for (const place of [...workshops, ...dataCenters]) {
     const dataCenter = place.sceneType === 'data_center';
     const score = 28 + (goal === 'wealth' ? 22 : 0) + (cash < 7_500 ? 18 : cash < 9_500 ? 8 : 0) +
-      (dataCenter && goal === 'learn' ? 8 : 0) + (dataCenter ? finite(agent.traits?.craft) * 3 : 0);
+      (dataCenter && goal === 'learn' ? 8 : 0) + (dataCenter ? finite(agent.traits?.craft) * 3 : 0)
+      + personality.discipline * 7 + personality.ambition * 8 + skills.engineering * 0.16
+      + (['BUILD_WEALTH','RECOVER_FINANCIAL_STABILITY'].includes(primaryGoal) ? 17 : 0)
+      + (primaryGoal.includes('ENGINEERING') ? 20 : 0)
+      + recentMemoryUtility(agent, 'work', context.worldMinutes);
     options.push(candidate({ id: `work:${place.id}`, action: 'work', place: place.name,
       goal: dataCenter ? 'Complete a paid data-center shift and learn from its operations.' : 'Complete a paid workshop shift and contribute to the local economy.', score }));
   }
-  for (const place of [...libraries, ...observatories]) {
+  if (energy >= 15 && food >= 8) for (const place of [...libraries, ...observatories]) {
     const observatory = place.sceneType === 'observatory';
     const score = 23 + (goal === 'learn' ? 27 : 0) + Math.max(0, 82 - knowledge) * 0.72 +
-      finite(agent.traits?.curiosity) * 8 + (observatory ? 4 : 0);
+      finite(agent.traits?.curiosity) * 8 + (observatory ? 4 : 0) + personality.curiosity * 10
+      + skills.research * 0.14 + (primaryGoal === 'MASTER_RESEARCH' ? 24 : 0)
+      + recentMemoryUtility(agent, 'learn', context.worldMinutes);
     options.push(candidate({ id: `learn:${place.id}`, action: 'learn', place: place.name,
       goal: observatory ? 'Study current observations and record useful knowledge.' : 'Study in the library and deepen knowledge.', score }));
   }
@@ -101,10 +120,52 @@ export function buildActivityCandidates(agent, scenes, context = {}) {
     options.push(candidate({ id: `eat:${place.id}`, action: 'eat', place: place.name, plannedPaidMeal: paid,
       goal: paid ? 'Have a hearty meal at the cafe using internal world units.' : 'Take a simple meal break at the cafe.',
       score: 17 + Math.max(0, 86 - food) * 0.78 + (paid ? 4 : 0) + (goal === 'community' ? 3 : 0) }));
-    options.push(candidate({ id: `socialize:${place.id}`, action: 'socialize', place: place.name,
-      goal: 'Meet other residents at the cafe and build social connection.',
-      score: 22 + (goal === 'community' ? 24 : 0) + Math.max(0, 90 - social) * 0.58 +
-        finite(context.residentsAt?.[place.name]) * 2 + finite(agent.traits?.sociability) * 5 }));
+  }
+
+  for (const place of [...cafes, ...gardens]) {
+    if (energy < 12 || food < 8) continue;
+    const relationByAgent = new Map((Array.isArray(agent.relationships) ? agent.relationships : [])
+      .map((relation) => [relation.otherAgentId, relation]));
+    const partners = (context.residentsAtLocation?.[place.name] || []).map((other) => ({
+      ...other,
+      location: place.name,
+      lastInteractionWorldMinutes: relationByAgent.get(other.agentId)?.lastInteractionWorldMinutes,
+      relationship: relationByAgent.get(other.agentId) || null
+    }));
+    const partner = chooseSocialPartner({ ...agent, location: place.name }, place, partners, context.worldMinutes);
+    if (!partner) continue;
+    const relation = partner.relationship || {};
+    const socialMemory = (Array.isArray(agent.recentMemories) ? agent.recentMemories : [])
+      .some((memory) => memory.memoryType === 'social' && memory.relatedAgentId === partner.agentId
+        && Number(context.worldMinutes) - Number(memory.worldMinutes) <= 720);
+    const score = 22 + (goal === 'community' ? 24 : 0) + Math.max(0, 90 - social) * 0.58
+      + personality.sociability * 13 + skills.social * 0.12
+      + (primaryGoal === 'BUILD_RELATIONSHIPS' ? 28 : 0)
+      + clamp(finite(relation.familiarity) * 0.06 + finite(relation.affinity) * 0.03, 0, 9)
+      + (socialMemory ? 3 : 0);
+    options.push(candidate({ id: `socialize:${place.id}:${partner.agentId}`, action: 'socialize', place: place.name,
+      socialPartnerId: partner.agentId, socialPartnerName: partner.name,
+      goal: `Meet ${partner.name} at ${place.name} and build social connection.`, score }));
+  }
+
+  if (energy >= 20 && food >= 12) for (const place of [...workshops, ...dataCenters]) {
+    if (agent.location !== place.name) continue;
+    const partners = context.residentsAtLocation?.[place.name] || [];
+    const partner = partners.filter((other) => canCooperatePair({ actor: agent, partner: other,
+      scene: place, worldMinutes: context.worldMinutes }))
+      .sort((left, right) => Number(right.relationship?.trust || 0) - Number(left.relationship?.trust || 0)
+        || Number(right.relationship?.familiarity || 0) - Number(left.relationship?.familiarity || 0)
+        || String(left.agentId).localeCompare(String(right.agentId)))[0];
+    if (!partner) continue;
+    const relation = partner.relationship || {};
+    const partnerSkill = Number(partner.skills?.engineering) || 0;
+    const mentorship = Math.min(8, Math.abs(skills.engineering - partnerSkill) * 0.08);
+    options.push(candidate({ id: `cooperate:${place.id}:${partner.agentId}`, action: 'cooperate', place: place.name,
+      socialPartnerId: partner.agentId, socialPartnerName: partner.name,
+      goal: `Work with ${partner.name} at ${place.name} and create useful value together.`,
+      score: 34 + personality.sociability * 8 + personality.discipline * 5 + skills.engineering * 0.1
+        + Math.min(12, Number(relation.familiarity || 0) * 0.08 + Number(relation.trust || 0) * 0.35)
+        + mentorship + recentMemoryUtility(agent, 'cooperate', context.worldMinutes) }));
   }
 
   if (canTrade) {
@@ -116,14 +177,26 @@ export function buildActivityCandidates(agent, scenes, context = {}) {
       const buyAllowed = cash >= 75 && holdingValue + 50 <= nav * 0.5 && momentum >= -0.008;
       if (buyAllowed) options.push(candidate({ id: `trade:buy:${asset}`, action: 'trade', place: 'Exchange', side: 'buy', asset,
         quoteUnits: '50.00000000', goal: `Review the simulated ${asset} market at Exchange and buy a bounded amount if risk remains acceptable.`,
-        score: 34 + risk * 28 + (goal === 'wealth' ? 12 : 0) + Math.max(-5, Math.min(7, momentum * 1000)) }));
+        score: 34 + risk * 28 + (goal === 'wealth' ? 12 : 0) + Math.max(-5, Math.min(7, momentum * 1000))
+          + skills.trading * 0.14 + personality.ambition * 6
+          + (primaryGoal === 'BUILD_WEALTH' ? 15 : 0) + (primaryGoal === 'MASTER_TRADING' ? 24 : 0)
+          + recentMemoryUtility(agent, 'trade', context.worldMinutes) }));
       if (holdingValue >= 20 && momentum < 0.002) {
         const notional = Math.min(holdingValue * 0.1, nav * 0.1, 50);
         if (notional >= 10) options.push(candidate({ id: `trade:sell:${asset}`, action: 'trade', place: 'Exchange', side: 'sell', asset,
           quoteUnits: notional.toFixed(8), goal: `Trim a small ${asset} position at Exchange while keeping the order within risk limits.`,
-          score: 30 + risk * 20 + Math.max(-3, Math.min(12, -momentum * 1000)) }));
+          score: 30 + risk * 20 + Math.max(-3, Math.min(12, -momentum * 1000))
+            + skills.trading * 0.14 + (primaryGoal === 'MASTER_TRADING' ? 18 : 0)
+            + recentMemoryUtility(agent, 'trade', context.worldMinutes) }));
       }
     }
+  }
+
+  for (const option of options) {
+    option.score += goalActionUtility(option, agent.goals || []);
+    const belief = (Array.isArray(agent.beliefs) ? agent.beliefs : []).find((item) =>
+      item.subjectType === 'action' && item.subjectKey === option.action && item.beliefKey === 'outcome');
+    if (belief) option.score += clamp(finite(belief.estimate) * finite(belief.confidence) * 8, -8, 8);
   }
 
   if (!options.length && scenes.length) {
@@ -151,9 +224,317 @@ function safeJson(value) {
 }
 
 async function recordWorldEvent(client, worldId, agentId, tick, type, data) {
-  await client.query(`INSERT INTO world_events(world_id,actor_id,event_type,data,action_id)
-    VALUES($1,$2,$3,$4,$5) ON CONFLICT(world_id,actor_id,action_id) DO NOTHING`,
-  [worldId, agentId, type, data, actionId(agentId, tick, type.split('.').at(-1))]);
+  const result = await client.query(`INSERT INTO world_events(world_id,actor_id,event_type,data,action_id)
+    VALUES($1,$2,$3,$4,$5) ON CONFLICT(world_id,actor_id,action_id) DO UPDATE SET data=world_events.data
+    RETURNING id`, [worldId, agentId, type, data, actionId(agentId, tick, type.split('.').at(-1))]);
+  return result.rows[0]?.id || null;
+}
+
+export async function pruneResidentMemories(client, worldId, agentId) {
+  await client.query(`DELETE FROM agent_memories WHERE id IN (
+    SELECT id FROM agent_memories WHERE world_id=$1 AND agent_id=$2 AND long_term=false
+    ORDER BY importance DESC,world_minutes DESC,id DESC OFFSET 100)`, [worldId, agentId]);
+  await client.query(`DELETE FROM agent_memories WHERE id IN (
+    SELECT id FROM agent_memories WHERE world_id=$1 AND agent_id=$2 AND long_term=true
+    ORDER BY importance DESC,world_minutes DESC,id DESC OFFSET 20)`, [worldId, agentId]);
+}
+
+async function recordResidentMemory(client, { worldId, agentId, memoryType, summary, importance, worldMinutes,
+  location, relatedAgentId = null, metadata = {}, sourceEventId, longTerm = false }) {
+  if (!sourceEventId || !summary) return null;
+  const inserted = await client.query(`INSERT INTO agent_memories(world_id,agent_id,memory_type,summary,importance,
+      world_minutes,location,related_agent_id,metadata,source_event_id,long_term)
+    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT DO NOTHING RETURNING id`,
+  [worldId, agentId, memoryType, String(summary).slice(0, 240), clampPersonality(importance), worldMinutes,
+    location || null, relatedAgentId, metadata, sourceEventId, Boolean(longTerm || importance >= 0.7)]);
+  if (!inserted.rowCount) return null;
+  await pruneResidentMemories(client, worldId, agentId);
+  return inserted.rows[0].id;
+}
+
+async function recordConsolidatedMemory(client, { worldId, agentId, summary, importance, worldMinutes, key, metadata }) {
+  if (!summary || !key) return null;
+  const result = await client.query(`INSERT INTO agent_memories(world_id,agent_id,memory_type,summary,importance,
+      world_minutes,metadata,long_term,consolidation_key)
+    VALUES($1,$2,'summary',$3,$4,$5,$6,true,$7)
+    ON CONFLICT(world_id,agent_id,consolidation_key) WHERE consolidation_key IS NOT NULL
+    DO UPDATE SET summary=EXCLUDED.summary,importance=EXCLUDED.importance,world_minutes=EXCLUDED.world_minutes,
+      metadata=EXCLUDED.metadata,long_term=true,created_at=now()
+    RETURNING id`, [worldId, agentId, String(summary).slice(0, 240), clampPersonality(importance), worldMinutes, metadata, key]);
+  await pruneResidentMemories(client, worldId, agentId);
+  return result.rows[0]?.id || null;
+}
+
+async function applySkillGains(client, worldId, agentId, action, place, hadPartner = false) {
+  const gains = skillGainForAction(action, place, hadPartner);
+  for (const [skill, gain] of Object.entries(gains)) {
+    await client.query(`INSERT INTO world_agent_skills(world_id,agent_id,skill_name,skill_value,actions_completed)
+      VALUES($1,$2,$3,$4,1) ON CONFLICT(world_id,agent_id,skill_name) DO UPDATE SET
+        skill_value=LEAST(100,world_agent_skills.skill_value+$4),
+        actions_completed=world_agent_skills.actions_completed+1,updated_at=now()`, [worldId, agentId, skill, gain]);
+  }
+}
+
+async function refreshSocialProfile(client, worldId, agentId, worldMinutes, sourceEventId) {
+  const profileResult = await client.query(`SELECT COALESCE(g.category,p.primary_goal) AS primary_goal,
+        COALESCE(g.id,0)::bigint AS active_goal_id,p.goal_progress,p.goal_milestones,p.goal_last_updated_world_minutes,
+        s.risk_tolerance,m.energy,m.food,m.social FROM world_social_profiles p
+      JOIN world_agent_states s ON s.world_id=p.world_id AND s.agent_id=p.agent_id
+      JOIN world_members m ON m.world_id=p.world_id AND m.agent_id=p.agent_id
+      LEFT JOIN LATERAL (SELECT id,category FROM world_agent_goals WHERE world_id=p.world_id AND agent_id=p.agent_id
+        AND goal_type='primary' AND status='active' ORDER BY priority DESC,id LIMIT 1) g ON true
+      WHERE p.world_id=$1 AND p.agent_id=$2 FOR UPDATE OF p,s,m`, [worldId, agentId]);
+  const skillResult = await client.query(`SELECT skill_name,skill_value::text AS value,actions_completed FROM world_agent_skills
+      WHERE world_id=$1 AND agent_id=$2`, [worldId, agentId]);
+  const relationshipResult = await client.query(`SELECT other.id AS "otherAgentId",other.name,
+        r.familiarity::text AS familiarity,r.trust::text AS trust,r.affinity::text AS affinity,
+        r.interaction_count AS "interactionCount" FROM world_relationships r
+      JOIN agents other ON other.id=CASE WHEN r.agent_a_id=$2 THEN r.agent_b_id ELSE r.agent_a_id END
+      WHERE r.world_id=$1 AND (r.agent_a_id=$2 OR r.agent_b_id=$2)`, [worldId, agentId]);
+  const wealthResult = await client.query(`SELECT COALESCE(sum(b.balance * CASE WHEN b.asset_symbol='USDC' THEN 1 ELSE q.price_usd END),0)::text AS value
+      FROM crypto_balances b LEFT JOIN crypto_market_quotes q ON q.symbol=b.asset_symbol
+      WHERE b.world_id=$1 AND b.agent_id=$2 AND b.asset_symbol IN ('USDC','BTC','ETH')`, [worldId, agentId]);
+  const incomeResult = await client.query(`SELECT COALESCE(sum(amount),0)::text AS value FROM crypto_ledger
+      WHERE world_id=$1 AND agent_id=$2 AND asset_symbol='USDC' AND entry_type='work_income'`, [worldId, agentId]);
+  const actionResult = await client.query(`SELECT actions_taken FROM agent_minds WHERE world_id=$1 AND agent_id=$2`, [worldId, agentId]);
+  const needResult = await client.query(`SELECT energy,food,social FROM world_members WHERE world_id=$1 AND agent_id=$2`, [worldId, agentId]);
+  const recentActionResult = await client.query(`SELECT memory_type,metadata FROM agent_memories
+    WHERE world_id=$1 AND agent_id=$2 ORDER BY world_minutes DESC,id DESC LIMIT 30`, [worldId, agentId]);
+  const profile = profileResult.rows[0];
+  if (!profile) return null;
+  const skills = Object.fromEntries(skillResult.rows.map((row) => [row.skill_name, finite(row.value)]));
+  const skillActions = Object.fromEntries(skillResult.rows.map((row) => [row.skill_name, finite(row.actions_completed)]));
+  const relationships = relationshipResult.rows;
+  const metricState = {
+    skills, skillActions, relationships,
+    netWorthUsd: finite(wealthResult.rows[0]?.value),
+    workIncomeUsd: finite(incomeResult.rows[0]?.value),
+    completedActions: finite(actionResult.rows[0]?.actions_taken),
+    needs: needResult.rows[0] || { energy: 50, food: 50, social: 50 },
+    recentActions: recentActionResult.rows.map((memory) => memory.metadata?.action).filter(Boolean)
+  };
+  const priorMilestones = Number(profile.goal_milestones) || 0;
+  const progress = goalProgress(profile.primary_goal, metricState, priorMilestones);
+  const isFirstProgress = profile.goal_last_updated_world_minutes === null;
+  const role = deriveDominantRole(skills, profile.primary_goal);
+  await client.query(`UPDATE world_social_profiles SET primary_goal=$3,goal_progress=$4,goal_milestones=$5,
+      goal_last_updated_world_minutes=$6,dominant_role=$7,updated_at=now()
+    WHERE world_id=$1 AND agent_id=$2`, [worldId, agentId, profile.primary_goal, progress.progress, progress.milestones,
+    worldMinutes, role]);
+  if (Number(profile.active_goal_id) > 0) await client.query(`UPDATE world_agent_goals SET progress=$3,
+      updated_world_minutes=$4,updated_at=now() WHERE world_id=$1 AND id=$2 AND status='active'`,
+  [worldId, profile.active_goal_id, progress.progress, worldMinutes]);
+  if (!isFirstProgress && progress.milestones > priorMilestones) {
+    await recordWorldEvent(client, worldId, agentId, sourceEventId, 'world.goal_milestone', {
+      goal: profile.primary_goal, previousMilestones: priorMilestones, milestones: progress.milestones,
+      progress: progress.progress, metric: progress.metric, worldMinutes
+    });
+  }
+  return { ...progress, role, category: profile.primary_goal };
+}
+
+async function reflectResident(client, worldId, agent, tickCount, worldMinutes, trigger = 'cadence') {
+  const profileResult = await client.query(`SELECT p.*,s.risk_tolerance,m.energy,m.food,m.social
+    FROM world_social_profiles p JOIN world_agent_states s ON s.world_id=p.world_id AND s.agent_id=p.agent_id
+    JOIN world_members m ON m.world_id=p.world_id AND m.agent_id=p.agent_id
+    WHERE p.world_id=$1 AND p.agent_id=$2 FOR UPDATE OF p,s,m`, [worldId, agent.agentId]);
+  const profile = profileResult.rows[0];
+  if (!profile || !reflectionDue({ worldMinutes, lastReflectionWorldMinutes: profile.last_reflection_world_minutes,
+    important: trigger === 'important_event' })) return null;
+
+  const priorMinute = profile.last_reflection_world_minutes === null ? -1 : Number(profile.last_reflection_world_minutes);
+  const memoryResult = await client.query(`SELECT memory_type AS "memoryType",summary,importance::text AS importance,world_minutes AS "worldMinutes",
+      related_agent_id AS "relatedAgentId",metadata FROM agent_memories WHERE world_id=$1 AND agent_id=$2
+    ORDER BY world_minutes DESC,id DESC LIMIT 100`, [worldId, agent.agentId]);
+  const skillResult = await client.query(`SELECT skill_name AS skill,skill_value::text AS value,actions_completed AS actions FROM world_agent_skills
+    WHERE world_id=$1 AND agent_id=$2 ORDER BY skill_name`, [worldId, agent.agentId]);
+  const relationshipResult = await client.query(`SELECT CASE WHEN r.agent_a_id=$2 THEN r.agent_b_id ELSE r.agent_a_id END AS "otherAgentId",
+      other.name,r.familiarity::text AS familiarity,r.trust::text AS trust,r.affinity::text AS affinity,
+      r.interaction_count AS "interactionCount"
+    FROM world_relationships r JOIN agents other ON other.id=CASE WHEN r.agent_a_id=$2 THEN r.agent_b_id ELSE r.agent_a_id END
+    WHERE r.world_id=$1 AND (r.agent_a_id=$2 OR r.agent_b_id=$2)`, [worldId, agent.agentId]);
+  const wealthResult = await client.query(`SELECT COALESCE(sum(b.balance * CASE WHEN b.asset_symbol='USDC' THEN 1 ELSE q.price_usd END),0)::text AS value
+    FROM crypto_balances b LEFT JOIN crypto_market_quotes q ON q.symbol=b.asset_symbol
+    WHERE b.world_id=$1 AND b.agent_id=$2 AND b.asset_symbol IN ('USDC','BTC','ETH')`, [worldId, agent.agentId]);
+  const incomeResult = await client.query(`SELECT COALESCE(sum(amount),0)::text AS value FROM crypto_ledger
+    WHERE world_id=$1 AND agent_id=$2 AND asset_symbol='USDC' AND entry_type='work_income'`, [worldId, agent.agentId]);
+  const goalResult = await client.query(`SELECT id,goal_type AS "goalType",category,description,priority::text AS priority,
+      progress::text AS progress,status,source,metadata,updated_world_minutes AS "updatedWorldMinutes" FROM world_agent_goals
+    WHERE world_id=$1 AND agent_id=$2 AND status='active' ORDER BY CASE goal_type WHEN 'primary' THEN 0 WHEN 'secondary' THEN 1 ELSE 2 END,
+      priority DESC,updated_world_minutes DESC LIMIT 7`, [worldId, agent.agentId]);
+  const memories = memoryResult.rows;
+  const newMemories = memories.filter((memory) => Number(memory.worldMinutes) > priorMinute);
+  const skills = Object.fromEntries(skillResult.rows.map((skill) => [skill.skill, Number(skill.value)]));
+  const skillActions = Object.fromEntries(skillResult.rows.map((skill) => [skill.skill, Number(skill.actions)]));
+  const relationships = relationshipResult.rows.map((relation) => ({ ...relation,
+    familiarity: Number(relation.familiarity), trust: Number(relation.trust), affinity: Number(relation.affinity) }));
+  const balances = { netWorthUsd: Number(wealthResult.rows[0]?.value) || 0 };
+  const workIncomeUsd = Number(incomeResult.rows[0]?.value) || 0;
+  const activePrimary = goalResult.rows.find((goal) => goal.goalType === 'primary') || null;
+  const actionsResult = await client.query(`SELECT actions_taken FROM agent_minds WHERE world_id=$1 AND agent_id=$2`,
+    [worldId, agent.agentId]);
+  const metricState = { skills, skillActions, relationships, netWorthUsd: balances.netWorthUsd, workIncomeUsd,
+    completedActions: Number(actionsResult.rows[0]?.actions_taken) || 0,
+    recentActions: memories.slice(0, 30).map((memory) => memory.metadata?.action).filter(Boolean),
+    needs: { energy: agent.energy, food: agent.food, social: agent.social } };
+  const currentProgress = activePrimary ? goalProgress(activePrimary.category, metricState, Number(profile.goal_milestones) || 0) : null;
+  if (activePrimary && currentProgress) await client.query(`UPDATE world_agent_goals SET progress=$3,updated_world_minutes=$4,updated_at=now()
+    WHERE world_id=$1 AND id=$2`, [worldId, activePrimary.id, currentProgress.progress, worldMinutes]);
+
+  const proposal = reflectionProposal({ profile: { ...profile, riskModifier: Number(profile.risk_modifier) || 0,
+      personalityModifiers: profile.personality_modifiers || {} },
+    memories: newMemories, skills, relationships, balances, needs: metricState.needs, currentGoal: activePrimary, worldMinutes });
+
+  const outcomes = new Map();
+  for (const memory of newMemories) {
+    const action = memory.metadata?.action || ({ work: 'work', learning: 'learn', trade: 'trade', failure: 'trade',
+      social: 'socialize', cooperation: 'cooperate' })[memory.memoryType];
+    const outcome = Number(memory.metadata?.outcome);
+    if (!action || !Number.isFinite(outcome)) continue;
+    const record = outcomes.get(action) || { count: 0, sum: 0 };
+    record.count++;
+    record.sum += Math.max(-1, Math.min(1, outcome));
+    outcomes.set(action, record);
+  }
+  for (const [action, sample] of outcomes) {
+    const estimate = sample.sum / sample.count;
+    await client.query(`INSERT INTO world_agent_beliefs(world_id,agent_id,subject_type,subject_key,belief_key,
+        estimate,confidence,sample_count,updated_world_minutes,evidence)
+      VALUES($1,$2,'action',$3,'outcome',$4,$5,$6,$7,$8::jsonb)
+      ON CONFLICT(world_id,agent_id,subject_type,subject_key,belief_key) DO UPDATE SET
+        estimate=(world_agent_beliefs.estimate*world_agent_beliefs.sample_count+EXCLUDED.estimate*EXCLUDED.sample_count)
+          / NULLIF(world_agent_beliefs.sample_count+EXCLUDED.sample_count,0),
+        confidence=LEAST(0.95,(world_agent_beliefs.sample_count+EXCLUDED.sample_count)*0.08),
+        sample_count=world_agent_beliefs.sample_count+EXCLUDED.sample_count,
+        updated_world_minutes=EXCLUDED.updated_world_minutes,evidence=EXCLUDED.evidence`,
+    [worldId, agent.agentId, action, estimate, Math.min(0.95, sample.count * 0.08), sample.count, worldMinutes,
+      JSON.stringify({ samplesInReflection: sample.count, lastWorldMinute: worldMinutes })]);
+  }
+
+  const currentPrimaryProgress = currentProgress?.progress ?? Number(activePrimary?.progress || 0);
+  let selectedGoal = activePrimary;
+  if (activePrimary && currentPrimaryProgress >= 100) {
+    await client.query(`UPDATE world_agent_goals SET status='completed',progress=100,updated_world_minutes=$3,updated_at=now()
+      WHERE world_id=$1 AND id=$2 AND status='active'`, [worldId, activePrimary.id, worldMinutes]);
+    const generated = proposal.nextGoal;
+    const inserted = await client.query(`INSERT INTO world_agent_goals(world_id,agent_id,goal_type,category,description,
+        priority,parent_goal_id,created_world_minutes,updated_world_minutes,source,metadata)
+      VALUES($1,$2,'primary',$3,$4,1,$5,$6,$6,$7,$8::jsonb)
+      ON CONFLICT DO NOTHING RETURNING id,goal_type AS "goalType",category,description,priority::text AS priority,
+        progress::text AS progress,status,source,metadata`,
+    [worldId, agent.agentId, generated.category, generated.description, activePrimary.id, worldMinutes, generated.source,
+      JSON.stringify(generated.metadata || {})]);
+    selectedGoal = inserted.rows[0] || activePrimary;
+    await client.query(`UPDATE world_social_profiles SET primary_goal=$3,goal_progress=0,goal_milestones=0,
+        goal_started_world_minutes=$4,goal_last_updated_world_minutes=$4,updated_at=now()
+      WHERE world_id=$1 AND agent_id=$2`, [worldId, agent.agentId, selectedGoal.category, worldMinutes]);
+  }
+
+  const currentSecondaries = goalResult.rows.filter((goal) => goal.goalType === 'secondary');
+  if (currentSecondaries.length < 3) {
+    const skill = Object.entries(skills).sort((a, b) => a[1] - b[1])[0]?.[0] || 'research';
+    const proposedSecondary = newMemories.some((memory) => memory.memoryType === 'cooperation')
+      ? { category: 'COOPERATE_AND_BUILD', description: 'Develop useful work partnerships through real shared activity.',
+        source: 'relationship', metadata: {} }
+      : { category: `DEVELOP_${skill.toUpperCase()}`, description: `Develop ${skill} through repeated useful practice.`,
+        source: 'experience', metadata: { skill } };
+    if (!currentSecondaries.some((goal) => goal.category === proposedSecondary.category)) await client.query(`
+      INSERT INTO world_agent_goals(world_id,agent_id,goal_type,category,description,priority,parent_goal_id,
+        created_world_minutes,updated_world_minutes,source,metadata)
+      VALUES($1,$2,'secondary',$3,$4,0.55,$5,$6,$6,$7,$8::jsonb) ON CONFLICT DO NOTHING`,
+    [worldId, agent.agentId, proposedSecondary.category, proposedSecondary.description, selectedGoal?.id || null,
+      worldMinutes, proposedSecondary.source, JSON.stringify(proposedSecondary.metadata)]);
+  }
+
+  const shortGoals = goalResult.rows.filter((goal) => goal.goalType === 'short');
+  if (!shortGoals.length || worldMinutes - Number(shortGoals[0]?.updatedWorldMinutes || 0) >= 720) {
+    await client.query(`UPDATE world_agent_goals SET status='completed',updated_world_minutes=$3,updated_at=now()
+      WHERE world_id=$1 AND agent_id=$2 AND goal_type='short' AND status='active'`, [worldId, agent.agentId, worldMinutes]);
+    const weakNeed = ['energy', 'food', 'social'].sort((a, b) => Number(agent[a] ?? 50) - Number(agent[b] ?? 50))[0];
+    const short = Number(agent[weakNeed] ?? 50) < 55
+      ? { category: 'RESTORE_NEEDS', description: `Restore ${weakNeed} before taking on another demanding activity.` }
+      : { category: `PRACTICE_${(proposal.rationale.bestSkill || 'research').toUpperCase()}`,
+        description: `Take a concrete step to practice ${proposal.rationale.bestSkill || 'research'}.` };
+    await client.query(`INSERT INTO world_agent_goals(world_id,agent_id,goal_type,category,description,priority,
+        parent_goal_id,created_world_minutes,updated_world_minutes,source,metadata)
+      VALUES($1,$2,'short',$3,$4,0.45,$5,$6,$6,'self_generated',$7::jsonb) ON CONFLICT DO NOTHING`,
+    [worldId, agent.agentId, short.category, short.description, selectedGoal?.id || null, worldMinutes,
+      JSON.stringify({ trigger, need: weakNeed })]);
+  }
+
+  const profileUpdates = await client.query(`UPDATE world_social_profiles SET personality_modifiers=$3::jsonb,
+      risk_modifier=$4,last_reflection_world_minutes=$5,updated_at=now()
+    WHERE world_id=$1 AND agent_id=$2 RETURNING sociability::text AS sociability,curiosity::text AS curiosity,
+      discipline::text AS discipline,ambition::text AS ambition`,
+  [worldId, agent.agentId, JSON.stringify(proposal.modifiers), proposal.riskModifier, worldMinutes]);
+  const reflection = await client.query(`INSERT INTO world_agent_reflections(world_id,agent_id,world_minutes,trigger,rationale)
+    VALUES($1,$2,$3,$4,$5::jsonb) ON CONFLICT(world_id,agent_id,world_minutes) DO NOTHING RETURNING id`,
+  [worldId, agent.agentId, worldMinutes, trigger, JSON.stringify(proposal.rationale)]);
+  const eventId = await recordWorldEvent(client, worldId, agent.agentId, tickCount, 'world.agent_reflected', {
+    trigger, worldMinutes, goal: selectedGoal?.category || null, personalityModifiers: proposal.modifiers,
+    riskModifier: proposal.riskModifier, rationale: proposal.rationale
+  });
+
+  const beliefResult = await client.query(`SELECT subject_key,estimate::text AS estimate,confidence::text AS confidence
+    FROM world_agent_beliefs WHERE world_id=$1 AND agent_id=$2 AND subject_type='action'
+      AND belief_key='outcome' ORDER BY sample_count DESC,subject_key`, [worldId, agent.agentId]);
+  const strongest = beliefResult.rows[0];
+  if (strongest && Number(strongest.confidence) >= 0.24) await recordConsolidatedMemory(client, {
+    worldId, agentId: agent.agentId, worldMinutes, key: `belief:action:${strongest.subject_key}`,
+    summary: `${strongest.subject_key} has been a ${Number(strongest.estimate) >= 0 ? 'reliable' : 'difficult'} path in recent personal experience.`,
+    importance: 0.68, metadata: { action: strongest.subject_key, estimate: Number(strongest.estimate),
+      confidence: Number(strongest.confidence), reflectionId: reflection.rows[0]?.id || null }
+  });
+  await pruneResidentMemories(client, worldId, agent.agentId);
+  return { ...proposal, primaryGoal: selectedGoal?.category || null,
+    personality: profileUpdates.rows[0] || null, reflectionId: reflection.rows[0]?.id || null, eventId };
+}
+
+async function completeSocialPair(client, worldId, actor, scene, runtime, tick) {
+  if (!scene || !['cafe', 'garden'].includes(scene.sceneType) || scene.status !== 'active') return null;
+  const partners = await client.query(`SELECT m.agent_id AS "agentId",a.name,s.status,s.planned_action AS "plannedAction",
+      m.location,r.familiarity::text AS familiarity,r.trust::text AS trust,r.affinity::text AS affinity,
+      r.interaction_count AS "interactionCount",r.last_interaction_world_minutes AS "lastInteractionWorldMinutes"
+    FROM world_members m JOIN agents a ON a.id=m.agent_id
+    JOIN world_agent_states s ON s.world_id=m.world_id AND s.agent_id=m.agent_id
+    LEFT JOIN world_relationships r ON r.world_id=m.world_id AND
+      ((r.agent_a_id=$2 AND r.agent_b_id=m.agent_id) OR (r.agent_b_id=$2 AND r.agent_a_id=m.agent_id))
+    WHERE m.world_id=$1 AND m.location=$3 AND m.agent_id<>$2 AND s.status='idle'
+    ORDER BY COALESCE(r.familiarity,0) DESC,a.name`, [worldId, actor.agentId, scene.name]);
+  const eligible = partners.rows.filter((partner) => canSocializePair({
+    actor, partner: { ...partner, location: scene.name }, scene, worldMinutes: runtime.world_minutes
+  }));
+  const preferredId = actor.social_partner_id || actor.socialPartnerId;
+  const partner = eligible.find((item) => item.agentId === preferredId) || eligible[0];
+  if (!partner) return null;
+  const pair = canonicalPair(actor.agentId, partner.agentId);
+  if (!pair) return null;
+  const relationship = (await client.query(`INSERT INTO world_relationships(world_id,agent_a_id,agent_b_id,
+      familiarity,trust,affinity,last_interaction_world_minutes,interaction_count)
+    VALUES($1,$2,$3,8,2,3,$4,1)
+    ON CONFLICT(world_id,agent_a_id,agent_b_id) DO UPDATE SET
+      familiarity=LEAST(100,world_relationships.familiarity+8),
+      trust=LEAST(100,world_relationships.trust+2),affinity=LEAST(100,world_relationships.affinity+3),
+      last_interaction_world_minutes=EXCLUDED.last_interaction_world_minutes,
+      interaction_count=world_relationships.interaction_count+1,updated_at=now()
+    RETURNING familiarity::text AS familiarity,trust::text AS trust,affinity::text AS affinity,
+      interaction_count AS "interactionCount"`, [worldId, pair[0], pair[1], runtime.world_minutes])).rows[0];
+  const eventId = await recordWorldEvent(client, worldId, actor.agentId, tick, 'world.social_interaction', {
+    partnerId: partner.agentId, partnerName: partner.name, place: scene.name,
+    worldMinutes: finite(runtime.world_minutes), relationship
+  });
+  const importance = Number(relationship.interactionCount) >= 5 ? 0.72 : 0.48;
+  const summary = `Met ${partner.name} at ${scene.name}.`;
+  await recordResidentMemory(client, { worldId, agentId: actor.agentId, memoryType: 'social', summary, importance,
+    worldMinutes: runtime.world_minutes, location: scene.name, relatedAgentId: partner.agentId,
+    metadata: { familiarity: Number(relationship.familiarity), trust: Number(relationship.trust), affinity: Number(relationship.affinity) },
+    sourceEventId: eventId });
+  await recordResidentMemory(client, { worldId, agentId: partner.agentId, memoryType: 'social',
+    summary: `Met ${actor.name} at ${scene.name}.`, importance, worldMinutes: runtime.world_minutes,
+    location: scene.name, relatedAgentId: actor.agentId,
+    metadata: { familiarity: Number(relationship.familiarity), trust: Number(relationship.trust), affinity: Number(relationship.affinity) },
+    sourceEventId: eventId });
+  return { partnerId: partner.agentId, partnerName: partner.name, relationship, eventId };
 }
 
 async function setMindGoal(client, worldId, agentId, goal, action, summary) {
@@ -190,12 +571,14 @@ function updatedNeeds(agent, deltas) {
   return Object.fromEntries(FINITE_STAT_KEYS.map((key) => [key, incrementStat(agent[key], finite(deltas[key]))]));
 }
 
-async function completeActivity(client, worldId, agent, runtime, quotes, now) {
+async function completeActivity(client, worldId, agent, runtime, quotes, now, scene) {
   const activity = agent.planned_action;
   const place = agent.location;
   const profile = `${agent.agentId}:${runtime.tick_count}:${activity}`;
   let needs = { energy: 0, food: 0, social: 0, happiness: 0, knowledge: 0 };
   let result = { action: activity, place };
+  let socialInteraction = null;
+  let cooperativePartnerEventId = null;
   if (activity === 'work') {
     const dataCenter = agent.scene_type === 'data_center';
     const amount = 20 + (stableInt(`${profile}:wage`) % (dataCenter ? 71 : 61));
@@ -203,6 +586,63 @@ async function completeActivity(client, worldId, agent, runtime, quotes, now) {
       `${actionId(agent.agentId, runtime.tick_count, 'work_income')}:USDC`, dataCenter ? 'simulated data center wages' : 'simulated workshop wages');
     needs = { energy: -8, food: -6, social: -2, happiness: 2, knowledge: dataCenter ? 3 : 1 };
     result.income = { amount: `${amount}.00000000`, asset: 'USDC', simulated: true };
+  } else if (activity === 'cooperate') {
+    const pairId = canonicalPair(agent.agentId, agent.planned_partner_id);
+    const partnerResult = pairId && scene && ['workshop', 'data_center'].includes(scene.sceneType) && scene.status === 'active'
+      ? await client.query(`SELECT m.agent_id AS "agentId",a.name,m.energy,m.food,m.social,m.location,
+          s.status,s.happiness,s.knowledge,COALESCE(s.goal,'balanced') AS goal,am.current_goal AS "currentGoal",
+          COALESCE(r.familiarity,0)::text AS familiarity,COALESCE(r.trust,0)::text AS trust,
+          COALESCE(r.affinity,0)::text AS affinity,r.last_interaction_world_minutes AS "lastInteractionWorldMinutes"
+        FROM world_members m JOIN agents a ON a.id=m.agent_id
+        JOIN world_agent_states s ON s.world_id=m.world_id AND s.agent_id=m.agent_id
+        LEFT JOIN agent_minds am ON am.world_id=m.world_id AND am.agent_id=m.agent_id
+        LEFT JOIN world_relationships r ON r.world_id=m.world_id AND r.agent_a_id=$1 AND r.agent_b_id=$2
+        WHERE m.world_id=$3 AND m.agent_id=$6 AND m.location=$4 AND s.status='idle'
+          AND (COALESCE(r.familiarity,0)>=15 OR COALESCE(r.trust,0)>=5)
+          AND (r.last_interaction_world_minutes IS NULL OR $5-r.last_interaction_world_minutes>=${SOCIAL_COOLDOWN_WORLD_MINUTES})
+        FOR UPDATE OF m,s`, [pairId[0], pairId[1], worldId, place, runtime.world_minutes, agent.planned_partner_id])
+      : { rows: [] };
+    const partner = partnerResult.rows[0];
+    if (!partner || partner.agentId === agent.agentId) {
+      result.abandoned = 'cooperation_partner_unavailable';
+      needs.energy = -1;
+    } else {
+      const dataCenter = scene.sceneType === 'data_center';
+      const base = dataCenter ? 71 : 61;
+      const actorAmount = 20 + stableInt(`${profile}:coop-actor-wage`) % base;
+      const partnerAmount = 20 + stableInt(`${profile}:coop-partner-wage`) % base;
+      await adjustUsdc(client, worldId, agent.agentId, `${actorAmount}.00000000`, 'work_income',
+        `${actionId(agent.agentId, runtime.tick_count, 'cooperate_income')}:USDC`, 'simulated cooperative work income');
+      await adjustUsdc(client, worldId, partner.agentId, `${partnerAmount}.00000000`, 'work_income',
+        `${actionId(agent.agentId, runtime.tick_count, `cooperate_income:${agent.agentId}`)}:USDC`, 'simulated cooperative work income');
+      needs = { energy: -8, food: -6, social: 1, happiness: 4, knowledge: dataCenter ? 3 : 2 };
+      const partnerNeeds = updatedNeeds(partner, { energy: -6, food: -4, social: 1, happiness: 3, knowledge: dataCenter ? 2 : 1 });
+      await client.query(`UPDATE world_members SET energy=$3,food=$4,social=$5 WHERE world_id=$1 AND agent_id=$2`,
+        [worldId, partner.agentId, partnerNeeds.energy, partnerNeeds.food, partnerNeeds.social]);
+      await client.query(`UPDATE world_agent_states SET happiness=$3,knowledge=$4,next_decision_at=$5,updated_at=$6
+        WHERE world_id=$1 AND agent_id=$2`, [worldId, partner.agentId, partnerNeeds.happiness, partnerNeeds.knowledge,
+        new Date(now.getTime() + ACTION_SECONDS.cooperate * 1_000 + 5_000), now]);
+      const relationship = (await client.query(`INSERT INTO world_relationships(world_id,agent_a_id,agent_b_id,
+          familiarity,trust,affinity,last_interaction_world_minutes,interaction_count)
+        VALUES($1,$2,$3,4,1.5,2,$4,1)
+        ON CONFLICT(world_id,agent_a_id,agent_b_id) DO UPDATE SET
+          familiarity=LEAST(100,world_relationships.familiarity+4),trust=LEAST(100,world_relationships.trust+1.5),
+          affinity=LEAST(100,world_relationships.affinity+2),last_interaction_world_minutes=EXCLUDED.last_interaction_world_minutes,
+          interaction_count=world_relationships.interaction_count+1,updated_at=now()
+        RETURNING familiarity::text AS familiarity,trust::text AS trust,affinity::text AS affinity,
+          interaction_count AS "interactionCount"`, [worldId, pairId[0], pairId[1], runtime.world_minutes])).rows[0];
+      result.cooperation = { partnerId: partner.agentId, partnerName: partner.name,
+        actorIncomeUsd: `${actorAmount}.00000000`, partnerIncomeUsd: `${partnerAmount}.00000000`,
+        incomeUsd: `${actorAmount + partnerAmount}.00000000`, relationship };
+      needs.incomeUsd = actorAmount;
+      await setMindGoal(client, worldId, partner.agentId, partner.currentGoal || partner.goal, 'cooperate',
+        `Worked with ${agent.name} at ${place} and earned ${partnerAmount}.00000000 simulated USDC.`);
+      await recordWorldEvent(client, worldId, agent.agentId, runtime.tick_count, 'world.cooperation_completed', {
+        partnerId: partner.agentId, partnerName: partner.name, place, worldMinutes: runtime.world_minutes,
+        actorIncomeUsd: result.cooperation.actorIncomeUsd, partnerIncomeUsd: result.cooperation.partnerIncomeUsd,
+        relationship
+      });
+    }
   } else if (activity === 'learn') {
     needs = { energy: -5, food: -2, social: 0, happiness: agent.scene_type === 'observatory' ? 3 : 1,
       knowledge: 6 + stableInt(`${profile}:study`) % 9 };
@@ -222,11 +662,10 @@ async function completeActivity(client, worldId, agent, runtime, quotes, now) {
       }
     } else needs = { energy: 10, food: 45, social: 3, happiness: 2, knowledge: 0 };
   } else if (activity === 'socialize') {
-    const nearby = await client.query(`SELECT count(*)::int AS count FROM world_members
-      WHERE world_id=$1 AND location=$2 AND agent_id<>$3`, [worldId, place, agent.agentId]);
-    const count = Math.min(3, finite(nearby.rows[0]?.count));
-    needs = { energy: -2, food: -1, social: 18 + count * 2, happiness: 4 + count * 2, knowledge: count ? 1 : 0 };
-    result.residentsNearby = count;
+    socialInteraction = await completeSocialPair(client, worldId, agent, scene, runtime, runtime.tick_count);
+    if (socialInteraction) result.socialInteraction = socialInteraction;
+    needs = { energy: -2, food: -1, social: socialInteraction ? 20 : 0,
+      happiness: socialInteraction ? 6 : 0, knowledge: socialInteraction ? 1 : 0 };
   } else if (activity === 'trade') {
     const quote = quotes.find((item) => item.symbol === agent.planned_asset);
     if (place !== 'Exchange' || !quote || !agent.planned_side || !agent.planned_quote_units) {
@@ -237,6 +676,12 @@ async function completeActivity(client, worldId, agent, runtime, quotes, now) {
         asset: agent.planned_asset, quoteUnits: String(agent.planned_quote_units), quote: { ...quote, all: quotes } });
       result.trade = { id: trade.orderId, side: trade.side, asset: trade.asset, quantity: trade.quantity,
         priceUsd: trade.executionPriceUsd, notionalUsd: trade.notionalUsd, feeUsdc: trade.feeUsdc, simulated: true };
+      if (trade.side === 'sell') {
+        const history = await client.query(`SELECT side,quantity::text AS quantity,notional_usd::text AS "notionalUsd",
+            fee_usdc::text AS "feeUsdc" FROM crypto_trades WHERE world_id=$1 AND agent_id=$2 AND asset_symbol=$3 ORDER BY id`,
+        [worldId, agent.agentId, trade.asset]);
+        result.trade.realizedPnlUsd = lastRealizedSalePnl(history.rows);
+      }
       await recordWorldEvent(client, worldId, agent.agentId, runtime.tick_count, 'crypto.trade_filled',
         { ...result.trade, action: 'trade', place, timestamp: now.toISOString() });
       await client.query(`UPDATE world_agent_states SET last_trade_at=$3 WHERE world_id=$1 AND agent_id=$2`,
@@ -252,7 +697,7 @@ async function completeActivity(client, worldId, agent, runtime, quotes, now) {
   await client.query(`UPDATE world_members SET energy=$3,food=$4,social=$5 WHERE world_id=$1 AND agent_id=$2`,
     [worldId, agent.agentId, next.energy, next.food, next.social]);
   await client.query(`UPDATE world_agent_states SET happiness=$3,knowledge=$4,status='idle',planned_action=NULL,
-      target_location=NULL,planned_side=NULL,planned_asset=NULL,planned_quote_units=NULL,planned_paid_meal=false,
+      target_location=NULL,planned_partner_id=NULL,planned_side=NULL,planned_asset=NULL,planned_quote_units=NULL,planned_paid_meal=false,
       fruitfly_observation='{}'::jsonb,fruitfly_candidates='[]'::jsonb,fruitfly_selected='{}'::jsonb,
       movement_started_at=NULL,movement_ends_at=NULL,action_started_at=NULL,action_ends_at=NULL,
       next_decision_at=$5,updated_at=$6 WHERE world_id=$1 AND agent_id=$2`,
@@ -261,16 +706,51 @@ async function completeActivity(client, worldId, agent, runtime, quotes, now) {
     : activity === 'learn' ? `Studied at ${place} and gained knowledge.`
       : activity === 'rest' ? `Rested at ${place}.`
         : activity === 'eat' ? `Ate at ${place}.`
-          : activity === 'socialize' ? `Socialized at ${place}.`
+      : activity === 'socialize' ? (socialInteraction ? `Met ${socialInteraction.partnerName} at ${place}.` : `Spent time in the social space at ${place}.`)
+            : activity === 'cooperate' ? (result.cooperation ? `Worked with ${result.cooperation.partnerName} at ${place}.` : 'The planned cooperation could not take place.')
             : result.trade ? `Completed a simulated ${result.trade.side} of ${result.trade.asset} at Exchange.` : 'Skipped an unavailable simulated trade.';
   await setMindGoal(client, worldId, agent.agentId, agent.current_goal || agent.goal, activity, summary);
-  await recordWorldEvent(client, worldId, agent.agentId, runtime.tick_count, 'world.action_completed', {
+  const completionEventId = await recordWorldEvent(client, worldId, agent.agentId, runtime.tick_count, 'world.action_completed', {
     ...result, needs: next, status: 'completed', worldMinutes: finite(runtime.world_minutes)
   });
+  if (activity === 'cooperate' && result.cooperation) {
+    cooperativePartnerEventId = await recordWorldEvent(client, worldId, result.cooperation.partnerId,
+      runtime.tick_count, 'world.action_completed', {
+        action: 'cooperate', partnerId: agent.agentId, partnerName: agent.name, place, status: 'completed',
+        incomeUsd: result.cooperation.partnerIncomeUsd, worldMinutes: finite(runtime.world_minutes)
+      });
+  }
+  if (socialInteraction) {
+    await applySkillGains(client, worldId, agent.agentId, activity, place, true);
+    await applySkillGains(client, worldId, socialInteraction.partnerId, activity, place, true);
+    await refreshSocialProfile(client, worldId, agent.agentId, runtime.world_minutes, socialInteraction.eventId);
+    await refreshSocialProfile(client, worldId, socialInteraction.partnerId, runtime.world_minutes, socialInteraction.eventId);
+  } else if (activity === 'cooperate' && result.cooperation) {
+    const actorMemory = memoryForCompletedAction({ action: 'cooperate', result, place, worldMinutes: runtime.world_minutes });
+    const partnerMemory = memoryForCompletedAction({ action: 'cooperate', place, worldMinutes: runtime.world_minutes,
+      result: { cooperation: { partnerId: agent.agentId, partnerName: agent.name, incomeUsd: result.cooperation.partnerIncomeUsd } } });
+    await applySkillGains(client, worldId, agent.agentId, activity, place, true);
+    await applySkillGains(client, worldId, result.cooperation.partnerId, activity, place, true);
+    if (actorMemory) await recordResidentMemory(client, { worldId, agentId: agent.agentId, ...actorMemory,
+      worldMinutes: runtime.world_minutes, location: place, sourceEventId: completionEventId });
+    if (partnerMemory) await recordResidentMemory(client, { worldId, agentId: result.cooperation.partnerId, ...partnerMemory,
+      worldMinutes: runtime.world_minutes, location: place, sourceEventId: cooperativePartnerEventId });
+    await refreshSocialProfile(client, worldId, agent.agentId, runtime.world_minutes, completionEventId);
+    await refreshSocialProfile(client, worldId, result.cooperation.partnerId, runtime.world_minutes, completionEventId);
+  } else if (activity !== 'socialize' && !result.abandoned) {
+    const meaningful = activity === 'work' && result.income || activity === 'learn' && result.learning || activity === 'trade' && result.trade;
+    if (meaningful) {
+      await applySkillGains(client, worldId, agent.agentId, activity, place);
+      const memory = memoryForCompletedAction({ action: activity, result, place, worldMinutes: runtime.world_minutes });
+      if (memory) await recordResidentMemory(client, { worldId, agentId: agent.agentId, ...memory,
+        worldMinutes: runtime.world_minutes, location: place, sourceEventId: completionEventId });
+      await refreshSocialProfile(client, worldId, agent.agentId, runtime.world_minutes, completionEventId);
+    }
+  }
   const observation = safeJson(agent.fruitfly_observation);
   const candidates = Array.isArray(agent.fruitfly_candidates) ? agent.fruitfly_candidates : [];
   const selected = safeJson(agent.fruitfly_selected);
-  return observation.self && candidates.length && selected.id
+  return selected.learnerUsed && observation.self && candidates.length && selected.id
     ? { agentId: agent.agentId, observation, candidates, selected, result }
     : null;
 }
@@ -300,15 +780,55 @@ async function ensureAgentRows(pool, worldId) {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+    await client.query(`INSERT INTO world_runtime_state(world_id,tick_count,world_minutes,last_tick_at,market_snapshot,typesafe_next_at)
+      VALUES($1,0,480,now(),'{}'::jsonb,now()) ON CONFLICT(world_id) DO NOTHING`, [worldId]);
+    const runtime = (await client.query('SELECT world_minutes FROM world_runtime_state WHERE world_id=$1', [worldId])).rows[0];
+    const worldMinutes = Math.max(0, Math.trunc(finite(runtime?.world_minutes, 480)));
     for (const [index, member] of members.rows.entries()) {
       const profile = initialWorldAgentProfile(index);
       await client.query(`INSERT INTO world_agent_states(world_id,agent_id,goal,risk_tolerance,happiness,knowledge,next_decision_at)
         VALUES($1,$2,$3,$4,$5,$6,now()+($7::text || ' seconds')::interval) ON CONFLICT(world_id,agent_id) DO NOTHING`,
       [worldId, member.agent_id, profile.goal, profile.riskTolerance, profile.happiness, profile.knowledge, String(3 + index * 3)]);
       await ensureCryptoAccount(client, { worldId, agentId: member.agent_id });
+      const social = initialSocialProfile(member.agent_id, index);
+      const skills = initialSkillValues(member.agent_id, index);
+      await client.query(`INSERT INTO world_social_profiles(world_id,agent_id,sociability,curiosity,discipline,ambition,
+          primary_goal,goal_started_world_minutes,dominant_role)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT(world_id,agent_id) DO NOTHING`,
+      [worldId, member.agent_id, social.sociability, social.curiosity, social.discipline, social.ambition,
+        social.primaryGoal, worldMinutes, deriveDominantRole(skills, social.primaryGoal)]);
+      const currentProfile = (await client.query(`SELECT primary_goal FROM world_social_profiles
+        WHERE world_id=$1 AND agent_id=$2`, [worldId, member.agent_id])).rows[0];
+      const seeded = seededGoalSet(member.agent_id, index);
+      const primaryCategory = currentProfile?.primary_goal || seeded.primary.category;
+      const primaryDescription = goalDescription(primaryCategory) || seeded.primary.description;
+      await client.query(`INSERT INTO world_agent_goals(world_id,agent_id,goal_type,category,description,priority,
+          created_world_minutes,updated_world_minutes,source)
+        SELECT $1,$2,'primary',$3,$4,1,$5,$5,'seed'
+        WHERE NOT EXISTS (SELECT 1 FROM world_agent_goals WHERE world_id=$1 AND agent_id=$2
+          AND goal_type='primary' AND status='active') ON CONFLICT DO NOTHING`,
+      [worldId, member.agent_id, primaryCategory, primaryDescription, worldMinutes]);
+      const activePrimary = (await client.query(`SELECT id FROM world_agent_goals WHERE world_id=$1 AND agent_id=$2
+        AND goal_type='primary' AND status='active' ORDER BY priority DESC,id LIMIT 1`, [worldId, member.agent_id])).rows[0];
+      for (const goalType of ['secondary', 'short']) {
+        const count = (await client.query(`SELECT count(*)::int AS count FROM world_agent_goals
+          WHERE world_id=$1 AND agent_id=$2 AND goal_type=$3 AND status='active'`, [worldId, member.agent_id, goalType])).rows[0].count;
+        if (count > 0) continue;
+        const seeds = seeded[goalType];
+        for (const item of seeds.slice(0, goalType === 'secondary' ? 3 : 3)) {
+          await client.query(`INSERT INTO world_agent_goals(world_id,agent_id,goal_type,category,description,priority,
+              parent_goal_id,created_world_minutes,updated_world_minutes,source,metadata)
+            VALUES($1,$2,$3,$4,$5,$6,$7,$8,$8,'seed',$9::jsonb) ON CONFLICT DO NOTHING`, [worldId, member.agent_id, goalType,
+            item.category, item.description, item.priority, goalType === 'short' ? activePrimary?.id || null : null,
+            worldMinutes, JSON.stringify({ seeded: true })]);
+        }
+      }
+      for (const [skill, value] of Object.entries(skills)) {
+        await client.query(`INSERT INTO world_agent_skills(world_id,agent_id,skill_name,skill_value)
+          VALUES($1,$2,$3,$4) ON CONFLICT(world_id,agent_id,skill_name) DO NOTHING`,
+        [worldId, member.agent_id, skill, value]);
+      }
     }
-    await client.query(`INSERT INTO world_runtime_state(world_id,tick_count,world_minutes,last_tick_at,market_snapshot,typesafe_next_at)
-      VALUES($1,0,480,now(),'{}'::jsonb,now()) ON CONFLICT(world_id) DO NOTHING`, [worldId]);
     await client.query('COMMIT');
   } catch (error) {
     await client.query('ROLLBACK');
@@ -321,11 +841,32 @@ async function readEngineSnapshot(pool, worldId) {
     pool.query('SELECT name FROM worlds WHERE id=$1', [worldId]),
     pool.query(`SELECT a.id AS "agentId",a.name,am.archetype,am.traits,am.current_goal AS "currentGoal",am.actions_taken AS "actionsTaken",
         m.energy,m.food,m.social,m.location,s.goal,s.risk_tolerance AS "riskTolerance",s.happiness,s.knowledge,
+        p.sociability::text AS sociability,p.curiosity::text AS curiosity,p.discipline::text AS discipline,p.ambition::text AS ambition,
+        p.primary_goal AS "primaryGoal",p.goal_progress::text AS "goalProgress",p.dominant_role AS "dominantRole",
+        p.personality_modifiers AS "personalityModifiers",p.risk_modifier::text AS "riskModifier",
+        COALESCE((SELECT jsonb_object_agg(skill_name,skill_value) FROM world_agent_skills k
+          WHERE k.world_id=m.world_id AND k.agent_id=m.agent_id),'{}'::jsonb) AS skills,
+        COALESCE((SELECT jsonb_agg(jsonb_build_object('goalType',g.goal_type,'category',g.category,
+            'description',g.description,'priority',g.priority,'progress',g.progress,'status',g.status,'source',g.source,
+            'metadata',g.metadata) ORDER BY CASE g.goal_type WHEN 'primary' THEN 0 WHEN 'secondary' THEN 1 ELSE 2 END,
+              g.priority DESC,g.updated_world_minutes DESC) FROM world_agent_goals g
+          WHERE g.world_id=m.world_id AND g.agent_id=m.agent_id AND g.status='active'),'[]'::jsonb) AS goals,
+        COALESCE((SELECT jsonb_agg(jsonb_build_object('memoryType',memory.memory_type,'summary',memory.summary,
+            'importance',memory.importance,'worldMinutes',memory.world_minutes,'metadata',memory.metadata)
+          ORDER BY memory.world_minutes DESC,memory.id DESC) FROM (SELECT memory_type,summary,importance,world_minutes,metadata,id
+            FROM agent_memories WHERE world_id=m.world_id AND agent_id=m.agent_id
+            ORDER BY world_minutes DESC,id DESC LIMIT 20) memory),'[]'::jsonb) AS memories,
+        COALESCE((SELECT jsonb_agg(jsonb_build_object('otherAgentId',CASE WHEN rel.agent_a_id=m.agent_id THEN rel.agent_b_id ELSE rel.agent_a_id END,
+            'name',other.name,'familiarity',rel.familiarity,'trust',rel.trust,'affinity',rel.affinity)
+          ORDER BY rel.familiarity DESC,rel.trust DESC) FROM world_relationships rel
+          JOIN agents other ON other.id=CASE WHEN rel.agent_a_id=m.agent_id THEN rel.agent_b_id ELSE rel.agent_a_id END
+          WHERE rel.world_id=m.world_id AND (rel.agent_a_id=m.agent_id OR rel.agent_b_id=m.agent_id)),'[]'::jsonb) AS relationships,
         coalesce((SELECT balance::text FROM crypto_balances b WHERE b.world_id=m.world_id AND b.agent_id=m.agent_id AND b.asset_symbol='USDC'),'0') AS usdc,
         coalesce((SELECT balance::text FROM crypto_balances b WHERE b.world_id=m.world_id AND b.agent_id=m.agent_id AND b.asset_symbol='BTC'),'0') AS btc,
         coalesce((SELECT balance::text FROM crypto_balances b WHERE b.world_id=m.world_id AND b.agent_id=m.agent_id AND b.asset_symbol='ETH'),'0') AS eth
       FROM world_members m JOIN agents a ON a.id=m.agent_id JOIN world_agent_states s ON s.world_id=m.world_id AND s.agent_id=m.agent_id
       LEFT JOIN agent_minds am ON am.world_id=m.world_id AND am.agent_id=m.agent_id
+      LEFT JOIN world_social_profiles p ON p.world_id=m.world_id AND p.agent_id=m.agent_id
       WHERE m.world_id=$1 ORDER BY m.joined_at,a.name`, [worldId]),
     pool.query(`SELECT id,name,scene_type AS "sceneType",status FROM world_scenes WHERE world_id=$1 ORDER BY created_at,id`, [worldId]),
     pool.query(`SELECT symbol,price_usd::text AS "priceUsd",quote_version AS "quoteVersion",as_of AS "asOf",source
@@ -341,43 +882,82 @@ async function runStrategicTypeSafe(pool, worldId, chooseWithTypeSafe, runtimeSt
   const index = stableInt(`${worldId}:${snapshot.runtime.tick_count}:typesafe`) % snapshot.members.length;
   const resident = snapshot.members[index];
   const goalCandidates = [
-    { id: 'wealth', action: 'work', goal: 'Prioritize sustainable simulated income and bounded Exchange participation.', description: 'Build simulated savings through paid work; only trade at Exchange with existing risk limits.' },
-    { id: 'learn', action: 'learn', goal: 'Prioritize study, observation, and growing useful knowledge.', description: 'Spend more time learning in the library or observatory.' },
-    { id: 'community', action: 'socialize', goal: 'Prioritize helpful social connection with nearby residents.', description: 'Spend more time meeting residents in shared places.' },
-    { id: 'wellbeing', action: 'rest', goal: 'Prioritize energy, food, and a steady mood.', description: 'Prefer rest and simple care when needs are low.' },
-    { id: 'balanced', action: 'travel', goal: 'Balance paid work, learning, health, and social needs.', description: 'Keep a varied routine based on current needs.' }
+    { id: 'BUILD_WEALTH', legacyGoal: 'wealth', action: 'work', goal: 'Build simulated savings through paid work and bounded Exchange activity.', description: 'Build simulated savings through paid work; only trade at Exchange with existing risk limits.' },
+    { id: 'MASTER_TRADING', legacyGoal: 'wealth', action: 'trade', goal: 'Develop simulated trading expertise while respecting existing Exchange limits.', description: 'Practice at Exchange only when the existing risk gate permits it.' },
+    { id: 'MASTER_RESEARCH', legacyGoal: 'learn', action: 'learn', goal: 'Grow research skill through study and observation.', description: 'Study in the library or observatory.' },
+    { id: 'MASTER_ENGINEERING', legacyGoal: 'learn', action: 'work', goal: 'Grow engineering skill through data-center and workshop shifts.', description: 'Work at an existing workshop or data center.' },
+    { id: 'BUILD_RELATIONSHIPS', legacyGoal: 'community', action: 'socialize', goal: 'Build meaningful familiarity with co-located residents.', description: 'Meet available residents at a cafe or garden.' },
+    { id: 'BALANCED_LIFE', legacyGoal: 'balanced', action: 'rest', goal: 'Balance care, work, learning and social connection.', description: 'Choose a varied routine that supports needs and wellbeing.' }
   ];
+  const skills = safeJson(resident.skills);
+  const bestSkill = Object.entries(skills).sort((a, b) => Number(b[1]) - Number(a[1]))[0]?.[0] || 'research';
+  goalCandidates.push({ id: `DEVELOP_${bestSkill.toUpperCase()}`, legacyGoal: bestSkill === 'trading' ? 'wealth'
+    : bestSkill === 'social' ? 'community' : 'learn', action: bestSkill === 'trading' ? 'trade'
+      : bestSkill === 'social' ? 'socialize' : bestSkill === 'engineering' ? 'work' : 'learn',
+  goal: `Develop ${bestSkill} through useful practice informed by personal experience.`,
+  description: `Continue building ${bestSkill} while protecting immediate needs.` });
+  if (resident.memories.filter((memory) => Number(memory.metadata?.realizedPnlUsd) < 0).length >= 2) goalCandidates.push({
+    id: 'RECOVER_FINANCIAL_STABILITY', legacyGoal: 'wealth', action: 'work',
+    goal: 'Rebuild simulated financial stability after recent realized losses.',
+    description: 'Prefer stable work and learning while allowing existing risk gates to govern any Exchange activity.'
+  });
+  const trusted = resident.relationships.find((relation) => Number(relation.familiarity) >= 40 && Number(relation.trust) >= 8);
+  if (trusted) goalCandidates.push({ id: 'COOPERATE_WITH_RESIDENT', legacyGoal: 'community', action: 'cooperate',
+    goal: `Find a useful shared project with ${trusted.name}.`, description: `Explore a real cooperative opportunity with ${trusted.name}.` });
   const traits = safeJson(resident.traits);
   const observation = {
     self: { agentId: resident.agentId, energy: resident.energy, food: resident.food, social: resident.social,
       location: resident.location, internalTokenUnits: '0' },
     members: snapshot.members.map((member) => ({ id: member.agentId, name: member.name, location: member.location })),
     scenes: snapshot.scenes,
-    mind: { archetype: resident.archetype || 'observer', traits, currentGoal: resident.currentGoal,
-      actionsTaken: resident.actionsTaken, memories: [] },
+      mind: { archetype: resident.archetype || 'observer', traits, currentGoal: resident.currentGoal,
+      actionsTaken: resident.actionsTaken, memories: resident.memories, goals: resident.goals,
+      relationships: resident.relationships, socialProfile: {
+        primaryGoal: resident.primaryGoal, goalProgress: resident.goalProgress, dominantRole: resident.dominantRole,
+        sociability: resident.sociability, curiosity: resident.curiosity, discipline: resident.discipline,
+        ambition: resident.ambition, skills: resident.skills, modifiers: resident.personalityModifiers,
+        riskModifier: resident.riskModifier
+      } },
     market: { quotes: snapshot.quotes },
     trading: { balances: { USDC: resident.usdc, BTC: resident.btc, ETH: resident.eth }, positions: [],
       netAssetValueUsd: resident.usdc, risk: { simulatedOnly: true } }
   };
   const selection = await chooseWithTypeSafe(observation, goalCandidates, runtimeState, []);
   const selectedGoal = selection.decision?.id;
-  if (!ALLOWED_GOALS.has(selectedGoal)) return { reason: selection.reason || 'fallback', resident: resident.name };
-  const result = await pool.query(`UPDATE world_agent_states SET goal=$3,updated_at=now()
-    WHERE world_id=$1 AND agent_id=$2 RETURNING goal`, [worldId, resident.agentId, selectedGoal]);
-  if (!result.rowCount) return { reason: 'resident_state_missing', resident: resident.name };
-  const selectedDescription = goalCandidates.find((item) => item.id === selectedGoal).goal;
-  await pool.query(`UPDATE agent_minds SET current_goal=$3,updated_at=now() WHERE world_id=$1 AND agent_id=$2`,
-    [worldId, resident.agentId, selectedDescription]);
-  await pool.query(`INSERT INTO world_events(world_id,actor_id,event_type,data,action_id)
-    VALUES($1,$2,'world.goal_updated',$3,$4) ON CONFLICT(world_id,actor_id,action_id) DO NOTHING`,
-  [worldId, resident.agentId, { goal: selectedGoal, decisionSource: 'typesafe', simulated: true },
-    actionId(resident.agentId, snapshot.runtime.tick_count, 'goal_updated')]);
+  const goalCandidate = goalCandidates.find((item) => item.id === selectedGoal);
+  if (!goalCandidate) return { reason: selection.reason || 'fallback', resident: resident.name };
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(`UPDATE world_agent_goals SET status='paused',updated_world_minutes=$3,updated_at=now()
+      WHERE world_id=$1 AND agent_id=$2 AND goal_type='primary' AND status='active'`,
+    [worldId, resident.agentId, snapshot.runtime.world_minutes]);
+    await client.query(`INSERT INTO world_agent_goals(world_id,agent_id,goal_type,category,description,priority,
+        created_world_minutes,updated_world_minutes,source,metadata)
+      VALUES($1,$2,'primary',$3,$4,1,$5,$5,'strategy',$6::jsonb) ON CONFLICT DO NOTHING`,
+    [worldId, resident.agentId, selectedGoal, goalCandidate.goal, snapshot.runtime.world_minutes,
+      JSON.stringify({ selectedBy: 'typesafe', model: selection.model || null })]);
+    await client.query(`UPDATE world_agent_states SET goal=$3,updated_at=now() WHERE world_id=$1 AND agent_id=$2`,
+      [worldId, resident.agentId, goalCandidate.legacyGoal]);
+    await client.query(`UPDATE agent_minds SET current_goal=$3,updated_at=now() WHERE world_id=$1 AND agent_id=$2`,
+      [worldId, resident.agentId, goalCandidate.description]);
+    await client.query(`UPDATE world_social_profiles SET primary_goal=$3,goal_progress=0,goal_milestones=0,
+        goal_started_world_minutes=$4,goal_last_updated_world_minutes=$4,updated_at=now()
+      WHERE world_id=$1 AND agent_id=$2`, [worldId, resident.agentId, selectedGoal, snapshot.runtime.world_minutes]);
+    await recordWorldEvent(client, worldId, resident.agentId, snapshot.runtime.tick_count, 'world.goal_updated', {
+      goal: selectedGoal, description: goalCandidate.goal, decisionSource: 'typesafe', simulated: true
+    });
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally { client.release(); }
   return { reason: 'selected', resident: resident.name, goal: selectedGoal,
     model: selection.model || null, costUsd: selection.costUsd ?? null };
 }
 
 export async function startWorldEngine(pool, { onError = () => {}, onStatus = () => {}, chooseWithTypeSafe = null,
-  runtimeState = null, fruitfly = null, tickMs = WORLD_TICK_MS } = {}) {
+  runtimeState = null, fruitfly = null, tickMs = WORLD_TICK_MS, nowProvider = () => Date.now(), schedule = true } = {}) {
   const worldResult = await pool.query(`SELECT w.id FROM worlds w WHERE w.open=true
     ORDER BY w.created_at DESC LIMIT 1`);
   if (!worldResult.rowCount) return { running: false, reason: 'no_open_world', stop: async () => {} };
@@ -403,9 +983,15 @@ export async function startWorldEngine(pool, { onError = () => {}, onStatus = ()
   let nextRetryAt = 0;
   let lastErrorLoggedAt = 0;
   let suppressedErrors = 0;
+  let timer = null;
+  const readNowMs = () => {
+    const value = nowProvider();
+    return value instanceof Date ? value.getTime() : finite(value, Date.now());
+  };
 
   async function tick() {
-    if (stopped || tickInProgress || Date.now() < nextRetryAt) return;
+    const nowMs = readNowMs();
+    if (stopped || tickInProgress || nowMs < nextRetryAt) return;
     tickInProgress = true;
     let shouldAskTypeSafe = false;
     const fruitflyOutcomes = [];
@@ -417,7 +1003,7 @@ export async function startWorldEngine(pool, { onError = () => {}, onStatus = ()
           FROM world_runtime_state WHERE world_id=$1 FOR UPDATE`, [worldId]);
         if (!clockResult.rowCount) throw new Error('WORLD_RUNTIME_STATE_MISSING');
         const clock = clockResult.rows[0];
-        const now = new Date();
+        const now = new Date(nowMs);
         const previousAt = new Date(clock.last_tick_at).getTime();
         const elapsed = Math.max(1, Math.min(MAX_CATCH_UP_SECONDS,
           Math.floor((now.getTime() - (Number.isFinite(previousAt) ? previousAt : now.getTime())) / 1_000)));
@@ -434,11 +1020,10 @@ export async function startWorldEngine(pool, { onError = () => {}, onStatus = ()
         const priorSnapshot = safeJson(clock.market_snapshot);
         const nextSnapshot = marketSnapshot(quotes);
         const typeSafeDueAt = new Date(clock.typesafe_next_at).getTime();
-        shouldAskTypeSafe = Boolean(chooseWithTypeSafe && !typeSafeInProgress && Date.now() >= typeSafeDueAt &&
-          Date.now() >= nextTypeSafeAt);
+        shouldAskTypeSafe = Boolean(chooseWithTypeSafe && !typeSafeInProgress && nowMs >= typeSafeDueAt && nowMs >= nextTypeSafeAt);
         if (shouldAskTypeSafe) {
           typeSafeInProgress = true;
-          nextTypeSafeAt = Date.now() + TYPE_SAFE_INTERVAL_MS;
+          nextTypeSafeAt = nowMs + TYPE_SAFE_INTERVAL_MS;
           await client.query(`UPDATE world_runtime_state SET typesafe_next_at=$2 WHERE world_id=$1`,
             [worldId, new Date(nextTypeSafeAt)]);
         }
@@ -452,9 +1037,42 @@ export async function startWorldEngine(pool, { onError = () => {}, onStatus = ()
         const membersResult = await client.query(`SELECT m.world_id,m.agent_id,a.name,m.energy,m.food,m.social,m.location,
             am.archetype,am.traits,am.memories,am.current_goal,am.actions_taken,
             s.goal,s.risk_tolerance AS risk_tolerance,s.happiness,s.knowledge,s.status,s.planned_action,s.target_location,
-            s.planned_side,s.planned_asset,s.planned_quote_units::text AS planned_quote_units,s.planned_paid_meal,
+            s.planned_partner_id AS planned_partner_id,s.planned_side,s.planned_asset,s.planned_quote_units::text AS planned_quote_units,s.planned_paid_meal,
             s.fruitfly_observation,s.fruitfly_candidates,s.fruitfly_selected,
             s.movement_started_at,s.movement_ends_at,s.action_started_at,s.action_ends_at,s.next_decision_at,s.last_trade_at,
+            p.sociability::text AS sociability,p.curiosity::text AS curiosity,p.discipline::text AS discipline,
+            p.ambition::text AS ambition,p.primary_goal AS primary_goal,p.goal_progress::text AS goal_progress,
+            p.goal_milestones AS goal_milestones,p.dominant_role AS dominant_role,
+            p.personality_modifiers,p.risk_modifier::text AS risk_modifier,
+            p.last_reflection_world_minutes AS last_reflection_world_minutes,
+            COALESCE((SELECT jsonb_object_agg(k.skill_name,k.skill_value) FROM world_agent_skills k
+              WHERE k.world_id=m.world_id AND k.agent_id=m.agent_id),'{}'::jsonb) AS skills,
+            COALESCE((SELECT jsonb_agg(jsonb_build_object('id',g.id,'goalType',g.goal_type,'category',g.category,
+                'description',g.description,'priority',g.priority,'progress',g.progress,'status',g.status,'source',g.source,
+                'parentGoalId',g.parent_goal_id,'metadata',g.metadata,'updatedWorldMinutes',g.updated_world_minutes)
+              ORDER BY CASE g.goal_type WHEN 'primary' THEN 0 WHEN 'secondary' THEN 1 ELSE 2 END,g.priority DESC,g.updated_world_minutes DESC)
+              FROM world_agent_goals g WHERE g.world_id=m.world_id AND g.agent_id=m.agent_id AND g.status='active'),
+              '[]'::jsonb) AS goals,
+            COALESCE((SELECT jsonb_agg(jsonb_build_object('subjectType',b.subject_type,'subjectKey',b.subject_key,
+                'beliefKey',b.belief_key,'estimate',b.estimate,'confidence',b.confidence,'sampleCount',b.sample_count)
+              ORDER BY b.sample_count DESC,b.subject_type,b.subject_key)
+              FROM world_agent_beliefs b WHERE b.world_id=m.world_id AND b.agent_id=m.agent_id),'[]'::jsonb) AS beliefs,
+            COALESCE((SELECT jsonb_agg(jsonb_build_object('id',recent.id,'memoryType',recent.memory_type,
+                'summary',recent.summary,'importance',recent.importance,'worldMinutes',recent.world_minutes,
+                'location',recent.location,'relatedAgentId',recent.related_agent_id,'metadata',recent.metadata)
+                ORDER BY recent.world_minutes DESC,recent.id DESC)
+              FROM (SELECT id,memory_type,summary,importance,world_minutes,location,related_agent_id,metadata
+                FROM agent_memories WHERE world_id=m.world_id AND agent_id=m.agent_id
+                ORDER BY world_minutes DESC,id DESC LIMIT 12) recent),'[]'::jsonb) AS recent_memories,
+            COALESCE((SELECT jsonb_agg(jsonb_build_object('otherAgentId',recent.other_id,'name',recent.other_name,
+                'familiarity',recent.familiarity,'trust',recent.trust,'affinity',recent.affinity,
+                'interactionCount',recent.interaction_count,'lastInteractionWorldMinutes',recent.last_interaction_world_minutes)
+                ORDER BY recent.familiarity DESC,recent.interaction_count DESC)
+              FROM (SELECT CASE WHEN r.agent_a_id=m.agent_id THEN r.agent_b_id ELSE r.agent_a_id END AS other_id,
+                  other.name AS other_name,r.familiarity,r.trust,r.affinity,r.interaction_count,r.last_interaction_world_minutes
+                FROM world_relationships r JOIN agents other ON other.id=CASE WHEN r.agent_a_id=m.agent_id THEN r.agent_b_id ELSE r.agent_a_id END
+                WHERE r.world_id=m.world_id AND (r.agent_a_id=m.agent_id OR r.agent_b_id=m.agent_id)
+                ORDER BY r.familiarity DESC,r.interaction_count DESC LIMIT 12) recent),'[]'::jsonb) AS relationships,
             coalesce((SELECT balance::text FROM crypto_balances b WHERE b.world_id=m.world_id AND b.agent_id=m.agent_id AND b.asset_symbol='USDC'),'0') AS usdc,
             coalesce((SELECT balance::text FROM crypto_balances b WHERE b.world_id=m.world_id AND b.agent_id=m.agent_id AND b.asset_symbol='BTC'),'0') AS btc,
             coalesce((SELECT balance::text FROM crypto_balances b WHERE b.world_id=m.world_id AND b.agent_id=m.agent_id AND b.asset_symbol='ETH'),'0') AS eth,
@@ -462,6 +1080,7 @@ export async function startWorldEngine(pool, { onError = () => {}, onStatus = ()
           FROM world_members m JOIN agents a ON a.id=m.agent_id
           JOIN world_agent_states s ON s.world_id=m.world_id AND s.agent_id=m.agent_id
           LEFT JOIN agent_minds am ON am.world_id=m.world_id AND am.agent_id=m.agent_id
+          LEFT JOIN world_social_profiles p ON p.world_id=m.world_id AND p.agent_id=m.agent_id
           WHERE m.world_id=$1 ORDER BY m.joined_at,a.name FOR UPDATE OF m,s`, [worldId]);
         const scenesResult = await client.query(`SELECT id,name,scene_type AS "sceneType",status FROM world_scenes
           WHERE world_id=$1 ORDER BY created_at,id`, [worldId]);
@@ -470,8 +1089,36 @@ export async function startWorldEngine(pool, { onError = () => {}, onStatus = ()
           membersResult.rows.filter((other) => other.location === member.location).length - 1]));
 
         for (const row of membersResult.rows) {
-          const agent = { ...row, agentId: row.agent_id, riskTolerance: finite(row.risk_tolerance),
-            lastTradeAt: row.last_trade_at, planned_paid_meal: row.planned_paid_meal };
+          const agent = { ...row, agentId: row.agent_id,
+            lastTradeAt: row.last_trade_at, planned_paid_meal: row.planned_paid_meal,
+            social_partner_id: row.planned_partner_id,
+            riskTolerance: clamp(finite(row.risk_tolerance) + finite(row.risk_modifier), 0, 1),
+            sociability: finite(row.sociability, 0.5), curiosity: finite(row.curiosity, 0.5),
+            discipline: finite(row.discipline, 0.5), ambition: finite(row.ambition, 0.5),
+            personalityModifiers: safeJson(row.personality_modifiers),
+            primaryGoal: row.primary_goal || 'BALANCED_LIFE', skills: safeJson(row.skills),
+            goals: Array.isArray(row.goals) ? row.goals : [], beliefs: Array.isArray(row.beliefs) ? row.beliefs : [],
+            recentMemories: Array.isArray(row.recent_memories) ? row.recent_memories : [],
+            relationships: Array.isArray(row.relationships) ? row.relationships : [] };
+          const lastReflection = row.last_reflection_world_minutes === null ? null : Number(row.last_reflection_world_minutes);
+          const newImportantMemory = agent.recentMemories.some((memory) => Number(memory.importance) >= 0.7
+            && Number(memory.worldMinutes) > (lastReflection ?? -1));
+          const reflectionTrigger = newImportantMemory ? 'important_event' : 'cadence';
+          const reflected = reflectionDue({ worldMinutes, lastReflectionWorldMinutes: lastReflection,
+            important: reflectionTrigger === 'important_event' })
+            ? await reflectResident(client, worldId, agent, tickCount, worldMinutes, reflectionTrigger) : null;
+          if (reflected) {
+            agent.personalityModifiers = reflected.modifiers;
+            agent.riskTolerance = clamp(finite(row.risk_tolerance) + reflected.riskModifier, 0, 1);
+            agent.primaryGoal = reflected.primaryGoal || agent.primaryGoal;
+            agent.last_reflection_world_minutes = worldMinutes;
+            const updatedGoals = await client.query(`SELECT id,goal_type AS "goalType",category,description,
+                priority::text AS priority,progress::text AS progress,status,source,parent_goal_id AS "parentGoalId",metadata
+              FROM world_agent_goals WHERE world_id=$1 AND agent_id=$2 AND status='active'
+              ORDER BY CASE goal_type WHEN 'primary' THEN 0 WHEN 'secondary' THEN 1 ELSE 2 END,priority DESC,updated_world_minutes DESC`,
+            [worldId, agent.agentId]);
+            agent.goals = updatedGoals.rows;
+          }
           if (agent.status === 'walking' && new Date(agent.movement_ends_at).getTime() <= now.getTime()) {
             const destination = agent.target_location;
             await client.query('UPDATE world_members SET location=$3 WHERE world_id=$1 AND agent_id=$2', [worldId, agent.agentId, destination]);
@@ -487,27 +1134,46 @@ export async function startWorldEngine(pool, { onError = () => {}, onStatus = ()
           } else if (agent.status === 'performing' && new Date(agent.action_ends_at).getTime() <= now.getTime()) {
             const placeResult = scenes.find((scene) => scene.name === agent.location);
             const learning = await completeActivity(client, worldId, { ...agent, scene_type: placeResult?.sceneType || null },
-              { tick_count: tickCount, world_minutes: worldMinutes }, quotes, now);
+              { tick_count: tickCount, world_minutes: worldMinutes }, quotes, now, placeResult);
             if (learning) fruitflyOutcomes.push(learning);
           } else if (agent.status === 'idle' && new Date(agent.next_decision_at).getTime() <= now.getTime()) {
-            const candidates = buildActivityCandidates(agent, scenes, { tick: tickCount, quotes,
-              previousQuotes: priorSnapshot, residentsAt: placeCounts });
-            let activity = candidates[0] || null;
+            const residentsAtLocation = Object.fromEntries(scenes.filter((scene) => ['cafe','garden','workshop','data_center'].includes(scene.sceneType))
+              .map((scene) => [scene.name, membersResult.rows.filter((other) => other.location === scene.name
+                && other.agent_id !== agent.agentId && other.status === 'idle').map((other) => {
+                  const relationship = agent.relationships.find((item) => item.otherAgentId === other.agent_id) || null;
+                  return { agentId: other.agent_id, name: other.name, status: other.status, location: other.location,
+                    energy: other.energy, food: other.food, skills: safeJson(other.skills), relationship,
+                    lastInteractionWorldMinutes: relationship?.lastInteractionWorldMinutes };
+                })]));
+            const utilityCandidates = buildActivityCandidates(agent, scenes, { tick: tickCount, worldMinutes, nowMs, quotes,
+              previousQuotes: priorSnapshot, residentsAt: placeCounts, residentsAtLocation });
+            const candidates = utilityCandidates;
+            let activity = null;
             let flyObservation = null;
             let flyCandidates = [];
             let flySelected = null;
+            let decision = null;
+            let usedFruitfly = false;
             if (fruitfly && candidates.length) {
-              flyObservation = { self: { agentId: agent.agentId, energy: agent.energy, food: agent.food, social: agent.social },
-                mind: { archetype: agent.archetype || 'observer', traits: safeJson(agent.traits),
-                  actionsTaken: agent.actions_taken, memories: Array.isArray(agent.memories) ? agent.memories.slice(-24) : [] } };
+              flyObservation = { self: { agentId: agent.agentId, energy: agent.energy, food: agent.food, social: agent.social,
+                  riskTolerance: agent.riskTolerance },
+                mind: { archetype: agent.archetype || 'observer', traits: { ...safeJson(agent.traits),
+                    curiosity: agent.curiosity, craft: finite(agent.skills?.engineering) / 100 },
+                  actionsTaken: agent.actions_taken, memories: agent.recentMemories,
+                  goals: agent.goals, beliefs: agent.beliefs, relationships: agent.relationships,
+                  personality: { ...agent.personalityModifiers, sociability: agent.sociability, curiosity: agent.curiosity,
+                    discipline: agent.discipline, ambition: agent.ambition } } };
               flyCandidates = candidates.map(({ id, action, targetLocation, goal, description, plannedPaidMeal,
-                side, asset, quoteUnits, score }) => ({ id, action, targetLocation, goal, description, plannedPaidMeal,
-                side, asset, quoteUnits, score }));
+                side, asset, quoteUnits, score, socialPartnerId, socialPartnerName }) => ({ id, action, targetLocation, goal, description, plannedPaidMeal,
+                side, asset, quoteUnits, score, socialPartnerId, socialPartnerName }));
               try {
-                const choice = fruitfly.choose(agent.agentId, flyObservation, flyCandidates, activity);
-                if (choice?.candidate) {
+                const choice = fruitfly.choose(agent.agentId, flyObservation, flyCandidates, candidates[0]);
+                if (choice?.candidate && candidates.some((candidate) => candidate.id === choice.candidate.id)) {
                   activity = choice.candidate;
-                  flySelected = choice.candidate;
+                  usedFruitfly = true;
+                  decision = choice;
+                } else if (choice?.candidate) {
+                  onError(new Error('Fruitfly selected a candidate outside the feasible set.'), 'fruitfly_choice');
                 }
               } catch (error) { onError(error, 'fruitfly_choice'); }
             }
@@ -516,6 +1182,31 @@ export async function startWorldEngine(pool, { onError = () => {}, onStatus = ()
                 WHERE world_id=$1 AND agent_id=$2`, [worldId, agent.agentId, new Date(now.getTime() + 30_000), now]);
               continue;
             }
+            flySelected = { ...activity,
+              behaviorProbability: Number(decision?.behaviorProbability) || 0,
+              fruitflyProbability: Number(decision?.fruitflyProbability) || 0,
+              learnerUsed: usedFruitfly
+            };
+            const familyDistribution = decision?.probabilities || {};
+            const topFamilies = Object.entries(familyDistribution).sort((a, b) => b[1] - a[1]).slice(0, 3);
+            await client.query(`INSERT INTO world_decision_traces(world_id,agent_id,tick_count,world_minutes,
+                chosen_candidate_id,chosen_action,behavior_probability,distribution,utility_scores,goal_snapshot,rationale)
+              VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9::jsonb,$10::jsonb,$11::jsonb)`,
+            [worldId, agent.agentId, tickCount, worldMinutes, activity.id, activity.action,
+              Math.max(0.00000001, Math.min(1, Number(decision?.behaviorProbability) || 1)),
+              JSON.stringify({ behavior: familyDistribution, fruitfly: decision?.fruitflyProbabilities || {},
+                utility: decision?.utilityProbabilities || {}, components: decision?.distributionComponents || {},
+                mix: DECISION_MIX }),
+              JSON.stringify(decision?.utilityScores || {}),
+              JSON.stringify({ primary: agent.goals.find((goal) => goal.goalType === 'primary') || null,
+                secondary: agent.goals.filter((goal) => goal.goalType === 'secondary'),
+                short: agent.goals.filter((goal) => goal.goalType === 'short') }),
+              JSON.stringify({ selectedGoal: activity.goal, selectedDescription: activity.description,
+                topFamilies, learnedBeliefs: agent.beliefs.length, memoryCount: agent.recentMemories.length,
+                relationshipCount: agent.relationships.length, source: 'fruitfly_utility_mixture' })]);
+            await client.query(`DELETE FROM world_decision_traces WHERE id IN (
+              SELECT id FROM world_decision_traces WHERE world_id=$1 AND agent_id=$2
+              ORDER BY tick_count DESC,id DESC OFFSET 50)`, [worldId, agent.agentId]);
             const duration = ACTION_SECONDS[activity.action] || 10;
             const tradeFields = activity.action === 'trade'
               ? [activity.side, activity.asset, activity.quoteUnits] : [null, null, null];
@@ -523,36 +1214,43 @@ export async function startWorldEngine(pool, { onError = () => {}, onStatus = ()
               const travelSeconds = 6 + stableInt(`${agent.agentId}:${tickCount}:travel`) % 11;
               const movementEnd = new Date(now.getTime() + travelSeconds * 1_000);
               await client.query(`UPDATE world_agent_states SET status='walking',planned_action=$3,target_location=$4,
-                  planned_side=$5,planned_asset=$6,planned_quote_units=$7,planned_paid_meal=$8,
-                  fruitfly_observation=$11::jsonb,fruitfly_candidates=$12::jsonb,fruitfly_selected=$13::jsonb,
-                  movement_started_at=$9,movement_ends_at=$10,action_started_at=NULL,action_ends_at=NULL,
-                  updated_at=$9 WHERE world_id=$1 AND agent_id=$2`,
-              [worldId, agent.agentId, activity.action, activity.targetLocation, ...tradeFields, Boolean(activity.plannedPaidMeal), now, movementEnd,
-                JSON.stringify(flyObservation || {}), JSON.stringify(flyCandidates), JSON.stringify(flySelected || {})]);
+                  planned_side=$5,planned_asset=$6,planned_quote_units=$7,planned_paid_meal=$8,planned_partner_id=$9,
+                  fruitfly_observation=$12::jsonb,fruitfly_candidates=$13::jsonb,fruitfly_selected=$14::jsonb,
+                  movement_started_at=$10,movement_ends_at=$11,action_started_at=NULL,action_ends_at=NULL,
+                  updated_at=$10 WHERE world_id=$1 AND agent_id=$2`,
+              [worldId, agent.agentId, activity.action, activity.targetLocation, ...tradeFields, Boolean(activity.plannedPaidMeal),
+                activity.socialPartnerId, now, movementEnd, JSON.stringify(flyObservation || {}), JSON.stringify(flyCandidates), JSON.stringify(flySelected || {})]);
               await setMindGoal(client, worldId, agent.agentId, activity.goal, activity.action,
                 `Started traveling from ${agent.location} to ${activity.targetLocation}.`);
               await recordWorldEvent(client, worldId, agent.agentId, tickCount, 'world.movement_started',
                 { from: agent.location, to: activity.targetLocation, place: agent.location, action: activity.action,
                   startedAt: now.toISOString(), arrivesAt: movementEnd.toISOString(), worldMinutes });
+              row.status = 'walking';
+              row.planned_action = activity.action;
             } else {
               await client.query(`UPDATE world_agent_states SET status='performing',planned_action=$3,target_location=NULL,
-                  planned_side=$4,planned_asset=$5,planned_quote_units=$6,planned_paid_meal=$7,
-                  fruitfly_observation=$10::jsonb,fruitfly_candidates=$11::jsonb,fruitfly_selected=$12::jsonb,
-                  movement_started_at=NULL,movement_ends_at=NULL,action_started_at=$8,action_ends_at=$9,updated_at=$8
+                  planned_side=$4,planned_asset=$5,planned_quote_units=$6,planned_paid_meal=$7,planned_partner_id=$8,
+                  fruitfly_observation=$11::jsonb,fruitfly_candidates=$12::jsonb,fruitfly_selected=$13::jsonb,
+                  movement_started_at=NULL,movement_ends_at=NULL,action_started_at=$9,action_ends_at=$10,updated_at=$9
                 WHERE world_id=$1 AND agent_id=$2`,
-              [worldId, agent.agentId, activity.action, ...tradeFields, Boolean(activity.plannedPaidMeal), now,
+              [worldId, agent.agentId, activity.action, ...tradeFields, Boolean(activity.plannedPaidMeal), activity.socialPartnerId, now,
                 new Date(now.getTime() + duration * 1_000), JSON.stringify(flyObservation || {}),
                 JSON.stringify(flyCandidates), JSON.stringify(flySelected || {})]);
               await setMindGoal(client, worldId, agent.agentId, activity.goal, activity.action, null);
               await recordWorldEvent(client, worldId, agent.agentId, tickCount, 'world.action_started',
                 { place: agent.location, action: activity.action, worldMinutes, at: now.toISOString() });
+              row.status = 'performing';
+              row.planned_action = activity.action;
+              if (activity.action === 'cooperate' && activity.socialPartnerId) {
+                const partnerNextDecision = new Date(now.getTime() + duration * 1_000 + 5_000);
+                await client.query(`UPDATE world_agent_states SET next_decision_at=GREATEST(next_decision_at,$3),updated_at=$4
+                  WHERE world_id=$1 AND agent_id=$2 AND status='idle'`,
+                [worldId, activity.socialPartnerId, partnerNextDecision, now]);
+                const partnerRow = membersResult.rows.find((member) => member.agent_id === activity.socialPartnerId);
+                if (partnerRow) partnerRow.next_decision_at = partnerNextDecision;
+              }
             }
           }
-        }
-        if (tickCount % 60 < elapsed) {
-          await client.query(`DELETE FROM world_events WHERE world_id=$1 AND event_type LIKE 'world.%'
-            AND id IN (SELECT id FROM world_events WHERE world_id=$1 AND event_type LIKE 'world.%'
-              ORDER BY id DESC OFFSET 1_000)`, [worldId]);
         }
         await client.query('COMMIT');
         const recovered = errorCount > 0;
@@ -578,29 +1276,32 @@ export async function startWorldEngine(pool, { onError = () => {}, onStatus = ()
       }
     } catch (error) {
       errorCount += 1;
-      nextRetryAt = Date.now() + Math.min(30_000, 1_000 * 2 ** Math.min(errorCount, 5));
-      if (Date.now() - lastErrorLoggedAt >= 60_000) {
-        lastErrorLoggedAt = Date.now();
+      nextRetryAt = readNowMs() + Math.min(30_000, 1_000 * 2 ** Math.min(errorCount, 5));
+      if (readNowMs() - lastErrorLoggedAt >= 60_000) {
+        lastErrorLoggedAt = readNowMs();
         onError(error, 'tick');
       } else suppressedErrors += 1;
     } finally { tickInProgress = false; }
   }
 
-  const timer = setInterval(() => {
-    if (activeTick || stopped) return;
-    activeTick = tick().finally(() => { activeTick = null; });
-  }, Math.max(250, Math.trunc(finite(tickMs, WORLD_TICK_MS))));
-  timer.unref?.();
+  if (schedule) {
+    timer = setInterval(() => {
+      if (activeTick || stopped) return;
+      activeTick = tick().finally(() => { activeTick = null; });
+    }, Math.max(250, Math.trunc(finite(tickMs, WORLD_TICK_MS))));
+    timer.unref?.();
+  }
   await tick();
   onStatus({ running: true, worldId, tickMs });
 
   return {
     running: true,
     worldId,
+    tickOnce: tick,
     async stop() {
       if (stopped) return;
       stopped = true;
-      clearInterval(timer);
+      if (timer) clearInterval(timer);
       if (activeTick) await activeTick;
       if (typeSafeTask) await typeSafeTask;
       if (fruitflyTask) await fruitflyTask;

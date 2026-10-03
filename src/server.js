@@ -124,8 +124,10 @@ async function readCryptoQuotes(client = pool) {
 
 app.addHook('preHandler', async (request, reply) => {
   const pathOnly = request.raw.url?.split('?')[0] || '';
+  const localResidentDetail = /^\/local\/map-data\/residents\/[^/]+$/.test(pathOnly)
+    && ['127.0.0.1', '::1', 'localhost'].includes(HOST);
   if (pathOnly === '/' || pathOnly === '/styles.css' || pathOnly === '/app.js' || pathOnly === '/world3d.js' || pathOnly === '/public/stats' ||
-      pathOnly === '/local/map-data' || pathOnly === '/health' || pathOnly === '/v1/agents/challenges' || pathOnly === '/v1/agents') return;
+      pathOnly === '/local/map-data' || localResidentDetail || pathOnly === '/health' || pathOnly === '/v1/agents/challenges' || pathOnly === '/v1/agents') return;
 
   const agentId = request.headers['x-agent-id'];
   const time = Number(request.headers['x-agent-time']);
@@ -214,6 +216,25 @@ app.get('/local/map-data', async (_request, reply) => {
         ws.target_location AS "targetLocation",ws.movement_started_at AS "movementStartedAt",
         ws.movement_ends_at AS "movementEndsAt",ws.action_started_at AS "actionStartedAt",ws.action_ends_at AS "actionEndsAt",
         am.archetype,am.current_goal AS "currentGoal",am.actions_taken AS "actionsTaken",am.updated_at AS "mindUpdatedAt",
+        COALESCE((SELECT g.category FROM world_agent_goals g WHERE g.world_id=m.world_id AND g.agent_id=m.agent_id
+          AND g.goal_type='primary' AND g.status='active' ORDER BY g.priority DESC,g.id LIMIT 1),sp.primary_goal) AS "primaryGoal",
+        COALESCE((SELECT g.progress::text FROM world_agent_goals g WHERE g.world_id=m.world_id AND g.agent_id=m.agent_id
+          AND g.goal_type='primary' AND g.status='active' ORDER BY g.priority DESC,g.id LIMIT 1),sp.goal_progress::text) AS "goalProgress",
+        sp.dominant_role AS "dominantRole",sp.personality_modifiers AS "personalityModifiers",
+        sp.risk_modifier::text AS "riskModifier",
+        (SELECT g.description FROM world_agent_goals g WHERE g.world_id=m.world_id AND g.agent_id=m.agent_id
+          AND g.goal_type='short' AND g.status='active' ORDER BY g.priority DESC,g.updated_world_minutes DESC LIMIT 1) AS "shortGoal",
+        sp.sociability::text AS sociability,sp.curiosity::text AS curiosity,sp.discipline::text AS discipline,sp.ambition::text AS ambition,
+        COALESCE((SELECT jsonb_object_agg(skill_name,skill_value) FROM world_agent_skills sk
+          WHERE sk.world_id=m.world_id AND sk.agent_id=m.agent_id),'{}'::jsonb) AS skills,
+        COALESCE((SELECT jsonb_agg(jsonb_build_object('otherAgentId',recent.other_id,'name',recent.other_name,
+            'familiarity',recent.familiarity,'trust',recent.trust,'affinity',recent.affinity,
+            'interactionCount',recent.interaction_count) ORDER BY recent.familiarity DESC,recent.interaction_count DESC)
+          FROM (SELECT CASE WHEN rel.agent_a_id=m.agent_id THEN rel.agent_b_id ELSE rel.agent_a_id END AS other_id,
+              other.name AS other_name,rel.familiarity,rel.trust,rel.affinity,rel.interaction_count
+            FROM world_relationships rel JOIN agents other ON other.id=CASE WHEN rel.agent_a_id=m.agent_id THEN rel.agent_b_id ELSE rel.agent_a_id END
+            WHERE rel.world_id=m.world_id AND (rel.agent_a_id=m.agent_id OR rel.agent_b_id=m.agent_id)
+            ORDER BY rel.familiarity DESC,rel.interaction_count DESC LIMIT 10) recent),'[]'::jsonb) AS "relationshipSummary",
         coalesce((SELECT balance::text FROM crypto_balances b WHERE b.world_id=m.world_id AND b.agent_id=m.agent_id AND b.asset_symbol='USDC'),'0') AS "usdcBalance",
         coalesce((SELECT balance::text FROM crypto_balances b WHERE b.world_id=m.world_id AND b.agent_id=m.agent_id AND b.asset_symbol='BTC'),'0') AS "btcBalance",
         coalesce((SELECT balance::text FROM crypto_balances b WHERE b.world_id=m.world_id AND b.agent_id=m.agent_id AND b.asset_symbol='ETH'),'0') AS "ethBalance",
@@ -221,6 +242,7 @@ app.get('/local/map-data', async (_request, reply) => {
       FROM world_members m JOIN agents a ON a.id=m.agent_id
       LEFT JOIN world_agent_states ws ON ws.world_id=m.world_id AND ws.agent_id=m.agent_id
       LEFT JOIN agent_minds am ON am.world_id=m.world_id AND am.agent_id=m.agent_id
+      LEFT JOIN world_social_profiles sp ON sp.world_id=m.world_id AND sp.agent_id=m.agent_id
       LEFT JOIN LATERAL (
         SELECT e.event_type,e.created_at,coalesce(e.data->>'place',e.data->>'to') AS place,e.data->>'action' AS action
         FROM world_events e WHERE e.world_id=m.world_id AND e.actor_id=m.agent_id
@@ -281,6 +303,68 @@ app.get('/local/map-data', async (_request, reply) => {
   return { world: { ...world.rows[0], engine: clock || { running: false } }, scenes: scenes.rows, residents: residents.rows, events: events.rows,
     dataCenterLogs: dataCenterLogs.rows, trading: { simulated: true, quotes: cryptoQuotes, robinhood: robinhoodMarket,
       portfolios: cryptoPortfolios.rows, recentTrades }, generatedAt: new Date().toISOString() };
+});
+
+app.get('/local/map-data/residents/:agentId', async (request, reply) => {
+  if (!['127.0.0.1', '::1', 'localhost'].includes(HOST)) return fail(reply, 403, 'LOCAL_DASHBOARD_ONLY');
+  const { agentId } = request.params;
+  if (!validUuid(agentId)) return fail(reply, 400, 'AGENT_ID_INVALID');
+  reply.header('Cache-Control', 'no-store');
+  const world = await pool.query(`SELECT id FROM worlds WHERE open=true ORDER BY created_at DESC LIMIT 1`);
+  if (!world.rowCount) return fail(reply, 404, 'WORLD_NOT_FOUND');
+  const worldId = world.rows[0].id;
+  const [profile, skills, relationships, memories, goals, beliefs, decisions, reflections] = await Promise.all([
+    pool.query(`SELECT a.id,a.name,COALESCE((SELECT g.category FROM world_agent_goals g
+          WHERE g.world_id=m.world_id AND g.agent_id=m.agent_id AND g.goal_type='primary' AND g.status='active'
+          ORDER BY g.priority DESC,g.id LIMIT 1),p.primary_goal) AS "primaryGoal",
+        COALESCE((SELECT g.description FROM world_agent_goals g WHERE g.world_id=m.world_id AND g.agent_id=m.agent_id
+          AND g.goal_type='primary' AND g.status='active' ORDER BY g.priority DESC,g.id LIMIT 1),p.primary_goal) AS "primaryGoalDescription",
+        p.goal_progress::text AS "goalProgress",
+        p.goal_milestones AS "goalMilestones",p.dominant_role AS "dominantRole",
+        p.sociability::text AS sociability,p.curiosity::text AS curiosity,p.discipline::text AS discipline,
+        p.ambition::text AS ambition,p.personality_modifiers AS "personalityModifiers",
+        p.risk_modifier::text AS "riskModifier",s.risk_tolerance::text AS "riskTolerance",
+        m.location,COALESCE(s.status,'idle') AS "currentStatus",s.planned_action AS "currentAction",
+        am.current_goal AS "currentIntent",p.last_reflection_world_minutes AS "lastReflectionWorldMinutes"
+      FROM world_members m JOIN agents a ON a.id=m.agent_id
+      LEFT JOIN world_social_profiles p ON p.world_id=m.world_id AND p.agent_id=m.agent_id
+      LEFT JOIN world_agent_states s ON s.world_id=m.world_id AND s.agent_id=m.agent_id
+      LEFT JOIN agent_minds am ON am.world_id=m.world_id AND am.agent_id=m.agent_id
+      WHERE m.world_id=$1 AND m.agent_id=$2`, [worldId, agentId]),
+    pool.query(`SELECT skill_name AS skill,skill_value::text AS value,actions_completed AS "actionsCompleted"
+      FROM world_agent_skills WHERE world_id=$1 AND agent_id=$2 ORDER BY skill_value DESC,skill_name`, [worldId, agentId]),
+    pool.query(`SELECT other.id AS "agentId",other.name,r.familiarity::text AS familiarity,r.trust::text AS trust,
+        r.affinity::text AS affinity,r.interaction_count AS "interactionCount",
+        r.last_interaction_world_minutes AS "lastInteractionWorldMinutes"
+      FROM world_relationships r
+      JOIN agents other ON other.id=CASE WHEN r.agent_a_id=$2 THEN r.agent_b_id ELSE r.agent_a_id END
+      WHERE r.world_id=$1 AND (r.agent_a_id=$2 OR r.agent_b_id=$2)
+      ORDER BY r.familiarity DESC,r.trust DESC,r.interaction_count DESC LIMIT 10`, [worldId, agentId]),
+    pool.query(`SELECT memory.id,memory.memory_type AS type,memory.summary,memory.importance::text AS importance,
+        memory.world_minutes AS "worldMinutes",memory.location,memory.related_agent_id AS "relatedAgentId",
+        related.name AS "relatedAgentName",memory.metadata,memory.created_at AS "createdAt",memory.long_term AS "longTerm"
+      FROM agent_memories memory LEFT JOIN agents related ON related.id=memory.related_agent_id
+      WHERE memory.world_id=$1 AND memory.agent_id=$2
+      ORDER BY memory.world_minutes DESC,memory.id DESC LIMIT 12`, [worldId, agentId]),
+    pool.query(`SELECT id,goal_type AS "goalType",category,description,priority::text AS priority,
+        progress::text AS progress,status,source,parent_goal_id AS "parentGoalId",
+        created_world_minutes AS "createdWorldMinutes",updated_world_minutes AS "updatedWorldMinutes",metadata
+      FROM world_agent_goals WHERE world_id=$1 AND agent_id=$2 AND status='active'
+      ORDER BY CASE goal_type WHEN 'primary' THEN 0 WHEN 'secondary' THEN 1 ELSE 2 END,priority DESC,updated_world_minutes DESC LIMIT 7`, [worldId, agentId]),
+    pool.query(`SELECT subject_type AS "subjectType",subject_key AS "subjectKey",belief_key AS "beliefKey",
+        estimate::text AS estimate,confidence::text AS confidence,sample_count AS "sampleCount",
+        updated_world_minutes AS "updatedWorldMinutes",evidence FROM world_agent_beliefs
+      WHERE world_id=$1 AND agent_id=$2 ORDER BY sample_count DESC,confidence DESC LIMIT 12`, [worldId, agentId]),
+    pool.query(`SELECT tick_count AS "tickCount",world_minutes AS "worldMinutes",chosen_candidate_id AS "candidateId",
+        chosen_action AS action,behavior_probability::text AS probability,distribution,utility_scores AS "utilityScores",
+        goal_snapshot AS goals,rationale,created_at AS "createdAt"
+      FROM world_decision_traces WHERE world_id=$1 AND agent_id=$2 ORDER BY tick_count DESC,id DESC LIMIT 8`, [worldId, agentId]),
+    pool.query(`SELECT world_minutes AS "worldMinutes",trigger,rationale,created_at AS "createdAt"
+      FROM world_agent_reflections WHERE world_id=$1 AND agent_id=$2 ORDER BY world_minutes DESC,id DESC LIMIT 5`, [worldId, agentId])
+  ]);
+  if (!profile.rowCount) return fail(reply, 404, 'RESIDENT_NOT_FOUND');
+  return { resident: profile.rows[0], skills: skills.rows, relationships: relationships.rows, recentMemories: memories.rows,
+    goals: goals.rows, beliefs: beliefs.rows, decisions: decisions.rows, reflections: reflections.rows };
 });
 
 app.post('/v1/agents/challenges', async () => {

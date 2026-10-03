@@ -118,9 +118,11 @@ export class ActorCriticLearner {
   }
 
   /** Dopamine from the reward and the live state's value (the next state), then the three-factor step. */
-  learn(reward, done) {
+  learn(reward, done, { actorWeight = 1 } = {}) {
     if (!this.pending) return null;
     const c = this.cfg;
+    const policyGradientWeight = Number.isFinite(Number(actorWeight))
+      ? Math.max(0, Math.min(4, Number(actorWeight))) : 1;
     const nextValue = done ? 0.0 : this.value();
     const tdError = reward + c.gamma * nextValue - this.pending.value;
     let delta = tdError;
@@ -128,21 +130,25 @@ export class ActorCriticLearner {
     let moved = 0, sumAbs = 0, traceAbs = 0;
     for (let k = 0; k < this.edges.length; k++) {
       traceAbs += Math.abs(this.trace[k]);
-      const step = c.eta * delta * this.trace[k];
+      const step = c.eta * delta * this.trace[k] * policyGradientWeight;
       if (step === 0) continue;
       let eff = this.efficacy[k] + step;
       if (eff > c.cap) eff = c.cap; else if (eff < -c.cap) eff = -c.cap;
       const d = eff - this.efficacy[k];
       if (d !== 0) { moved++; sumAbs += Math.abs(d); this.efficacy[k] = eff; this.brain.setEfficacy(this.edges[k], eff); }
     }
-    for (let k = 0; k < this.neurons.length; k++) this.brain.bias[this.neurons[k]] += c.etaBias * delta * this.traceBias[k];
+    for (let k = 0; k < this.neurons.length; k++) {
+      this.brain.bias[this.neurons[k]] += c.etaBias * delta * this.traceBias[k] * policyGradientWeight;
+    }
     let energy = 0; for (let k = 0; k < this.traceCritic.length; k++) energy += this.traceCritic[k] * this.traceCritic[k];
     const norm = 1.0 / (1.0 + energy);
     for (let k = 0; k < this.criticIndex.length; k++) this.wCritic[k] += c.etaCritic * delta * this.traceCritic[k] * norm;
     this.bCritic += c.etaCritic * delta * this.traceCritic[this.criticIndex.length] * norm;
     if (done) { this.trace.fill(0); this.traceBias.fill(0); this.traceCritic.fill(0); }
     this.updates++;
-    const out = { delta, tdError, reward, value: this.pending.value, nextValue, moved, meanAbsStep: moved ? sumAbs / moved : 0, trace: this.edges.length ? traceAbs / this.edges.length : 0, saturation: this.pending.saturation, updates: this.updates, ...this.stats() };
+    const out = { delta, tdError, reward, value: this.pending.value, nextValue, actorWeight: policyGradientWeight,
+      moved, meanAbsStep: moved ? sumAbs / moved : 0, trace: this.edges.length ? traceAbs / this.edges.length : 0,
+      saturation: this.pending.saturation, updates: this.updates, ...this.stats() };
     this.pending = null;
     return out;
   }
