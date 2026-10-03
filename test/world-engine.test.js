@@ -8,7 +8,9 @@ const scenes = [
   { id: 'library', name: 'Library', sceneType: 'library', status: 'active' },
   { id: 'cafe', name: 'Cafe', sceneType: 'cafe', status: 'active' },
   { id: 'observatory', name: 'Observatory', sceneType: 'observatory', status: 'active' },
-  { id: 'data-center', name: 'Data Center', sceneType: 'data_center', status: 'active' }
+  { id: 'data-center', name: 'Data Center', sceneType: 'data_center', status: 'active' },
+  { id: 'generated-studio', name: 'Resident Workshop Annex', sceneType: 'studio', status: 'active' },
+  { id: 'generated-commons', name: 'Open Commons', sceneType: 'commons', status: 'active' }
 ];
 
 function agent(overrides = {}) {
@@ -54,6 +56,18 @@ test('utility decision offers bounded BTC/ETH orders only for a market-capable r
   assert.ok(Number(order.quoteUnits) <= 50);
   const nonTrader = buildActivityCandidates(agent({ goal: 'learn', riskTolerance: 0.2 }), scenes, { tick: 11, quotes });
   assert.equal(nonTrader.some((item) => item.action === 'trade'), false);
+});
+
+test('resident-created studio and commons are valid destinations for autonomous activities', () => {
+  const work = buildActivityCandidates(agent({ energy: 80, food: 80 }), scenes, { tick: 13 })
+    .find((item) => item.action === 'work' && item.targetLocation === 'Resident Workshop Annex');
+  assert.ok(work, 'generated studio can receive a work action and walk-in destination');
+  const social = buildActivityCandidates(agent({ status: 'idle', energy: 80, food: 80, social: 10 }), scenes, {
+    tick: 14, worldMinutes: 200, residentsAtLocation: { 'Open Commons': [
+      { agentId: 'resident-02', name: 'Resident 02', status: 'idle', energy: 80, food: 80, social: 50 }
+    ] }
+  }).find((item) => item.action === 'socialize' && item.targetLocation === 'Open Commons');
+  assert.ok(social, 'generated commons can receive a social action and walk-in destination');
 });
 
 test('state values and movement interpolation stay finite and bounded', () => {

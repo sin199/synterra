@@ -8,6 +8,8 @@ export const SOCIAL_SKILLS = Object.freeze(['trading', 'research', 'engineering'
 export const SOCIAL_ROLES = Object.freeze(['researcher', 'engineer', 'trader', 'worker', 'socialite', 'generalist']);
 export const SOCIAL_COOLDOWN_WORLD_MINUTES = 45;
 export const DECISION_MIX = Object.freeze({ fruitfly: 0.65, utility: 0.30, exploration: 0.05, utilityTemperature: 18 });
+// Utility determines candidate eligibility only; Fruitfly remains responsible for the final choice.
+export const UTILITY_CANDIDATE_POLICY = Object.freeze({ thresholdRatio: 0.75, minimum: 3, maximum: 8 });
 export const REFLECTION_CADENCE_WORLD_MINUTES = 360;
 export const IMPORTANT_REFLECTION_COOLDOWN_WORLD_MINUTES = 60;
 export const ADAPTIVE_PERSONALITY_LIMIT = 0.15;
@@ -95,6 +97,21 @@ export function decisionFamilies(candidates) {
     if (!current || Number(candidate.score) > Number(current.score)) families.set(family, candidate);
   }
   return [...families.values()].sort((a, b) => fruitflyFamily(a.action).localeCompare(fruitflyFamily(b.action)));
+}
+
+export function qualifyUtilityCandidates(candidates, policy = UTILITY_CANDIDATE_POLICY) {
+  const ranked = (Array.isArray(candidates) ? candidates : [])
+    .filter((candidate) => candidate && Number.isFinite(Number(candidate.score)))
+    .sort((left, right) => Number(right.score) - Number(left.score));
+  if (ranked.length <= 1) return ranked;
+  const maximum = Math.max(2, Math.trunc(Number(policy.maximum) || UTILITY_CANDIDATE_POLICY.maximum));
+  const minimum = Math.min(maximum, Math.max(2, Math.trunc(Number(policy.minimum) || UTILITY_CANDIDATE_POLICY.minimum)));
+  const ratio = clampFinite(policy.thresholdRatio, 0.1, 1, UTILITY_CANDIDATE_POLICY.thresholdRatio);
+  const best = Number(ranked[0].score);
+  const threshold = best >= 0 ? best * ratio : best - Math.abs(best) * (1 - ratio);
+  const qualified = ranked.filter((candidate) => Number(candidate.score) >= threshold);
+  const selected = qualified.length >= minimum ? qualified : ranked.slice(0, minimum);
+  return selected.slice(0, maximum);
 }
 
 export function softmaxUtilities(candidates, temperature = DECISION_MIX.utilityTemperature) {
@@ -281,7 +298,7 @@ export function canSocializePair({ actor, partner, scene, worldMinutes }) {
   const actorMayBePerformingSocially = actor?.status === 'idle' || (actor?.status === 'performing' && actor?.planned_action === 'socialize');
   return Boolean(actor && partner && actor.agentId !== partner.agentId && actorMayBePerformingSocially
     && partner.status === 'idle' && actor.location === partner.location && scene?.status === 'active'
-    && ['cafe', 'garden'].includes(scene.sceneType)
+    && ['cafe', 'garden', 'commons'].includes(scene.sceneType)
     && socialCooldownReady(partner.lastInteractionWorldMinutes, worldMinutes));
 }
 
@@ -426,8 +443,14 @@ export function lastRealizedSalePnl(trades) {
   return Number.isFinite(lastRealized) ? Math.round(lastRealized * 1e8) / 1e8 : null;
 }
 
-function fruitflyFamily(action) {
+export function fruitflyFamily(action) {
   if (action === 'trade' || action === 'trade_meme') return 'trade_crypto';
   if (action === 'learn') return 'travel';
+  if (['opportunity', 'opportunity_reject'].includes(action)) return 'travel';
+  if (['opportunity_propose', 'project_propose', 'project_join', 'project_reject', 'project_contribute',
+    'project_leave', 'place_create'].includes(action)) return 'cooperate';
+  if (['organization_found', 'organization_join', 'organization_reject', 'organization_leave',
+    'organization_invite', 'organization_contribute', 'information_share', 'information_accept',
+    'information_ignore', 'information_doubt'].includes(action)) return 'socialize';
   return action;
 }

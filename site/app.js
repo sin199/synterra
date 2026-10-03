@@ -19,6 +19,11 @@ const marketQuotes = document.querySelector('#market-quotes');
 const marketUpdated = document.querySelector('#market-updated');
 const portfolioSummary = document.querySelector('#portfolio-summary');
 const recentTrades = document.querySelector('#recent-trades');
+const evolutionStats = document.querySelector('#world-evolution-stats');
+const opportunityList = document.querySelector('#world-opportunity-list');
+const projectList = document.querySelector('#world-project-list');
+const organizationList = document.querySelector('#world-organization-list');
+const historyList = document.querySelector('#world-history-list');
 const numberFormat = new Intl.NumberFormat('zh-CN');
 const moneyFormat = new Intl.NumberFormat('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const MAP_POINTS = [
@@ -39,9 +44,20 @@ const EVENT_LABELS = {
   'crypto.trade_filled': '模拟加密货币成交', 'crypto.trade_held': '选择持有',
   'crypto.robinhood_paper_filled': 'Robinhood meme 币模拟成交',
   'world.movement_started': '启程', 'world.agent_arrived': '抵达', 'world.action_started': '开始行动',
-  'world.action_completed': '完成行动', 'world.goal_updated': '调整长期目标'
+  'world.action_completed': '完成行动', 'world.goal_updated': '调整长期目标',
+  'world.project_proposed': '发起项目', 'world.project_contribution': '项目贡献',
+  'world.project_completed': '项目完成', 'world.project_failed': '项目失败',
+  'world.organization_founded': '成立组织', 'world.organization_invited': '组织邀请',
+  'world.organization_membership_decided': '组织成员变更', 'world.information_shared': '分享信息',
+  'world.information_accepted': '采纳信息', 'world.information_doubted': '质疑信息',
+  'world.information_ignored': '忽略信息'
 };
-const ACTION_LABELS = { work: '工作', cooperate: '合作工作', learn: '学习', rest: '休息', eat: '进食', socialize: '社交', trade: '模拟交易' };
+const ACTION_LABELS = { work: '工作', cooperate: '合作工作', learn: '学习', rest: '休息', eat: '进食', socialize: '社交', trade: '模拟交易',
+  opportunity: '参与机会', opportunity_reject: '拒绝机会', opportunity_propose: '发起机会', project_propose: '发起项目', project_join: '加入项目',
+  project_reject: '拒绝项目', project_contribute: '项目贡献', project_leave: '退出项目', organization_found: '成立组织',
+  organization_join: '加入组织', organization_reject: '拒绝组织邀请', organization_leave: '退出组织',
+  organization_invite: '邀请成员', organization_contribute: '组织贡献', information_share: '分享信息',
+  information_accept: '采纳信息', information_ignore: '忽略信息', information_doubt: '质疑信息' };
 let latestMapData = null;
 let selectedAgentId = null;
 let selectedResidentDetail = null;
@@ -123,6 +139,14 @@ function createAgentMarker(agent, selected = false) {
   return button;
 }
 
+function sceneMapPoint(scene, index) {
+  const x = Number(scene.position?.x), z = Number(scene.position?.z);
+  if (Number.isFinite(x) && Number.isFinite(z) && Math.hypot(x, z) >= 0.2) {
+    return [Math.max(7, Math.min(93, 50 + x * 45)), Math.max(7, Math.min(93, 50 + z * 43))];
+  }
+  return MAP_POINTS[index % MAP_POINTS.length];
+}
+
 function renderMap() {
   if (!latestMapData || !mapLocations) return;
   mapLocations.replaceChildren();
@@ -144,7 +168,7 @@ function renderMap() {
   }
 
   scenes.forEach((scene, index) => {
-    const [left, top] = MAP_POINTS[index % MAP_POINTS.length];
+    const [left, top] = sceneMapPoint(scene, index);
     const node = document.createElement('div');
     node.className = 'map-location';
     node.dataset.sceneType = scene.sceneType || 'commons';
@@ -152,6 +176,7 @@ function renderMap() {
     node.style.top = `${top}%`;
     node.setAttribute('role', 'group');
     node.setAttribute('aria-label', `${scene.name}，${displayCount(scene.residentCount)} 位居民`);
+    node.title = scene.purpose || scene.description || scene.name;
 
     const label = document.createElement('div');
     label.className = 'map-place-label';
@@ -504,6 +529,70 @@ function renderActivity() {
   }
 }
 
+function renderEvolutionList(container, entries, emptyText, describe) {
+  if (!container) return;
+  container.replaceChildren();
+  if (!entries?.length) {
+    const empty = document.createElement('li');
+    empty.className = 'world-evolution-empty';
+    empty.textContent = emptyText;
+    container.append(empty);
+    return;
+  }
+  for (const entry of entries) {
+    const row = document.createElement('li');
+    const heading = document.createElement('strong');
+    heading.textContent = entry.title || entry.name || entry.eventType || '世界记录';
+    const detail = document.createElement('span');
+    detail.textContent = describe(entry);
+    row.append(heading, detail);
+    container.append(row);
+  }
+}
+
+function renderWorldEvolution() {
+  const evolution = latestMapData?.worldEvolution;
+  if (!evolution) return;
+  const dashboard = evolution.dashboard || {};
+  evolutionStats?.replaceChildren();
+  for (const [label, value] of [
+    ['居民', displayCount(dashboard.residents)], ['地点', displayCount(dashboard.places)],
+    ['活跃项目', displayCount(dashboard.activeProjects)], ['组织', displayCount(dashboard.organizations)],
+    ['开放机会', displayCount(dashboard.activeOpportunities)], ['已完成项目', displayCount(dashboard.completedProjects)],
+    ['世界年龄', `${displayCount(dashboard.worldAgeDays)} 天`],
+    ['模拟资产', `$${Number(dashboard.totalSimulatedWealthUsd || 0).toLocaleString('en-US', { maximumFractionDigits: 2 })}`],
+    ['内部单位净额', Number(dashboard.totalInternalUnits || 0).toLocaleString('zh-CN', { maximumFractionDigits: 2 })]
+  ]) {
+    const item = document.createElement('div');
+    item.className = 'world-evolution-stat';
+    const amount = document.createElement('strong');
+    amount.textContent = value;
+    const name = document.createElement('span');
+    name.textContent = label;
+    item.append(amount, name);
+    evolutionStats?.append(item);
+  }
+  renderEvolutionList(opportunityList, evolution.opportunities, '目前没有开放机会。', (item) => {
+    const type = item.type || '任务';
+    const place = item.sceneName ? ` · ${item.sceneName}` : '';
+    return `${type} · ${item.acceptedCount || 0}/${item.capacity} 人参与${place}`;
+  });
+  renderEvolutionList(projectList, evolution.projects, '居民还没有发起项目。', (item) => {
+    const status = ({ idea: '构想', proposed: '提案', recruiting: '招募中', active: '进行中',
+      completed: '已完成', failed: '失败', abandoned: '已放弃' })[item.status] || item.status;
+    const participants = Array.isArray(item.participants) ? item.participants.filter((member) =>
+      ['active', 'completed'].includes(member.status)).length : 0;
+    return `${status} · ${Math.round(Number(item.progressValue ?? item.progress) || 0)}% · ${participants} 位参与者`;
+  });
+  renderEvolutionList(organizationList, evolution.organizations, '还没有形成组织。', (item) => {
+    const members = (item.members || []).filter((member) => member.status === 'active').length;
+    const projects = (item.projects || []).length;
+    return `${item.status === 'active' ? '运作中' : item.status === 'dormant' ? '休眠' : '组建中'} · ${members} 位成员 · ${projects} 个项目`;
+  });
+  renderEvolutionList(historyList, evolution.history, '世界还没有留下重要历史。', (item) =>
+    `${item.detail || item.eventType || ''} · 第 ${Math.max(1, Math.floor(Number(item.worldTime || 0) / 1_440) + 1)} 天`);
+}
+
 function renderSummary() {
   if (!latestMapData) return;
   const residents = latestMapData.residents || [];
@@ -626,6 +715,7 @@ function renderMapData(data) {
   world3d?.update(data, selectedAgentId);
   renderAgentPanel(residents.find((resident) => resident.id === selectedAgentId));
   renderActivity();
+  renderWorldEvolution();
   renderTrading();
 }
 

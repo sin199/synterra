@@ -286,7 +286,13 @@ export function createWorld3D(canvas, labelsElement, onSelect) {
 
   function layout(now = Date.now()) {
     const scenes = data?.scenes || [], residents = data?.residents || [];
-    const centers = scenes.map((_, index) => {
+    const centers = scenes.map((scene, index) => {
+      const x = Number(scene.position?.x), z = Number(scene.position?.z);
+      if (Number.isFinite(x) && Number.isFinite(z) && Math.hypot(x, z) >= 0.2) {
+        const angle = Math.atan2(z, x);
+        const radius = 5.25 + Math.min(2.25, Math.hypot(x, z) * 2.35);
+        return [Math.cos(angle) * radius, Math.sin(angle) * radius * 0.77];
+      }
       const angle = -Math.PI / 2 + (index / Math.max(scenes.length, 1)) * Math.PI * 2;
       const radius = scenes.length <= 1 ? 0 : 5.7;
       return [Math.cos(angle) * radius, Math.sin(angle) * radius * 0.77];

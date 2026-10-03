@@ -3,7 +3,7 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { SettlingBrain } from './vendor/fruitfly/brain.js';
 import { ActorCriticLearner } from './vendor/fruitfly/learner.js';
-import { DECISION_MIX, chooseMixedCandidate } from '../social-world.js';
+import { DECISION_MIX, chooseMixedCandidate, fruitflyFamily } from '../social-world.js';
 
 export const FRUITFLY_POLICY_VERSION = 'synterra-fruitfly-candidate-policy-v2';
 
@@ -85,14 +85,8 @@ function stimulateState(model, observation) {
 };
 
 function feasibleActions(candidates) {
-  const present = new Set(candidates.map((candidate) => actionFamily(candidate.action)));
+  const present = new Set(candidates.map((candidate) => fruitflyFamily(candidate.action)));
   return ACTIONS.filter((action) => present.has(action));
-}
-
-function actionFamily(action) {
-  if (['trade','trade_meme'].includes(action)) return 'trade_crypto';
-  if (action === 'learn') return 'travel';
-  return action;
 }
 
 function configureOutputs(model, actions) {
@@ -116,7 +110,7 @@ function pickCandidate(model, observation, candidates, preferredDecision) {
 
 function prepareLearning(model, observation, candidates, selected) {
   const actions = feasibleActions(candidates);
-  const selectedFamily = actionFamily(selected.action);
+  const selectedFamily = fruitflyFamily(selected.action);
   if (!actions.includes(selectedFamily)) throw new Error('Fruitfly selection is outside the feasible candidate set.');
   stimulateState(model, observation);
   configureOutputs(model, actions);

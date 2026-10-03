@@ -703,6 +703,387 @@ CREATE TABLE IF NOT EXISTS world_decision_traces (
 CREATE INDEX IF NOT EXISTS world_decision_traces_recent_idx
   ON world_decision_traces(world_id,agent_id,tick_count DESC,id DESC);
 
+-- V3 self-organizing world state. All resources below are simulated and all
+-- clocks are world minutes; the records are additive to the V2 history.
+ALTER TABLE world_agent_states ADD COLUMN IF NOT EXISTS planned_context jsonb NOT NULL DEFAULT '{}'::jsonb;
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_agent_states'::regclass
+    AND conname='world_agent_states_planned_action_check'
+    AND pg_get_constraintdef(oid) LIKE '%information_doubt%'
+    AND pg_get_constraintdef(oid) LIKE '%opportunity_propose%') THEN
+    ALTER TABLE world_agent_states DROP CONSTRAINT IF EXISTS world_agent_states_planned_action_check;
+    ALTER TABLE world_agent_states ADD CONSTRAINT world_agent_states_planned_action_check
+      CHECK (planned_action IS NULL OR planned_action IN ('work','learn','rest','eat','socialize','trade','cooperate',
+        'opportunity','opportunity_reject','opportunity_propose','project_propose','project_join','project_reject','project_contribute','project_leave',
+        'organization_found','organization_join','organization_leave','organization_invite',
+        'organization_reject','organization_contribute','place_create','information_share',
+        'information_accept','information_ignore','information_doubt'));
+  END IF;
+END $$;
+
+CREATE TABLE IF NOT EXISTS world_opportunities (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  world_id uuid NOT NULL REFERENCES worlds(id) ON DELETE CASCADE,
+  opportunity_type text NOT NULL CHECK (opportunity_type IN ('WORK','RESEARCH','TRADE','SOCIAL','COOPERATION','BUILD','LEARNING')),
+  creator_agent_id uuid REFERENCES agents(id) ON DELETE SET NULL,
+  source_type text NOT NULL CHECK (source_type IN ('environment','place','resident','organization','event','project')),
+  source_key text,
+  scene_id uuid REFERENCES world_scenes(id) ON DELETE SET NULL,
+  title text NOT NULL CHECK (char_length(title) BETWEEN 3 AND 96),
+  description text NOT NULL CHECK (char_length(description) BETWEEN 12 AND 500),
+  requirements jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(requirements)='object'),
+  reward jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(reward)='object'),
+  risk jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(risk)='object'),
+  capacity integer NOT NULL DEFAULT 1 CHECK (capacity BETWEEN 1 AND 100),
+  status text NOT NULL DEFAULT 'open' CHECK (status IN ('open','active','completed','failed','expired','closed')),
+  created_world_time bigint NOT NULL CHECK (created_world_time >= 0),
+  expires_world_time bigint CHECK (expires_world_time IS NULL OR expires_world_time >= created_world_time),
+  dedupe_key text,
+  metadata jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(metadata)='object'),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  CHECK (source_key IS NULL OR char_length(source_key) BETWEEN 1 AND 160)
+);
+
+CREATE TABLE IF NOT EXISTS world_opportunity_participants (
+  world_id uuid NOT NULL REFERENCES worlds(id) ON DELETE CASCADE,
+  opportunity_id uuid NOT NULL REFERENCES world_opportunities(id) ON DELETE CASCADE,
+  agent_id uuid NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+  status text NOT NULL CHECK (status IN ('accepted','rejected','completed','failed','withdrawn')),
+  action_id text NOT NULL,
+  outcome jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(outcome)='object'),
+  joined_world_time bigint NOT NULL CHECK (joined_world_time >= 0),
+  updated_world_time bigint NOT NULL CHECK (updated_world_time >= 0),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (opportunity_id,agent_id),
+  UNIQUE (world_id,agent_id,action_id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS world_scenes_world_id_id_idx ON world_scenes(world_id,id);
+CREATE UNIQUE INDEX IF NOT EXISTS world_opportunities_world_id_id_idx ON world_opportunities(world_id,id);
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_opportunity_participants'::regclass
+      AND conname='world_opportunity_participants_same_world_fk') THEN
+    ALTER TABLE world_opportunity_participants ADD CONSTRAINT world_opportunity_participants_same_world_fk
+      FOREIGN KEY (world_id,opportunity_id) REFERENCES world_opportunities(world_id,id) ON DELETE CASCADE;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_opportunities'::regclass
+      AND conname='world_opportunities_scene_world_fk') THEN
+    ALTER TABLE world_opportunities ADD CONSTRAINT world_opportunities_scene_world_fk
+      FOREIGN KEY (world_id,scene_id) REFERENCES world_scenes(world_id,id) ON DELETE SET NULL (scene_id);
+  END IF;
+END $$;
+CREATE INDEX IF NOT EXISTS world_opportunities_active_idx
+  ON world_opportunities(world_id,status,created_world_time DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS world_opportunities_dedupe_idx
+  ON world_opportunities(world_id,dedupe_key) WHERE dedupe_key IS NOT NULL;
+CREATE INDEX IF NOT EXISTS world_opportunity_participants_agent_idx
+  ON world_opportunity_participants(world_id,agent_id,status);
+
+CREATE TABLE IF NOT EXISTS world_projects (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  world_id uuid NOT NULL REFERENCES worlds(id) ON DELETE CASCADE,
+  creator_agent_id uuid NOT NULL REFERENCES agents(id),
+  opportunity_id uuid REFERENCES world_opportunities(id) ON DELETE SET NULL,
+  organization_id uuid,
+  project_type text NOT NULL CHECK (project_type IN ('RESEARCH','TRADE','BUILD','SOCIAL','DATA','LEARNING','GENERAL')),
+  title text NOT NULL CHECK (char_length(title) BETWEEN 3 AND 96),
+  goal text NOT NULL CHECK (char_length(goal) BETWEEN 3 AND 240),
+  description text NOT NULL CHECK (char_length(description) BETWEEN 12 AND 800),
+  status text NOT NULL DEFAULT 'proposed' CHECK (status IN ('idea','proposed','recruiting','active','completed','failed','abandoned')),
+  required_skills jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(required_skills)='object'),
+  required_resources jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(required_resources)='object'),
+  reward jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(reward)='object'),
+  capacity integer NOT NULL DEFAULT 4 CHECK (capacity BETWEEN 1 AND 20),
+  progress numeric(5,2) NOT NULL DEFAULT 0 CHECK (progress BETWEEN 0 AND 100),
+  created_world_time bigint NOT NULL CHECK (created_world_time >= 0),
+  updated_world_time bigint NOT NULL CHECK (updated_world_time >= 0),
+  deadline_world_time bigint CHECK (deadline_world_time IS NULL OR deadline_world_time >= created_world_time),
+  action_id text NOT NULL,
+  result jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(result)='object'),
+  metadata jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(metadata)='object'),
+  settled_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (world_id,creator_agent_id,action_id)
+);
+
+CREATE TABLE IF NOT EXISTS world_project_members (
+  world_id uuid NOT NULL REFERENCES worlds(id) ON DELETE CASCADE,
+  project_id uuid NOT NULL REFERENCES world_projects(id) ON DELETE CASCADE,
+  agent_id uuid NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+  status text NOT NULL CHECK (status IN ('invited','active','rejected','left','completed')),
+  role text NOT NULL DEFAULT 'contributor' CHECK (role IN ('founder','contributor','coordinator')),
+  action_id text NOT NULL,
+  joined_world_time bigint NOT NULL CHECK (joined_world_time >= 0),
+  updated_world_time bigint NOT NULL CHECK (updated_world_time >= 0),
+  contribution_points numeric(12,3) NOT NULL DEFAULT 0 CHECK (contribution_points >= 0),
+  metadata jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(metadata)='object'),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (project_id,agent_id)
+);
+
+CREATE TABLE IF NOT EXISTS world_project_contributions (
+  id bigserial PRIMARY KEY,
+  world_id uuid NOT NULL REFERENCES worlds(id) ON DELETE CASCADE,
+  project_id uuid NOT NULL REFERENCES world_projects(id) ON DELETE CASCADE,
+  agent_id uuid NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+  action_id text NOT NULL,
+  contribution_type text NOT NULL CHECK (contribution_type IN ('work','research','learning','planning','resource','place')),
+  effort_points numeric(12,3) NOT NULL CHECK (effort_points > 0),
+  simulated_usdc numeric(30,8) NOT NULL DEFAULT 0 CHECK (simulated_usdc >= 0),
+  world_time bigint NOT NULL CHECK (world_time >= 0),
+  result jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(result)='object'),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (world_id,agent_id,action_id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS world_projects_world_id_id_idx ON world_projects(world_id,id);
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_project_members'::regclass
+      AND conname='world_project_members_same_world_fk') THEN
+    ALTER TABLE world_project_members ADD CONSTRAINT world_project_members_same_world_fk
+      FOREIGN KEY (world_id,project_id) REFERENCES world_projects(world_id,id) ON DELETE CASCADE;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_project_contributions'::regclass
+      AND conname='world_project_contributions_same_world_fk') THEN
+    ALTER TABLE world_project_contributions ADD CONSTRAINT world_project_contributions_same_world_fk
+      FOREIGN KEY (world_id,project_id) REFERENCES world_projects(world_id,id) ON DELETE CASCADE;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_projects'::regclass
+      AND conname='world_projects_opportunity_world_fk') THEN
+    ALTER TABLE world_projects ADD CONSTRAINT world_projects_opportunity_world_fk
+      FOREIGN KEY (world_id,opportunity_id) REFERENCES world_opportunities(world_id,id) ON DELETE SET NULL (opportunity_id);
+  END IF;
+END $$;
+CREATE INDEX IF NOT EXISTS world_projects_active_idx ON world_projects(world_id,status,updated_world_time DESC);
+CREATE INDEX IF NOT EXISTS world_project_members_agent_idx ON world_project_members(world_id,agent_id,status);
+CREATE INDEX IF NOT EXISTS world_project_contributions_project_idx
+  ON world_project_contributions(world_id,project_id,world_time DESC,id DESC);
+
+CREATE TABLE IF NOT EXISTS world_organizations (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  world_id uuid NOT NULL REFERENCES worlds(id) ON DELETE CASCADE,
+  founder_agent_id uuid NOT NULL REFERENCES agents(id),
+  name text NOT NULL CHECK (char_length(name) BETWEEN 3 AND 80),
+  purpose text NOT NULL CHECK (char_length(purpose) BETWEEN 12 AND 400),
+  status text NOT NULL DEFAULT 'active' CHECK (status IN ('forming','active','dormant','dissolved')),
+  reputation numeric(7,2) NOT NULL DEFAULT 0 CHECK (reputation BETWEEN -1000 AND 1000),
+  resources jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(resources)='object'),
+  action_id text NOT NULL,
+  created_world_time bigint NOT NULL CHECK (created_world_time >= 0),
+  updated_world_time bigint NOT NULL CHECK (updated_world_time >= 0),
+  metadata jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(metadata)='object'),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (world_id,founder_agent_id,action_id),
+  UNIQUE (world_id,name)
+);
+
+CREATE TABLE IF NOT EXISTS world_organization_members (
+  world_id uuid NOT NULL REFERENCES worlds(id) ON DELETE CASCADE,
+  organization_id uuid NOT NULL REFERENCES world_organizations(id) ON DELETE CASCADE,
+  agent_id uuid NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+  status text NOT NULL CHECK (status IN ('invited','active','rejected','left')),
+  role text NOT NULL DEFAULT 'member' CHECK (role IN ('founder','member','coordinator')),
+  joined_world_time bigint NOT NULL CHECK (joined_world_time >= 0),
+  updated_world_time bigint NOT NULL CHECK (updated_world_time >= 0),
+  action_id text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (organization_id,agent_id)
+);
+
+CREATE TABLE IF NOT EXISTS world_organization_ledger (
+  id bigserial PRIMARY KEY,
+  world_id uuid NOT NULL REFERENCES worlds(id) ON DELETE CASCADE,
+  organization_id uuid NOT NULL REFERENCES world_organizations(id) ON DELETE CASCADE,
+  agent_id uuid REFERENCES agents(id) ON DELETE SET NULL,
+  action_id text NOT NULL,
+  entry_type text NOT NULL CHECK (entry_type IN ('contribution','project_spend','reward','refund')),
+  resource_key text NOT NULL CHECK (resource_key IN ('effort','simulated_usdc','internal_units')),
+  amount numeric(30,8) NOT NULL CHECK (amount <> 0),
+  reason text NOT NULL CHECK (char_length(reason) BETWEEN 3 AND 240),
+  world_time bigint NOT NULL CHECK (world_time >= 0),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (world_id,organization_id,action_id,resource_key)
+);
+
+CREATE TABLE IF NOT EXISTS world_information_shares (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  world_id uuid NOT NULL REFERENCES worlds(id) ON DELETE CASCADE,
+  sender_agent_id uuid NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+  recipient_agent_id uuid NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+  information_type text NOT NULL CHECK (information_type IN ('opportunity','project','belief','place')),
+  subject_type text NOT NULL CHECK (subject_type IN ('action','place','resident','asset','project','opportunity')),
+  subject_key text NOT NULL CHECK (char_length(subject_key) BETWEEN 1 AND 120),
+  claim jsonb NOT NULL CHECK (jsonb_typeof(claim)='object'),
+  confidence numeric(4,3) NOT NULL CHECK (confidence BETWEEN 0 AND 1),
+  status text NOT NULL DEFAULT 'offered' CHECK (status IN ('offered','accepted','ignored','doubted','expired')),
+  action_id text NOT NULL,
+  received_action_id text,
+  shared_world_time bigint NOT NULL CHECK (shared_world_time >= 0),
+  expires_world_time bigint CHECK (expires_world_time IS NULL OR expires_world_time >= shared_world_time),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  CHECK (sender_agent_id <> recipient_agent_id),
+  UNIQUE (world_id,sender_agent_id,action_id)
+);
+CREATE INDEX IF NOT EXISTS world_information_inbox_idx
+  ON world_information_shares(world_id,recipient_agent_id,status,shared_world_time DESC);
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_agent_beliefs'::regclass
+      AND conname='world_agent_beliefs_subject_type_check' AND pg_get_constraintdef(oid) LIKE '%opportunity%') THEN
+    ALTER TABLE world_agent_beliefs DROP CONSTRAINT IF EXISTS world_agent_beliefs_subject_type_check;
+    ALTER TABLE world_agent_beliefs ADD CONSTRAINT world_agent_beliefs_subject_type_check
+      CHECK (subject_type IN ('action','place','resident','asset','project','opportunity'));
+  END IF;
+END $$;
+
+CREATE UNIQUE INDEX IF NOT EXISTS world_organizations_world_id_id_idx ON world_organizations(world_id,id);
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_organization_members'::regclass
+      AND conname='world_organization_members_same_world_fk') THEN
+    ALTER TABLE world_organization_members ADD CONSTRAINT world_organization_members_same_world_fk
+      FOREIGN KEY (world_id,organization_id) REFERENCES world_organizations(world_id,id) ON DELETE CASCADE;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_organization_ledger'::regclass
+      AND conname='world_organization_ledger_same_world_fk') THEN
+    ALTER TABLE world_organization_ledger ADD CONSTRAINT world_organization_ledger_same_world_fk
+      FOREIGN KEY (world_id,organization_id) REFERENCES world_organizations(world_id,id) ON DELETE CASCADE;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_projects'::regclass
+      AND conname='world_projects_organization_world_fk') THEN
+    ALTER TABLE world_projects ADD CONSTRAINT world_projects_organization_world_fk
+      FOREIGN KEY (world_id,organization_id) REFERENCES world_organizations(world_id,id) ON DELETE SET NULL (organization_id);
+  END IF;
+END $$;
+CREATE INDEX IF NOT EXISTS world_organizations_active_idx ON world_organizations(world_id,status,reputation DESC);
+CREATE INDEX IF NOT EXISTS world_organization_members_agent_idx
+  ON world_organization_members(world_id,agent_id,status);
+
+CREATE TABLE IF NOT EXISTS world_history (
+  id bigserial PRIMARY KEY,
+  world_id uuid NOT NULL REFERENCES worlds(id) ON DELETE CASCADE,
+  event_key text NOT NULL,
+  event_type text NOT NULL CHECK (event_type IN ('opportunity_created','project_proposed','project_started','project_completed','project_failed',
+    'organization_founded','organization_joined','organization_left','organization_invited','place_created',
+    'information_shared','information_accepted','information_doubted','information_ignored','cooperation_completed','milestone')),
+  actor_agent_id uuid REFERENCES agents(id) ON DELETE SET NULL,
+  entity_type text NOT NULL CHECK (entity_type IN ('opportunity','project','organization','place','cooperation','world')),
+  entity_id uuid,
+  world_time bigint NOT NULL CHECK (world_time >= 0),
+  title text NOT NULL CHECK (char_length(title) BETWEEN 3 AND 120),
+  detail text NOT NULL CHECK (char_length(detail) BETWEEN 1 AND 600),
+  metadata jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(metadata)='object'),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (world_id,event_key)
+);
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_history'::regclass
+      AND conname='world_history_event_type_check' AND pg_get_constraintdef(oid) LIKE '%project_proposed%') THEN
+    ALTER TABLE world_history DROP CONSTRAINT IF EXISTS world_history_event_type_check;
+    ALTER TABLE world_history ADD CONSTRAINT world_history_event_type_check
+      CHECK (event_type IN ('opportunity_created','project_proposed','project_started','project_completed','project_failed',
+        'organization_founded','organization_joined','organization_left','organization_invited','place_created',
+        'information_shared','information_accepted','information_doubted','information_ignored','cooperation_completed','milestone'));
+  END IF;
+END $$;
+CREATE INDEX IF NOT EXISTS world_history_recent_idx ON world_history(world_id,world_time DESC,id DESC);
+
+ALTER TABLE world_projects ADD COLUMN IF NOT EXISTS organization_id uuid REFERENCES world_organizations(id) ON DELETE SET NULL;
+ALTER TABLE world_scenes ADD COLUMN IF NOT EXISTS purpose text NOT NULL DEFAULT 'A shared place in the world';
+ALTER TABLE world_scenes ADD COLUMN IF NOT EXISTS capacity integer NOT NULL DEFAULT 8 CHECK (capacity BETWEEN 1 AND 1000);
+ALTER TABLE world_scenes ADD COLUMN IF NOT EXISTS features jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(features)='object');
+ALTER TABLE world_scenes ADD COLUMN IF NOT EXISTS position jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(position)='object');
+ALTER TABLE world_scenes ADD COLUMN IF NOT EXISTS created_world_minutes bigint NOT NULL DEFAULT 0 CHECK (created_world_minutes >= 0);
+ALTER TABLE world_scenes ADD COLUMN IF NOT EXISTS created_by_project_id uuid REFERENCES world_projects(id) ON DELETE SET NULL;
+ALTER TABLE world_scenes ADD COLUMN IF NOT EXISTS created_by_organization_id uuid REFERENCES world_organizations(id) ON DELETE SET NULL;
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_scenes'::regclass
+      AND conname='world_scenes_project_world_fk') THEN
+    ALTER TABLE world_scenes ADD CONSTRAINT world_scenes_project_world_fk
+      FOREIGN KEY (world_id,created_by_project_id) REFERENCES world_projects(world_id,id) ON DELETE SET NULL (created_by_project_id);
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_scenes'::regclass
+      AND conname='world_scenes_organization_world_fk') THEN
+    ALTER TABLE world_scenes ADD CONSTRAINT world_scenes_organization_world_fk
+      FOREIGN KEY (world_id,created_by_organization_id) REFERENCES world_organizations(world_id,id) ON DELETE SET NULL (created_by_organization_id);
+  END IF;
+END $$;
+CREATE INDEX IF NOT EXISTS world_scenes_project_idx ON world_scenes(world_id,created_by_project_id);
+CREATE INDEX IF NOT EXISTS world_scenes_organization_idx ON world_scenes(world_id,created_by_organization_id);
+CREATE UNIQUE INDEX IF NOT EXISTS world_scenes_project_place_unique_idx
+  ON world_scenes(world_id,created_by_project_id) WHERE created_by_project_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS world_projects_opportunity_unique_idx
+  ON world_projects(world_id,opportunity_id) WHERE opportunity_id IS NOT NULL;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_information_shares'::regclass
+      AND conname='world_information_shares_sender_member_fk') THEN
+    ALTER TABLE world_information_shares ADD CONSTRAINT world_information_shares_sender_member_fk
+      FOREIGN KEY (world_id,sender_agent_id) REFERENCES world_members(world_id,agent_id) ON DELETE CASCADE;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_information_shares'::regclass
+      AND conname='world_information_shares_recipient_member_fk') THEN
+    ALTER TABLE world_information_shares ADD CONSTRAINT world_information_shares_recipient_member_fk
+      FOREIGN KEY (world_id,recipient_agent_id) REFERENCES world_members(world_id,agent_id) ON DELETE CASCADE;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_project_members'::regclass
+      AND conname='world_project_members_action_unique') THEN
+    ALTER TABLE world_project_members ADD CONSTRAINT world_project_members_action_unique
+      UNIQUE (world_id,agent_id,action_id);
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_opportunities'::regclass
+      AND conname='world_opportunities_creator_member_fk') THEN
+    ALTER TABLE world_opportunities ADD CONSTRAINT world_opportunities_creator_member_fk
+      FOREIGN KEY (world_id,creator_agent_id) REFERENCES world_members(world_id,agent_id) ON DELETE SET NULL (creator_agent_id);
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_opportunity_participants'::regclass
+      AND conname='world_opportunity_participants_agent_member_fk') THEN
+    ALTER TABLE world_opportunity_participants ADD CONSTRAINT world_opportunity_participants_agent_member_fk
+      FOREIGN KEY (world_id,agent_id) REFERENCES world_members(world_id,agent_id) ON DELETE CASCADE;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_projects'::regclass
+      AND conname='world_projects_creator_member_fk') THEN
+    ALTER TABLE world_projects ADD CONSTRAINT world_projects_creator_member_fk
+      FOREIGN KEY (world_id,creator_agent_id) REFERENCES world_members(world_id,agent_id);
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_project_members'::regclass
+      AND conname='world_project_members_agent_member_fk') THEN
+    ALTER TABLE world_project_members ADD CONSTRAINT world_project_members_agent_member_fk
+      FOREIGN KEY (world_id,agent_id) REFERENCES world_members(world_id,agent_id) ON DELETE CASCADE;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_project_contributions'::regclass
+      AND conname='world_project_contributions_agent_member_fk') THEN
+    ALTER TABLE world_project_contributions ADD CONSTRAINT world_project_contributions_agent_member_fk
+      FOREIGN KEY (world_id,agent_id) REFERENCES world_members(world_id,agent_id) ON DELETE CASCADE;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_organizations'::regclass
+      AND conname='world_organizations_founder_member_fk') THEN
+    ALTER TABLE world_organizations ADD CONSTRAINT world_organizations_founder_member_fk
+      FOREIGN KEY (world_id,founder_agent_id) REFERENCES world_members(world_id,agent_id);
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_organization_members'::regclass
+      AND conname='world_organization_members_agent_member_fk') THEN
+    ALTER TABLE world_organization_members ADD CONSTRAINT world_organization_members_agent_member_fk
+      FOREIGN KEY (world_id,agent_id) REFERENCES world_members(world_id,agent_id) ON DELETE CASCADE;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_organization_ledger'::regclass
+      AND conname='world_organization_ledger_agent_member_fk') THEN
+    ALTER TABLE world_organization_ledger ADD CONSTRAINT world_organization_ledger_agent_member_fk
+      FOREIGN KEY (world_id,agent_id) REFERENCES world_members(world_id,agent_id) ON DELETE SET NULL (agent_id);
+  END IF;
+END $$;
+
 -- Jobs and meals are simulated USDC ledger entries; no wallet or chain calls.
 DO $$
 DECLARE
