@@ -10,6 +10,9 @@ export const SOCIAL_COOLDOWN_WORLD_MINUTES = 45;
 export const DECISION_MIX = Object.freeze({ fruitfly: 0.65, utility: 0.30, exploration: 0.05, utilityTemperature: 18 });
 // Utility determines candidate eligibility only; Fruitfly remains responsible for the final choice.
 export const UTILITY_CANDIDATE_POLICY = Object.freeze({ thresholdRatio: 0.75, minimum: 3, maximum: 8 });
+export const LAYERED_STRATEGIC_CANDIDATE_POLICY = Object.freeze({
+  thresholdRatio: 0.75, minimumPerLayer: 2, maximumPerLayer: 4, maximumTotal: 8
+});
 export const REFLECTION_CADENCE_WORLD_MINUTES = 360;
 export const IMPORTANT_REFLECTION_COOLDOWN_WORLD_MINUTES = 60;
 export const ADAPTIVE_PERSONALITY_LIMIT = 0.15;
@@ -43,6 +46,8 @@ export function initialSocialProfile(agentId, slot = 0) {
   const goalIndex = Math.abs(Math.trunc(Number(slot) || 0)) % SOCIAL_GOALS.length;
   return {
     ...personality,
+    // Stable economic trait; it affects the quoted price, not Fruitfly's selector.
+    priceSensitivity: clampPersonality(Math.round((0.2 + stableUnit(agentId, 'price-sensitivity') * 0.65) * 100) / 100),
     primaryGoal: SOCIAL_GOALS[goalIndex],
     goalProgress: 0,
     goalMilestones: 0,
@@ -92,11 +97,11 @@ export function decisionFamilies(candidates) {
   const families = new Map();
   for (const candidate of Array.isArray(candidates) ? candidates : []) {
     if (!candidate || !Number.isFinite(Number(candidate.score))) continue;
-    const family = fruitflyFamily(candidate.action);
+    const family = fruitflyFamily(candidate);
     const current = families.get(family);
     if (!current || Number(candidate.score) > Number(current.score)) families.set(family, candidate);
   }
-  return [...families.values()].sort((a, b) => fruitflyFamily(a.action).localeCompare(fruitflyFamily(b.action)));
+  return [...families.values()].sort((a, b) => fruitflyFamily(a).localeCompare(fruitflyFamily(b)));
 }
 
 export function qualifyUtilityCandidates(candidates, policy = UTILITY_CANDIDATE_POLICY) {
@@ -114,6 +119,49 @@ export function qualifyUtilityCandidates(candidates, policy = UTILITY_CANDIDATE_
   return selected.slice(0, maximum);
 }
 
+export function qualifyLayeredStrategicCandidates(candidates, policy = LAYERED_STRATEGIC_CANDIDATE_POLICY) {
+  const rankedCandidates = (Array.isArray(candidates) ? candidates : [])
+    .filter((candidate) => candidate && Number.isFinite(Number(candidate.score)));
+  // Qualify distinct Fruitfly output families first. Otherwise repeated offers
+  // from one family can consume the whole strategic Top-K and hide another
+  // feasible economic path. Restore near-best offers from selected families
+  // afterward so Fruitfly retains its within-family choice.
+  const ranked = decisionFamilies(rankedCandidates);
+  const economic = ranked.filter((candidate) => candidate.action.startsWith('business_')
+    || ['project_invest','project_distribute'].includes(candidate.action)
+    || (candidate.action === 'organization_contribute' && candidate.contributionType === 'capital'));
+  const general = ranked.filter((candidate) => !economic.includes(candidate));
+  if (!ranked.length) return [];
+  const mixedLayers = economic.length > 0 && general.length > 0;
+  const layerPolicy = mixedLayers ? { thresholdRatio: policy.thresholdRatio,
+    minimum: policy.minimumPerLayer, maximum: policy.maximumPerLayer } : undefined;
+  const selected = mixedLayers ? [...qualifyUtilityCandidates(economic, layerPolicy),
+    ...qualifyUtilityCandidates(general, layerPolicy)] : qualifyUtilityCandidates(ranked);
+  const maximumTotal = Math.max(2, Math.trunc(Number(policy.maximumTotal) || 8));
+  let retainedFamilies = selected;
+  if (retainedFamilies.length > maximumTotal) {
+    const bestEconomic = selected.filter((candidate) => economic.includes(candidate))
+      .sort((left, right) => Number(right.score) - Number(left.score))[0];
+    const bestGeneral = selected.filter((candidate) => general.includes(candidate))
+      .sort((left, right) => Number(right.score) - Number(left.score))[0];
+    const reserved = [bestEconomic, bestGeneral].filter(Boolean);
+    const rest = selected.filter((candidate) => !reserved.includes(candidate))
+      .sort((left, right) => Number(right.score) - Number(left.score));
+    retainedFamilies = [...reserved, ...rest.slice(0, maximumTotal - reserved.length)];
+  }
+  const ratio = clampFinite(policy.thresholdRatio, 0.1, 1, UTILITY_CANDIDATE_POLICY.thresholdRatio);
+  const familyThreshold = (best) => best >= 0 ? best * ratio : best - Math.abs(best) * (1 - ratio);
+  const selectedFamilyScores = new Map(retainedFamilies.map((candidate) =>
+    [fruitflyFamily(candidate), Number(candidate.score)]));
+  const retainedIds = new Set(retainedFamilies.map((candidate) => candidate.id));
+  const alternatives = rankedCandidates.filter((candidate) => {
+    const family = fruitflyFamily(candidate);
+    const best = selectedFamilyScores.get(family);
+    return best !== undefined && !retainedIds.has(candidate.id) && Number(candidate.score) >= familyThreshold(best);
+  }).sort((left, right) => Number(right.score) - Number(left.score));
+  return [...retainedFamilies, ...alternatives.slice(0, maximumTotal - retainedFamilies.length)];
+}
+
 export function softmaxUtilities(candidates, temperature = DECISION_MIX.utilityTemperature) {
   const ranked = decisionFamilies(candidates);
   if (!ranked.length) return {};
@@ -121,13 +169,13 @@ export function softmaxUtilities(candidates, temperature = DECISION_MIX.utilityT
   const max = Math.max(...ranked.map((item) => Number(item.score)));
   const exponentials = ranked.map((item) => Math.exp((Number(item.score) - max) / t));
   const total = exponentials.reduce((sum, value) => sum + value, 0);
-  return Object.fromEntries(ranked.map((item, index) => [fruitflyFamily(item.action), exponentials[index] / total]));
+  return Object.fromEntries(ranked.map((item, index) => [fruitflyFamily(item), exponentials[index] / total]));
 }
 
 export function mixedDecisionDistribution(candidates, fruitflyProbabilities = {}, config = DECISION_MIX) {
   const ranked = decisionFamilies(candidates);
   if (!ranked.length) return { families: [], probabilities: {}, components: {} };
-  const actions = ranked.map((candidate) => fruitflyFamily(candidate.action));
+  const actions = ranked.map((candidate) => fruitflyFamily(candidate));
   const utility = softmaxUtilities(ranked, config.utilityTemperature);
   const flyRaw = fruitflyProbabilities && typeof fruitflyProbabilities === 'object' ? fruitflyProbabilities : {};
   const flyTotal = actions.reduce((sum, action) => sum + Math.max(0, Number(flyRaw[action]) || 0), 0);
@@ -150,7 +198,7 @@ export function chooseMixedCandidate(candidates, fruitflyProbabilities, { action
   }
   action ||= Object.keys(distribution.probabilities).at(-1) || null;
   if (!action) return { candidate: null, action: null, ...distribution };
-  const options = (Array.isArray(candidates) ? candidates : []).filter((candidate) => fruitflyFamily(candidate.action) === action);
+  const options = (Array.isArray(candidates) ? candidates : []).filter((candidate) => fruitflyFamily(candidate) === action);
   const max = Math.max(...options.map((candidate) => Number(candidate.score) || 0));
   const weights = options.map((candidate) => Math.exp(((Number(candidate.score) || 0) - max) /
     Math.max(0.1, Number(config.utilityTemperature) || DECISION_MIX.utilityTemperature)));
@@ -163,7 +211,7 @@ export function chooseMixedCandidate(candidates, fruitflyProbabilities, { action
   }
   return { candidate: selected, action, confidence: distribution.probabilities[action] || 0,
     behaviorProbability: distribution.probabilities[action] || 0, fruitflyProbability: distribution.components.fruitfly[action] || 0,
-    utilityScores: Object.fromEntries(distribution.families.map((item) => [fruitflyFamily(item.action), Number(item.score)])),
+    utilityScores: Object.fromEntries(distribution.families.map((item) => [fruitflyFamily(item), Number(item.score)])),
     fruitflyProbabilities: distribution.components.fruitfly, utilityProbabilities: distribution.components.utility,
     distributionComponents: distribution.components,
     ...distribution };
@@ -443,12 +491,28 @@ export function lastRealizedSalePnl(trades) {
   return Number.isFinite(lastRealized) ? Math.round(lastRealized * 1e8) / 1e8 : null;
 }
 
-export function fruitflyFamily(action) {
+export function fruitflyFamily(candidateOrAction) {
+  const candidate = candidateOrAction && typeof candidateOrAction === 'object' ? candidateOrAction : {};
+  const action = String(candidate.action || candidateOrAction || '');
   if (action === 'trade' || action === 'trade_meme') return 'trade_crypto';
   if (action === 'learn') return 'travel';
+  if (action === 'business_skill_practice') return 'business_learn';
   if (['opportunity', 'opportunity_reject'].includes(action)) return 'travel';
+  if (['business_invest','project_invest','project_distribute'].includes(action)) return 'invest';
+  if (['business_apply','business_leave','business_hire','business_reject'].includes(action)) return 'job';
+  if (action === 'business_service') {
+    const serviceType = candidate.serviceType || candidate.service_type;
+    if (serviceType === 'food_service') return 'eat';
+    if (serviceType === 'social_service') return 'socialize';
+    if (serviceType === 'trading_service') return 'trade_crypto';
+    if (serviceType === 'engineering_service') return 'work';
+    if (serviceType === 'research_service') return 'travel';
+    return 'business';
+  }
   if (['opportunity_propose', 'project_propose', 'project_join', 'project_reject', 'project_contribute',
-    'project_leave', 'place_create', 'goal_review'].includes(action)) return 'cooperate';
+    'project_leave', 'project_invest', 'project_distribute', 'place_create', 'goal_review',
+    'business_found','business_price','business_distribute','business_close','business_seek_cofounder'].includes(action)) return 'business';
+  if (action === 'business_work') return 'work';
   if (['organization_found', 'organization_join', 'organization_reject', 'organization_leave',
     'organization_invite', 'organization_contribute', 'information_share', 'information_accept',
     'information_ignore', 'information_doubt'].includes(action)) return 'socialize';

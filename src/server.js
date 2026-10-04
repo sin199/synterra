@@ -21,6 +21,11 @@ import { foundWorldOrganization, inviteWorldOrganization, decideOrganizationMemb
   contributeOrganizationEffort, listWorldOrganizations } from './world-organizations.js';
 import { shareWorldInformation, decideWorldInformationShare, listInformationInbox } from './world-information.js';
 import { readEmergenceReport } from './world-emergence.js';
+import { closeWorldBusiness, distributeWorldBusinessProfit, distributeWorldProjectRevenue,
+  economicDashboardSql, foundWorldBusiness, investInWorldBusiness, investInWorldProject, listWorldBusinesses,
+  purchaseWorldBusinessService, reviewWorldBusinessPrice, completeWorldBusinessShift, applyToWorldBusinessJob,
+  decideWorldBusinessApplication, leaveWorldBusinessJob, practiceWorldBusinessCapability } from './world-businesses.js';
+import { ensureEconomicAccount, getEconomicAccount } from './economic-ledger.js';
 
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const SITE_ROOT = path.join(ROOT, 'site');
@@ -246,7 +251,7 @@ app.get('/local/map-data', async (_request, reply) => {
         COALESCE((SELECT g.progress::text FROM world_agent_goals g WHERE g.world_id=m.world_id AND g.agent_id=m.agent_id
           AND g.goal_type='primary' AND g.status='active' ORDER BY g.priority DESC,g.id LIMIT 1),sp.goal_progress::text) AS "goalProgress",
         sp.dominant_role AS "dominantRole",sp.personality_modifiers AS "personalityModifiers",
-        sp.risk_modifier::text AS "riskModifier",
+        sp.risk_modifier::text AS "riskModifier",sp.price_sensitivity::text AS "priceSensitivity",
         (SELECT g.description FROM world_agent_goals g WHERE g.world_id=m.world_id AND g.agent_id=m.agent_id
           AND g.goal_type='short' AND g.status='active' ORDER BY g.priority DESC,g.updated_world_minutes DESC LIMIT 1) AS "shortGoal",
         sp.sociability::text AS sociability,sp.curiosity::text AS curiosity,sp.discipline::text AS discipline,sp.ambition::text AS ambition,
@@ -327,6 +332,19 @@ app.get('/local/map-data', async (_request, reply) => {
     .sort((left, right) => new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime()).slice(0, 50);
   const worldMinutes = Number(clock?.worldMinutes) || 0;
   const emergence = await readEmergenceReport(pool, { worldId, worldMinutes });
+  const [economyDashboard, businesses, economicDemand, economyHistory] = await Promise.all([
+    pool.query(economicDashboardSql(), [worldId]),
+    listWorldBusinesses(pool, { worldId, limit: 12 }),
+    pool.query(`SELECT service_type AS "serviceType",demand_count AS "demandCount",
+        supply_count AS "supplyCount",unmet_count AS "unmetCount"
+      FROM world_economic_demand WHERE world_id=$1 AND world_day=$2
+      ORDER BY unmet_count DESC,demand_count DESC,service_type LIMIT 8`,
+    [worldId, Math.floor(worldMinutes / 1_440)]),
+    pool.query(`SELECT event_type AS "eventType",world_time AS "worldTime",title,detail,metadata
+      FROM world_history WHERE world_id=$1 AND (event_type LIKE 'business_%'
+        OR event_type IN ('project_invested','project_revenue','place_maintenance'))
+      ORDER BY world_time DESC,id DESC LIMIT 8`, [worldId])
+  ]);
   const [counts, opportunities, projects, organizations, history, internalUnits] = await Promise.all([
     pool.query(`SELECT
         (SELECT count(*)::int FROM world_members WHERE world_id=$1) AS residents,
@@ -357,9 +375,13 @@ app.get('/local/map-data', async (_request, reply) => {
   ]);
   const worldEvolution = { dashboard: { ...counts.rows[0], worldMinutes, worldAgeHours: Math.round(worldMinutes / 60),
       worldAgeDays: Math.floor(worldMinutes / 1_440) + 1,
-      totalSimulatedWealthUsd: cryptoPortfolios.rows.reduce((sum, row) => sum + Number(row.netAssetValueUsd || 0), 0).toFixed(2),
+      totalSimulatedWealthUsd: (Number(economyDashboard.rows[0]?.total_resident_net_worth_usd || 0)
+        + [...memeValueByAgent.values()].reduce((sum, value) => sum + value, 0)).toFixed(2),
       totalInternalUnits: internalUnits.rows[0].units }, opportunities: opportunities.rows, projects,
     organizations, history: history.rows };
+  worldEvolution.economy = { dashboard: economyDashboard.rows[0] || {}, businesses,
+    demand: economicDemand.rows, history: economyHistory.rows,
+    settlement: 'simulated_internal_ledger', chainSettlementEnabled: false };
   worldEvolution.emergence = emergence;
   return { world: { ...world.rows[0], engine: clock || { running: false } }, scenes: scenes.rows, residents: residents.rows, events: events.rows,
     dataCenterLogs: dataCenterLogs.rows, trading: { simulated: true, quotes: cryptoQuotes, robinhood: robinhoodMarket,
@@ -374,7 +396,8 @@ app.get('/local/map-data/residents/:agentId', async (request, reply) => {
   const world = await pool.query(`SELECT id FROM worlds WHERE open=true ORDER BY created_at DESC LIMIT 1`);
   if (!world.rowCount) return fail(reply, 404, 'WORLD_NOT_FOUND');
   const worldId = world.rows[0].id;
-  const [profile, skills, relationships, memories, goals, beliefs, decisions, reflections] = await Promise.all([
+  const [profile, skills, relationships, memories, goals, beliefs, decisions, reflections,
+    balances, employment, ownership, recentTransactions, recentPurchases, residentNetWorth] = await Promise.all([
     pool.query(`SELECT a.id,a.name,COALESCE((SELECT g.category FROM world_agent_goals g
           WHERE g.world_id=m.world_id AND g.agent_id=m.agent_id AND g.goal_type='primary' AND g.status='active'
           ORDER BY g.priority DESC,g.id LIMIT 1),p.primary_goal) AS "primaryGoal",
@@ -384,7 +407,8 @@ app.get('/local/map-data/residents/:agentId', async (request, reply) => {
         p.goal_milestones AS "goalMilestones",p.dominant_role AS "dominantRole",
         p.sociability::text AS sociability,p.curiosity::text AS curiosity,p.discipline::text AS discipline,
         p.ambition::text AS ambition,p.personality_modifiers AS "personalityModifiers",
-        p.risk_modifier::text AS "riskModifier",s.risk_tolerance::text AS "riskTolerance",
+        p.risk_modifier::text AS "riskModifier",p.price_sensitivity::text AS "priceSensitivity",
+        s.risk_tolerance::text AS "riskTolerance",
         m.location,COALESCE(s.status,'idle') AS "currentStatus",s.planned_action AS "currentAction",
         am.current_goal AS "currentIntent",p.last_reflection_world_minutes AS "lastReflectionWorldMinutes"
       FROM world_members m JOIN agents a ON a.id=m.agent_id
@@ -422,10 +446,84 @@ app.get('/local/map-data/residents/:agentId', async (request, reply) => {
       FROM world_decision_traces WHERE world_id=$1 AND agent_id=$2 ORDER BY tick_count DESC,id DESC LIMIT 8`, [worldId, agentId]),
     pool.query(`SELECT world_minutes AS "worldMinutes",trigger,rationale,created_at AS "createdAt"
       FROM world_agent_reflections WHERE world_id=$1 AND agent_id=$2 ORDER BY world_minutes DESC,id DESC LIMIT 5`, [worldId, agentId])
+    ,pool.query(`SELECT asset_symbol AS asset,balance::text AS balance FROM world_economic_accounts
+      WHERE world_id=$1 AND account_type='resident' AND owner_id=$2 ORDER BY asset_symbol`, [worldId, agentId])
+    ,pool.query(`SELECT employment.id,employment.business_id AS "businessId",business.name AS "businessName",
+        job.role,employment.wage_usdc::text AS "wageUsdc",employment.started_world_time AS "startedWorldTime"
+      FROM world_business_employment employment JOIN world_businesses business
+        ON business.world_id=employment.world_id AND business.id=employment.business_id
+      JOIN world_business_jobs job ON job.world_id=employment.world_id AND job.id=employment.job_id
+      WHERE employment.world_id=$1 AND employment.agent_id=$2 AND employment.status='active'
+      ORDER BY employment.started_world_time DESC`, [worldId, agentId])
+    ,pool.query(`WITH RECURSIVE holdings(asset_type,asset_id,share,path) AS (
+        SELECT owner.asset_type,owner.asset_id,owner.share::numeric,ARRAY[owner.asset_type||':'||owner.asset_id::text]
+        FROM world_economic_ownership owner WHERE owner.world_id=$1 AND owner.owner_type='resident' AND owner.owner_id=$2
+        UNION ALL
+        SELECT child.asset_type,child.asset_id,holdings.share*child.share,
+          holdings.path||(child.asset_type||':'||child.asset_id::text)
+        FROM holdings JOIN world_economic_ownership child ON child.world_id=$1
+          AND child.owner_type=holdings.asset_type AND child.owner_id=holdings.asset_id
+        WHERE holdings.asset_type IN ('organization','project')
+          AND NOT (child.asset_type||':'||child.asset_id::text)=ANY(holdings.path)
+      )
+      SELECT holdings.asset_type AS "assetType",holdings.asset_id AS "assetId",sum(holdings.share)::text AS share,
+        COALESCE(business.name,project.title,organization.name,place.name,'Economic asset') AS name,
+        COALESCE(account.balance::text,'0.00000000') AS "cashBalance"
+      FROM holdings LEFT JOIN world_businesses business ON holdings.asset_type='business'
+        AND business.world_id=$1 AND business.id=holdings.asset_id
+      LEFT JOIN world_projects project ON holdings.asset_type='project' AND project.world_id=$1 AND project.id=holdings.asset_id
+      LEFT JOIN world_organizations organization ON holdings.asset_type='organization'
+        AND organization.world_id=$1 AND organization.id=holdings.asset_id
+      LEFT JOIN world_scenes place ON holdings.asset_type='place' AND place.world_id=$1 AND place.id=holdings.asset_id
+      LEFT JOIN world_economic_accounts account ON account.world_id=$1 AND account.account_type=holdings.asset_type
+        AND account.owner_id=holdings.asset_id AND account.asset_symbol='USDC'
+      GROUP BY holdings.asset_type,holdings.asset_id,business.name,project.title,organization.name,place.name,account.balance
+      ORDER BY holdings.asset_type,name`, [worldId, agentId])
+    ,pool.query(`SELECT tx.transaction_type AS type,tx.asset_symbol AS asset,tx.amount::text AS amount,
+        tx.reason,tx.world_time AS "worldTime",
+        CASE WHEN destination.account_type='resident' AND destination.owner_id=$2 THEN 'income' ELSE 'expense' END AS flow
+      FROM world_economic_transactions tx
+      JOIN world_economic_accounts source ON source.id=tx.source_account_id
+      JOIN world_economic_accounts destination ON destination.id=tx.destination_account_id
+      WHERE tx.world_id=$1 AND ((source.account_type='resident' AND source.owner_id=$2)
+        OR (destination.account_type='resident' AND destination.owner_id=$2))
+      ORDER BY tx.world_time DESC,tx.created_at DESC LIMIT 12`, [worldId, agentId])
+    ,pool.query(`SELECT service.name AS "serviceName",business.name AS "businessName",orders.price_usdc::text AS "priceUsdc",
+        orders.world_time AS "worldTime",orders.status
+      FROM world_business_orders orders JOIN world_businesses business ON business.world_id=orders.world_id
+        AND business.id=orders.business_id JOIN world_business_services service ON service.world_id=orders.world_id
+        AND service.id=orders.service_id
+      WHERE orders.world_id=$1 AND orders.customer_agent_id=$2 ORDER BY orders.world_time DESC,orders.created_at DESC LIMIT 8`,
+    [worldId, agentId])
+    ,pool.query(`WITH RECURSIVE holdings(asset_type,asset_id,share,path) AS (
+        SELECT owner.asset_type,owner.asset_id,owner.share::numeric,ARRAY[owner.asset_type||':'||owner.asset_id::text]
+        FROM world_economic_ownership owner WHERE owner.world_id=$1 AND owner.owner_type='resident' AND owner.owner_id=$2
+        UNION ALL
+        SELECT child.asset_type,child.asset_id,holdings.share*child.share,
+          holdings.path||(child.asset_type||':'||child.asset_id::text)
+        FROM holdings JOIN world_economic_ownership child ON child.world_id=$1
+          AND child.owner_type=holdings.asset_type AND child.owner_id=holdings.asset_id
+        WHERE holdings.asset_type IN ('organization','project')
+          AND NOT (child.asset_type||':'||child.asset_id::text)=ANY(holdings.path)
+      ), assets AS (
+        SELECT account.account_type AS asset_type,account.owner_id AS asset_id,
+          sum(account.balance*COALESCE(quote.price_usd,0)) AS value_usd
+        FROM world_economic_accounts account LEFT JOIN crypto_market_quotes quote ON quote.symbol=account.asset_symbol
+        WHERE account.world_id=$1 AND account.account_type IN ('business','organization','project')
+        GROUP BY account.account_type,account.owner_id
+      )
+      SELECT (SELECT COALESCE(sum(account.balance*COALESCE(quote.price_usd,0)),0)
+          FROM world_economic_accounts account LEFT JOIN crypto_market_quotes quote ON quote.symbol=account.asset_symbol
+          WHERE account.world_id=$1 AND account.account_type='resident' AND account.owner_id=$2)
+        +(SELECT COALESCE(sum(holdings.share*assets.value_usd),0) FROM holdings JOIN assets USING(asset_type,asset_id)) AS "netWorthUsd"`,
+    [worldId, agentId])
   ]);
   if (!profile.rowCount) return fail(reply, 404, 'RESIDENT_NOT_FOUND');
   return { resident: profile.rows[0], skills: skills.rows, relationships: relationships.rows, recentMemories: memories.rows,
-    goals: goals.rows, beliefs: beliefs.rows, decisions: decisions.rows, reflections: reflections.rows };
+    goals: goals.rows, beliefs: beliefs.rows, decisions: decisions.rows, reflections: reflections.rows,
+    economy: { netWorthUsd: residentNetWorth.rows[0]?.netWorthUsd || '0.00000000', balances: balances.rows,
+      employment: employment.rows, ownership: ownership.rows, recentTransactions: recentTransactions.rows,
+      recentPurchases: recentPurchases.rows } };
 });
 
 app.post('/v1/agents/challenges', async () => {
@@ -1355,6 +1453,184 @@ app.get('/v1/worlds/:worldId/initiative-state', async (request, reply) => {
       totalInternalUnits: (await pool.query('SELECT COALESCE(sum(amount),0)::text AS units FROM token_ledger WHERE world_id=$1',
         [worldId])).rows[0].units },
     opportunities, projects, organizations, history: history.rows };
+});
+
+app.get('/v1/worlds/:worldId/economy', async (request, reply) => {
+  const { worldId } = request.params;
+  if (!validUuid(worldId)) return fail(reply, 400, 'WORLD_ID_INVALID');
+  await assertMember(pool, worldId, request.agentId);
+  const worldMinutes = await readWorldMinutes(pool, worldId);
+  const [dashboard, businesses, demand, balances, ownership, employment, investments, recentTransactions] = await Promise.all([
+    pool.query(economicDashboardSql(), [worldId]),
+    listWorldBusinesses(pool, { worldId, limit: 100 }),
+    pool.query(`SELECT service_type AS "serviceType",world_day AS "worldDay",demand_count AS "demandCount",
+        supply_count AS "supplyCount",unmet_count AS "unmetCount",evidence,updated_at AS "updatedAt"
+      FROM world_economic_demand WHERE world_id=$1 AND world_day=$2
+      ORDER BY unmet_count DESC,demand_count DESC,service_type`, [worldId, Math.floor(worldMinutes / 1_440)]),
+    pool.query(`SELECT asset_symbol AS asset,balance::text AS balance FROM world_economic_accounts
+      WHERE world_id=$1 AND account_type='resident' AND owner_id=$2 ORDER BY asset_symbol`, [worldId, request.agentId]),
+    pool.query(`SELECT asset_type AS "assetType",asset_id AS "assetId",share::text AS share,
+        invested_usdc::text AS "investedUsdc",acquired_world_time AS "acquiredWorldTime"
+      FROM world_economic_ownership WHERE world_id=$1 AND owner_type='resident' AND owner_id=$2
+      ORDER BY acquired_world_time DESC,asset_type,asset_id`, [worldId, request.agentId]),
+    pool.query(`SELECT employment.id,employment.business_id AS "businessId",business.name AS "businessName",
+        job.role,employment.wage_usdc::text AS "wageUsdc",employment.started_world_time AS "startedWorldTime"
+      FROM world_business_employment employment JOIN world_businesses business
+        ON business.world_id=employment.world_id AND business.id=employment.business_id
+      JOIN world_business_jobs job ON job.world_id=employment.world_id AND job.id=employment.job_id
+      WHERE employment.world_id=$1 AND employment.agent_id=$2 AND employment.status='active'
+      ORDER BY employment.started_world_time DESC`, [worldId, request.agentId]),
+    pool.query(`SELECT owner.asset_type AS "assetType",owner.asset_id AS "assetId",owner.share::text AS share,
+        owner.invested_usdc::text AS "investedUsdc",business.name AS "businessName",project.title AS "projectTitle"
+      FROM world_economic_ownership owner LEFT JOIN world_businesses business
+        ON owner.asset_type='business' AND business.world_id=owner.world_id AND business.id=owner.asset_id
+      LEFT JOIN world_projects project ON owner.asset_type='project'
+        AND project.world_id=owner.world_id AND project.id=owner.asset_id
+      WHERE owner.world_id=$1 AND owner.owner_type='resident' AND owner.owner_id=$2
+        AND owner.asset_type IN ('business','project') ORDER BY owner.acquired_world_time DESC`, [worldId, request.agentId]),
+    pool.query(`SELECT tx.id,tx.transaction_type AS type,tx.asset_symbol AS asset,tx.amount::text AS amount,
+        tx.reason,tx.world_time AS "worldTime",tx.reference_id AS "referenceId",
+        source.account_type AS "sourceType",source.owner_id AS "sourceOwnerId",
+        destination.account_type AS "destinationType",destination.owner_id AS "destinationOwnerId"
+      FROM world_economic_transactions tx
+      JOIN world_economic_accounts source ON source.id=tx.source_account_id
+      JOIN world_economic_accounts destination ON destination.id=tx.destination_account_id
+      WHERE tx.world_id=$1 AND ((source.account_type='resident' AND source.owner_id=$2)
+        OR (destination.account_type='resident' AND destination.owner_id=$2))
+      ORDER BY tx.world_time DESC,tx.created_at DESC LIMIT 30`, [worldId, request.agentId])
+  ]);
+  return { worldId, worldMinutes, settlement: 'simulated_internal_ledger', chainSettlementEnabled: false,
+    dashboard: dashboard.rows[0], demand: demand.rows, businesses, balances: balances.rows,
+    employment: employment.rows, investments: investments.rows, directOwnership: ownership.rows,
+    recentTransactions: recentTransactions.rows };
+});
+
+app.get('/v1/worlds/:worldId/businesses', async (request, reply) => {
+  const { worldId } = request.params;
+  if (!validUuid(worldId)) return fail(reply, 400, 'WORLD_ID_INVALID');
+  await assertMember(pool, worldId, request.agentId);
+  return { settlement: 'simulated_internal_ledger', businesses: await listWorldBusinesses(pool, { worldId,
+    limit: Math.min(200, Math.max(1, Number(request.query.limit) || 100)) }) };
+});
+
+app.post('/v1/worlds/:worldId/economy/actions', async (request, reply) => {
+  const { worldId } = request.params;
+  const body = request.body || {};
+  const actions = new Set(['business_found','business_invest','business_service','business_apply','business_decide',
+    'business_work','business_leave','business_price','business_distribute','business_close',
+    'business_skill_practice','business_seek_cofounder','project_invest','project_distribute']);
+  if (!validUuid(worldId) || !actions.has(body.action)) return fail(reply, 400, 'ECONOMIC_ACTION_INVALID');
+  const actionId = requireActionId(body);
+  const idFields = { business_invest: ['businessId'], business_service: ['serviceId'], business_apply: ['jobId'],
+    business_decide: ['applicationId'], business_work: ['businessId','serviceId'], business_leave: ['employmentId'],
+    business_price: ['businessId','serviceId'], business_distribute: ['businessId'], business_close: ['businessId'],
+    project_invest: ['projectId'], project_distribute: ['projectId'] }[body.action] || [];
+  if (idFields.some((field) => !validUuid(body[field]))) return fail(reply, 400, 'ECONOMIC_ACTION_ID_INVALID');
+  if (body.action === 'business_work' && body.employmentId !== undefined && !validUuid(body.employmentId)) {
+    return fail(reply, 400, 'ECONOMIC_ACTION_ID_INVALID');
+  }
+  if (body.action === 'business_invest' && body.fundingSource !== undefined
+      && (!body.fundingSource || !['resident','organization'].includes(body.fundingSource.type)
+        || (body.fundingSource.type === 'organization' && !validUuid(body.fundingSource.ownerId)))) {
+    return fail(reply, 400, 'BUSINESS_INVESTMENT_SOURCE_INVALID');
+  }
+  if (['business_invest','project_invest'].includes(body.action)) {
+    try { parsePositiveUnits(String(body.amountUsdc)); } catch { return fail(reply, 400, 'ECONOMIC_AMOUNT_INVALID'); }
+  }
+  if (body.action === 'business_service') {
+    try { parsePositiveUnits(String(body.maxPriceUsdc)); } catch { return fail(reply, 400, 'ECONOMIC_MAX_PRICE_INVALID'); }
+  }
+  if (body.action === 'business_decide' && !['accept','reject'].includes(body.decision)) {
+    return fail(reply, 400, 'BUSINESS_APPLICATION_DECISION_INVALID');
+  }
+  if (body.action === 'business_price' && !['raise','lower'].includes(body.direction)) {
+    return fail(reply, 400, 'BUSINESS_PRICE_DIRECTION_INVALID');
+  }
+  if (body.action === 'business_skill_practice' && (!['social','trading','research','engineering'].includes(body.preparationSkill)
+      || !['research_service','engineering_service','social_service','food_service','trading_service'].includes(body.preparationServiceType))) {
+    return fail(reply, 400, 'BUSINESS_PREPARATION_INVALID');
+  }
+  if (body.action === 'business_seek_cofounder') {
+    const proposal = body.cofounderProposal || {};
+    const organization = proposal.organizationProposal || {};
+    if (!validUuid(proposal.partnerId) || proposal.partnerId === request.agentId
+        || !validUuid(organization.projectId)
+        || !['research_service','engineering_service','social_service','food_service','trading_service'].includes(proposal.serviceType)
+        || typeof organization.name !== 'string' || typeof organization.purpose !== 'string') {
+      return fail(reply, 400, 'BUSINESS_COFOUNDER_PROPOSAL_INVALID');
+    }
+  }
+  const result = await transaction(async (client) => {
+    await assertMember(client, worldId, request.agentId, true);
+    const worldTime = await readWorldMinutes(client, worldId);
+    if (body.action === 'business_found') return foundWorldBusiness(client, { worldId, agentId: request.agentId,
+      actionId, proposal: body.proposal, worldTime });
+    if (body.action === 'business_skill_practice') return practiceWorldBusinessCapability(client, { worldId,
+      agentId: request.agentId, skill: body.preparationSkill, serviceType: body.preparationServiceType,
+      actionId, worldTime });
+    if (body.action === 'business_seek_cofounder') {
+      const proposal = body.cofounderProposal;
+      const organization = proposal.organizationProposal;
+      const formed = await foundWorldOrganization(client, { worldId, founderAgentId: request.agentId,
+        inviteAgentId: proposal.partnerId, projectId: organization.projectId,
+        name: organization.name, purpose: organization.purpose, actionId, worldTime,
+        metadata: { economicPreparation: true, serviceType: proposal.serviceType,
+          capabilityFit: Number(proposal.capabilityFit) || 0 } });
+      return { ...formed, partnerId: proposal.partnerId, serviceType: proposal.serviceType,
+        preparation: 'SEEK_COFOUNDER' };
+    }
+    if (body.action === 'business_invest') return investInWorldBusiness(client, { worldId,
+      businessId: body.businessId, investorAgentId: request.agentId, amount: body.amountUsdc,
+      actionId, worldTime, fundingSource: body.fundingSource || undefined });
+    if (body.action === 'project_invest') return investInWorldProject(client, { worldId,
+      projectId: body.projectId, investorAgentId: request.agentId, amount: body.amountUsdc, actionId, worldTime });
+    if (body.action === 'project_distribute') return distributeWorldProjectRevenue(client, { worldId,
+      projectId: body.projectId, ownerAgentId: request.agentId, actionId, worldTime });
+    if (body.action === 'business_apply') return applyToWorldBusinessJob(client, { worldId,
+      jobId: body.jobId, agentId: request.agentId, actionId, worldTime });
+    if (body.action === 'business_decide') return decideWorldBusinessApplication(client, { worldId,
+      applicationId: body.applicationId, founderAgentId: request.agentId, decision: body.decision, actionId, worldTime });
+    if (body.action === 'business_work') return completeWorldBusinessShift(client, { worldId,
+      businessId: body.businessId, serviceId: body.serviceId, employmentId: body.employmentId || null,
+      agentId: request.agentId, actionId, worldTime });
+    if (body.action === 'business_leave') return leaveWorldBusinessJob(client, { worldId,
+      employmentId: body.employmentId, agentId: request.agentId, actionId, worldTime });
+    if (body.action === 'business_price') {
+      const service = await client.query(`SELECT service.service_type,business.founder_agent_id AS "founderAgentId"
+        FROM world_business_services service JOIN world_businesses business ON business.id=service.business_id
+        WHERE service.world_id=$1 AND service.id=$2`, [worldId, body.serviceId]);
+      const demand = await client.query(`SELECT demand_count AS demand,supply_count AS supply FROM world_economic_demand
+        WHERE world_id=$1 AND service_type=$2 AND world_day=$3`,
+      [worldId, service.rows[0]?.service_type, Math.floor(worldTime / 1_440)]);
+      return reviewWorldBusinessPrice(client, { worldId, businessId: body.businessId, serviceId: body.serviceId,
+        agentId: request.agentId, direction: body.direction, actionId, worldTime,
+        demand: Number(demand.rows[0]?.demand) || 0, supply: Number(demand.rows[0]?.supply) || 0 });
+    }
+    if (body.action === 'business_distribute') return distributeWorldBusinessProfit(client, { worldId,
+      businessId: body.businessId, ownerAgentId: request.agentId, actionId, worldTime });
+    if (body.action === 'business_close') return closeWorldBusiness(client, { worldId,
+      businessId: body.businessId, founderAgentId: request.agentId, actionId, worldTime });
+    const service = await client.query(`SELECT service.service_type,business.founder_agent_id AS "founderAgentId"
+      FROM world_business_services service JOIN world_businesses business ON business.id=service.business_id
+      WHERE service.world_id=$1 AND service.id=$2`, [worldId, body.serviceId]);
+    const demand = await client.query(`SELECT demand_count AS demand,supply_count AS supply FROM world_economic_demand
+      WHERE world_id=$1 AND service_type=$2 AND world_day=$3`,
+    [worldId, service.rows[0]?.service_type, Math.floor(worldTime / 1_440)]);
+    const relationship = service.rows[0]?.founderAgentId ? await client.query(`SELECT familiarity,trust
+      FROM world_relationships WHERE world_id=$1 AND ((agent_a_id=$2 AND agent_b_id=$3)
+        OR (agent_a_id=$3 AND agent_b_id=$2))`, [worldId, request.agentId, service.rows[0].founderAgentId]) : { rows: [] };
+    const cash = await getEconomicAccount(client, { worldId, accountType: 'resident', ownerId: request.agentId,
+      asset: 'USDC', forUpdate: true });
+    const priceSensitivity = await client.query(`SELECT price_sensitivity FROM world_social_profiles
+      WHERE world_id=$1 AND agent_id=$2`, [worldId, request.agentId]);
+    return purchaseWorldBusinessService(client, { worldId, serviceId: body.serviceId,
+      customerAgentId: request.agentId, actionId, worldTime, maxPriceUsdc: body.maxPriceUsdc,
+      demand: Number(demand.rows[0]?.demand) || 1, supply: Number(demand.rows[0]?.supply) || 0,
+      relationship: relationship.rows[0] ? Number(relationship.rows[0].familiarity) * 0.3
+        + Number(relationship.rows[0].trust) * 0.7 : 0,
+      wealth: Number(cash?.balance) || 0, priceSensitivity: Number(priceSensitivity.rows[0]?.price_sensitivity ?? 0.5) });
+  });
+  return reply.code(result.idempotent ? 200 : 201).send({ simulated: true, settlement: 'internal_ledger', result });
 });
 
 app.get('/v1/worlds/:worldId/opportunities', async (request, reply) => {

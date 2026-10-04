@@ -161,27 +161,18 @@ export function explainWorldInitiativeGaps(agent, context = {}, candidates = [])
       organization.status === 'dissolved' ? [] : organization.memberIds || []);
     const hasTrustedPartner = relationships.some((relation) => Number(relation.trust) >= 5
       && Number(relation.familiarity) >= 25);
-    const repeatedPartners = partners.filter((partner) => Number(partner.sharedProjectCount || 0) >= 2);
-    const trustedRepeatedPartners = repeatedPartners.filter((partner) => Number(partner.trust) >= 5
+    const sharedPartners = partners.filter((partner) => Number(partner.sharedProjectCount || 0) >= 1);
+    const trustedSharedPartners = sharedPartners.filter((partner) => Number(partner.trust) >= 5
       && Number(partner.familiarity) >= 25);
-    const hasCompatibleRepeatedPartner = partners.some((partner) => {
-      const ownSkill = goalSkill(primaryCategory(agent));
-      const partnerSkill = goalSkill(partner.partnerGoal || '');
-      return Number(partner.sharedProjectCount || 0) >= 2 && Number(partner.trust) >= 5
-        && Number(partner.familiarity) >= 25 && (!ownSkill || !partnerSkill || ownSkill === partnerSkill)
-        && !existingPartners.includes(partner.partnerId || partner.agentId);
-    });
+    const hasAvailableSharedPartner = trustedSharedPartners.some((partner) =>
+      !existingPartners.includes(partner.partnerId || partner.agentId));
     const reason = !relationships.length && !partners.length ? 'NO_PARTNER'
-      : !hasTrustedPartner && !trustedRepeatedPartners.length ? 'INSUFFICIENT_TRUST'
-        : !repeatedPartners.length ? 'INSUFFICIENT_SHARED_WORK'
-          : !trustedRepeatedPartners.length ? 'INSUFFICIENT_TRUST'
-            : !hasCompatibleRepeatedPartner ? (trustedRepeatedPartners.some((partner) => {
-            const ownSkill = goalSkill(primaryCategory(agent));
-            const partnerSkill = goalSkill(partner.partnerGoal || '');
-            return Number(partner.sharedProjectCount || 0) >= 2 && ownSkill && partnerSkill && ownSkill !== partnerSkill;
-          }) ? 'INCOMPATIBLE_GOALS' : 'ALREADY_ORGANIZED')
+      : !hasTrustedPartner && !trustedSharedPartners.length ? 'INSUFFICIENT_TRUST'
+        : !sharedPartners.length ? 'INSUFFICIENT_SHARED_WORK'
+          : !trustedSharedPartners.length ? 'INSUFFICIENT_TRUST'
+          : !hasAvailableSharedPartner ? 'ALREADY_ORGANIZED'
             : 'INSUFFICIENT_SHARED_WORK';
-    record('organization', reason, { trustedPartner: hasTrustedPartner, repeatedPartnerCount: repeatedPartners.length }, 'organization_found');
+    record('organization', reason, { trustedPartner: hasTrustedPartner, sharedPartnerCount: sharedPartners.length }, 'organization_found');
   }
   if (!has('information_share')) {
     const relationships = Array.isArray(agent.relationships) ? agent.relationships : [];
@@ -308,8 +299,16 @@ export function buildWorldInitiativeCandidates(agent, context = {}) {
     for (const organization of organizationMemberships.filter((item) => item.memberStatus === 'active')) {
       options.push({ id: `organization:contribute:${organization.id}`, action: 'organization_contribute',
         targetLocation: agent.location, goal: `Contribute time and skill effort to ${organization.name}.`,
-        organizationId: organization.id, score: 22 + relevance(agent, 'organization', context)
+        organizationId: organization.id, contributionType: 'effort', score: 22 + relevance(agent, 'organization', context)
           + Math.min(8, Number(organization.reputation) / 10) });
+      if (Number(agent.usdc || agent.usdcBalance || 0) >= 150 && Number(organization.cashBalance || 0) < 500) {
+        options.push({ id: `organization:capital:${organization.id}:${Math.floor(Number(context.worldMinutes || 0) / 360)}`,
+          action: 'organization_contribute', targetLocation: agent.location,
+          goal: `Contribute a small amount of your own simulated USDC to ${organization.name}'s treasury for shared economic projects.`,
+          organizationId: organization.id, contributionType: 'capital', contributionAmountUsdc: '25.00000000',
+          score: 18 + Math.max(0, 500 - Number(organization.cashBalance || 0)) / 40
+            + relevance(agent, 'organization', context) });
+      }
       if (organization.projectOpenings?.length) {
         for (const project of organization.projectOpenings) {
           if (!projectMemberships.has(project.id) && projectFit(project, agent)) options.push({
@@ -346,12 +345,10 @@ export function buildWorldInitiativeCandidates(agent, context = {}) {
   }
 
   for (const partner of context.organizationPartners || []) {
-    const partnerSkill = goalSkill(partner.partnerGoal || '');
-    const goalCompatible = !skill || !partnerSkill || skill === partnerSkill;
     const partnerId = partner.partnerId || partner.agentId;
     const alreadyShared = (agent.organizationMemberships || []).some((organization) =>
       organization.memberIds?.includes(partnerId) && organization.status !== 'dissolved');
-    if (!alreadyShared && Number(partner.sharedProjectCount || 0) >= 2 && goalCompatible
+    if (!alreadyShared && Number(partner.sharedProjectCount || 0) >= 1
         && Number(partner.trust) >= 5 && Number(partner.familiarity) >= 25) {
       const safeName = partner.projectTitle || 'Shared Work';
       options.push({ id: `organization:found:${partnerId}:${partner.projectId}`, action: 'organization_found',

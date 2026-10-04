@@ -1,4 +1,5 @@
 import { addUnits, applyBasisPoints, divideUnits, formatUnits, isMarketAsset, multiplyUnits, parsePositiveUnits, parseSignedUnits } from './crypto-market.js';
+import { ensureEconomicAccount, ensureResidentEconomicAccounts, postEconomicTransfer } from './economic-ledger.js';
 
 export const STARTING_USDC = '10000.00000000';
 export const TRADE_FEE_BPS = 10;
@@ -71,6 +72,7 @@ export async function ensureCryptoAccount(client, { worldId, agentId }) {
       ON CONFLICT(world_id,agent_id,asset_symbol,reference_id) DO NOTHING`,
     [worldId, agentId, startingUsdc]);
   }
+  await ensureResidentEconomicAccounts(client, { worldId, agentId });
 }
 
 export async function accountSnapshot(client, worldId, agentId, quotes) {
@@ -95,6 +97,7 @@ export async function accountSnapshot(client, worldId, agentId, quotes) {
 }
 
 export async function executeCryptoTrade(client, { worldId, agentId, actionId, side, asset, quoteUnits, quote,
+  worldTime = 0,
   feeBps = TRADE_FEE_BPS, spreadBps = SPREAD_BPS, maxOrderNavBps = MAX_ORDER_NAV_BPS,
   maxAssetNavBps = MAX_ASSET_NAV_BPS }) {
   await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', [`crypto:${worldId}:${agentId}:${actionId}`]);
@@ -134,6 +137,19 @@ export async function executeCryptoTrade(client, { worldId, agentId, actionId, s
     await client.query(`INSERT INTO crypto_ledger(world_id,agent_id,asset_symbol,amount,entry_type,reference_id,reason)
       VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(world_id,agent_id,asset_symbol,reference_id) DO NOTHING`,
     [worldId, agentId, symbol, delta, kind, `${order.id}:${symbol}`, `${side} ${asset} simulated spot trade`]);
+  }
+  for (const [symbol, delta] of [['USDC', calculated.usdcDelta], [asset, calculated.assetDelta]]) {
+    const signed = parseSignedUnits(delta);
+    if (signed === 0n) continue;
+    const market = await ensureEconomicAccount(client, { worldId, accountType: 'system',
+      key: `system:exchange:${symbol}`, asset: symbol });
+    const resident = await ensureEconomicAccount(client, { worldId, accountType: 'resident', ownerId: agentId, asset: symbol });
+    const amount = formatUnits(signed > 0n ? signed : -signed);
+    await postEconomicTransfer(client, { worldId, sourceAccountId: signed > 0n ? market.id : resident.id,
+      destinationAccountId: signed > 0n ? resident.id : market.id, asset: symbol, amount,
+      transactionType: 'exchange_trade', reason: `${side} ${asset} simulated Exchange settlement.`,
+      worldTime, actionId: `exchange:${actionId}:${symbol}`, referenceId: order.id,
+      metadata: { side, tradedAsset: asset, quoteVersion: quote.quoteVersion } });
   }
   await client.query(`INSERT INTO crypto_trades(order_id,world_id,agent_id,side,asset_symbol,quantity,price_usd,notional_usd,fee_usdc)
     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`, [order.id, worldId, agentId, side, asset, calculated.quantity,

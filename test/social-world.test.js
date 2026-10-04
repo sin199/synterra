@@ -5,8 +5,9 @@ import {
   DECISION_MIX, SOCIAL_COOLDOWN_WORLD_MINUTES, addSkillGain, canCooperatePair, canSocializePair,
   chooseMixedCandidate, clampPersonality, clampRelationship, clampSkill, deriveDominantRole,
   effectivePersonality, goalActionUtility, goalProgress, initialSkillValues, initialSocialProfile,
-  lastRealizedSalePnl, memoryForCompletedAction, mixedDecisionDistribution, recentMemoryUtility,
-  reflectionDue, reflectionProposal, seededGoalSet, skillGainForAction, socialCooldownReady, updateRelationship
+  lastRealizedSalePnl, memoryForCompletedAction, mixedDecisionDistribution, qualifyUtilityCandidates, recentMemoryUtility,
+  qualifyLayeredStrategicCandidates, fruitflyFamily, reflectionDue, reflectionProposal, seededGoalSet,
+  skillGainForAction, socialCooldownReady, updateRelationship
 } from '../src/social-world.js';
 
 const scenes = [
@@ -26,12 +27,6 @@ function agent(overrides = {}) {
     recentMemories: [], ...overrides };
 }
 
-function uniformFruitflyPrior(candidates) {
-  const families = new Set(candidates.map(({ action }) =>
-    action === 'trade' || action === 'trade_meme' ? 'trade_crypto' : action === 'learn' ? 'travel' : action));
-  return Object.fromEntries([...families].map((family) => [family, 1]));
-}
-
 test('social personality and skills are stable, bounded and differentiated across residents', () => {
   const profiles = Array.from({ length: 10 }, (_, slot) => initialSocialProfile(`resident-${slot}`, slot));
   const skills = Array.from({ length: 10 }, (_, slot) => initialSkillValues(`resident-${slot}`, slot));
@@ -39,7 +34,9 @@ test('social personality and skills are stable, bounded and differentiated acros
   assert.equal(new Set(profiles.map((profile) => profile.primaryGoal)).size, 6);
   for (const profile of profiles) {
     for (const key of ['sociability', 'curiosity', 'discipline', 'ambition']) assert.ok(profile[key] >= 0 && profile[key] <= 1);
+    assert.ok(profile.priceSensitivity >= 0.2 && profile.priceSensitivity <= 0.85);
   }
+  assert.ok(new Set(profiles.map((profile) => profile.priceSensitivity)).size > 5);
   assert.ok(new Set(skills.map((profile) => JSON.stringify(profile))).size > 8);
   assert.ok(skills.every((profile) => Object.values(profile).every((value) => value >= 0 && value <= 100)));
 });
@@ -139,10 +136,6 @@ test('stable goals and personality change real Utility scores', () => {
   assert.ok(score(goalOnly) > score(baseline));
   assert.ok(score(skillOnly) > score(baseline));
   assert.ok(score(personalityOnly) > score(baseline));
-  const baselineWorkProbability = mixedDecisionDistribution(baseline, uniformFruitflyPrior(baseline)).probabilities.work;
-  assert.ok(mixedDecisionDistribution(goalOnly, uniformFruitflyPrior(goalOnly)).probabilities.work > baselineWorkProbability);
-  assert.ok(mixedDecisionDistribution(skillOnly, uniformFruitflyPrior(skillOnly)).probabilities.work > baselineWorkProbability);
-  assert.ok(mixedDecisionDistribution(personalityOnly, uniformFruitflyPrior(personalityOnly)).probabilities.work > baselineWorkProbability);
   assert.ok(baseline.some((candidate) => candidate.action === 'socialize'));
 });
 
@@ -158,10 +151,6 @@ test('sociability and relationship familiarity alter social Utility', () => {
   const known = familiarCandidates.find((candidate) => candidate.action === 'socialize');
   assert.ok(known.score > low.score + 10);
   assert.ok(known.score > unfamiliar.score);
-  const unfamiliarSocialProbability = mixedDecisionDistribution(unfamiliarCandidates,
-    uniformFruitflyPrior(unfamiliarCandidates)).probabilities.socialize;
-  assert.ok(mixedDecisionDistribution(familiarCandidates, uniformFruitflyPrior(familiarCandidates))
-    .probabilities.socialize > unfamiliarSocialProbability);
   assert.equal(buildActivityCandidates(agent({ location: 'Cafe' }), scenes, { tick: 4, worldMinutes: 100 })
     .some((candidate) => candidate.action === 'socialize'), false);
 });
@@ -179,21 +168,42 @@ test('recent simulated trading loss reduces Exchange utility temporarily', () =>
     metadata: { asset: 'BTC', realizedPnlUsd: -40 } }] }, 'trade', 1_000), 0);
 });
 
-test('personal history changes the final Fruitfly-mixed behavior distribution', () => {
-  const context = { tick: 18, worldMinutes: 1_000, nowMs: Date.now(),
-    quotes: [{ symbol: 'BTC', priceUsd: '64000' }, { symbol: 'ETH', priceUsd: '3200' }], previousQuotes: {} };
-  const resident = agent({ agentId: 'history-distribution', primaryGoal: 'MASTER_TRADING', riskTolerance: 0.75 });
-  const before = buildActivityCandidates(resident, scenes, context);
-  const after = buildActivityCandidates({ ...resident, recentMemories: [
-    { memoryType: 'failure', worldMinutes: 999, metadata: { asset: 'BTC', realizedPnlUsd: -50 } }
-  ] }, scenes, context);
-  const fruitflyProbabilities = Object.fromEntries(before.map(({ action }) => [
-    action === 'trade' || action === 'trade_meme' ? 'trade_crypto' : action === 'learn' ? 'travel' : action, 1
-  ]));
-  const beforeDistribution = mixedDecisionDistribution(before, fruitflyProbabilities).probabilities;
-  const afterDistribution = mixedDecisionDistribution(after, fruitflyProbabilities).probabilities;
-  assert.ok(beforeDistribution.trade_crypto > afterDistribution.trade_crypto,
-    'a recent realized trading loss should change final mixed action probability, not only UI metadata');
+test('personal history changes Utility eligibility instead of weighting Fruitfly choice', () => {
+  const historyEvidence = [
+    { id: 'work', action: 'work', score: 100 },
+    { id: 'learn', action: 'learn', score: 90 },
+    { id: 'socialize', action: 'socialize', score: 80 },
+    { id: 'trade', action: 'trade', score: 78 },
+    { id: 'rest', action: 'rest', score: 70 }
+  ];
+  const afterLoss = historyEvidence.map((candidate) => candidate.id === 'trade'
+    ? { ...candidate, score: 50 } : candidate);
+  const beforeEligible = qualifyUtilityCandidates(historyEvidence);
+  const afterEligible = qualifyUtilityCandidates(afterLoss);
+  assert.ok(beforeEligible.some((candidate) => candidate.id === 'trade'));
+  assert.ok(!afterEligible.some((candidate) => candidate.id === 'trade'));
+});
+
+test('strategic Top-K reserves distinct Fruitfly families so repeated production cannot crowd out hiring', () => {
+  const candidates = [
+    ...Array.from({ length: 7 }, (_, index) => ({ id: `production-${index}`, action: 'business_work', score: 100 - index })),
+    { id: 'meal-service', action: 'business_service', serviceType: 'food_service', score: 94 },
+    { id: 'new-business', action: 'business_found', score: 82 },
+    { id: 'job-application', action: 'business_apply', score: 78 },
+    { id: 'price-review', action: 'business_price', score: 63 },
+    { id: 'project-proposal', action: 'project_propose', score: 90 },
+    { id: 'project-join', action: 'project_join', score: 68 },
+    { id: 'low-value', action: 'goal_review', score: 20 }
+  ];
+  const eligible = qualifyLayeredStrategicCandidates(candidates);
+  assert.equal(fruitflyFamily('business_work'), 'work');
+  assert.equal(fruitflyFamily('business_apply'), 'job');
+  assert.equal(fruitflyFamily({ action: 'business_service', serviceType: 'research_service' }), 'travel');
+  assert.ok(eligible.some((candidate) => candidate.id === 'job-application'));
+  assert.ok(eligible.some((candidate) => candidate.id === 'production-0'));
+  assert.ok(eligible.length > 1 && eligible.length <= 8);
+  assert.ok(eligible.filter((candidate) => candidate.action === 'business_work').length > 1,
+    'near-best offers from a qualified family should remain available to Fruitfly');
 });
 
 test('high-effort actions lose eligibility when needs are critically low', () => {
@@ -262,16 +272,16 @@ test('goal progress stays bounded and advances milestone stages from durable met
   assert.equal(goalProgress('MASTER_RESEARCH', { skills: { research: 50 }, skillActions: { research: 20 } }, 1).milestones, 2);
 });
 
-test('a short-term goal changes the weighted candidate distribution toward its concrete next step', () => {
+test('a short-term goal raises the Utility score for its concrete next step', () => {
   const context = { tick: 38, worldMinutes: 2_000 };
   const resident = agent({ agentId: 'short-goal-plan' });
   const baseline = buildActivityCandidates(resident, scenes, context);
   const planned = buildActivityCandidates({ ...resident, goals: [
     { goalType: 'short', category: 'PRACTICE_ENGINEERING', priority: 1, status: 'active' }
   ] }, scenes, context);
-  const before = mixedDecisionDistribution(baseline, uniformFruitflyPrior(baseline)).probabilities.work;
-  const after = mixedDecisionDistribution(planned, uniformFruitflyPrior(planned)).probabilities.work;
-  assert.ok(after > before);
+  const workScore = (candidates) => candidates.find((candidate) => candidate.action === 'work'
+    && candidate.targetLocation === 'Data Center').score;
+  assert.ok(workScore(planned) > workScore(baseline));
 });
 
 test('profession role follows persistent skills and goal without locking a resident', () => {

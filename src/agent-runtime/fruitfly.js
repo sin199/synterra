@@ -5,11 +5,12 @@ import { SettlingBrain } from './vendor/fruitfly/brain.js';
 import { ActorCriticLearner } from './vendor/fruitfly/learner.js';
 import { DECISION_MIX, chooseMixedCandidate, fruitflyFamily } from '../social-world.js';
 
-export const FRUITFLY_POLICY_VERSION = 'synterra-fruitfly-candidate-policy-v2';
+export const FRUITFLY_POLICY_VERSION = 'synterra-fruitfly-candidate-policy-v3';
 
 // One stable action family per output neuron. The mapping is an experimental
 // software convention, not a claim about the fly's biological action semantics.
-const ACTIONS = ['eat', 'rest', 'socialize', 'work', 'cooperate', 'travel', 'trade_crypto', 'trade_hold'];
+const ACTIONS = ['eat', 'rest', 'socialize', 'work', 'cooperate', 'travel', 'trade_crypto', 'trade_hold',
+  'business', 'invest', 'job', 'business_learn'];
 const SENSORS = [
   ['synterra:state:food:low', 'synterra:state:food:high'],
   ['synterra:state:energy:low', 'synterra:state:energy:high'],
@@ -73,8 +74,25 @@ function stimulateState(model, observation) {
   learner.trace.fill(0); learner.traceBias.fill(0); learner.traceCritic.fill(0);
   brain.clearStimuli();
   const self = observation.self || {};
-  const traits = observation.mind?.traits || {};
-  const values = [unit(self.food), unit(self.energy), unit(self.social), unit(Number(traits.curiosity) * 100), unit(Number(traits.craft) * 100)];
+  const mind = observation.mind || {};
+  const traits = mind.traits || {};
+  const economic = mind.economic || {};
+  const relationships = Array.isArray(mind.relationships) ? mind.relationships : [];
+  const relationshipSignal = relationships.length ? relationships.reduce((sum, item) =>
+    sum + clamp((Number(item.trust) || 0) / 100, 0, 1), 0) / relationships.length : 0.5;
+  const skills = mind.skills && typeof mind.skills === 'object' ? Object.values(mind.skills)
+    .map((value) => clamp(Number(value) || 0, 0, 100) / 100) : [];
+  const skillSignal = skills.length ? skills.reduce((sum, value) => sum + value, 0) / skills.length : unit(Number(traits.craft) * 100);
+  const goalText = JSON.stringify(mind.goals || []).toUpperCase();
+  const economicGoal = /WEALTH|BUSINESS|MARKET|TRAD|ENGINEER|RESEARCH|LEARN/.test(goalText) ? 1 : 0;
+  const outcomeSignal = clamp(0.5 + (Number(economic.outcome) || 0) * 0.5, 0, 1);
+  const experienceSignal = clamp((Number(economic.recentExperience) || 0) / 8, 0, 1);
+  const marketSignal = clamp(Number(economic.marketOpportunity) || 0, 0, 1);
+  const curiositySignal = unit(Number(traits.curiosity) * 100) * 0.65 + marketSignal * 0.25 + economicGoal * 0.1;
+  const craftSignal = skillSignal * 0.45 + experienceSignal * 0.2 + outcomeSignal * 0.2
+    + clamp(Number(economic.capital) / 10_000, 0, 1) * 0.1 + economicGoal * 0.05;
+  const values = [unit(self.food), unit(self.energy), unit(self.social) * 0.7 + relationshipSignal * 0.3,
+    curiositySignal, craftSignal];
   for (let i = 0; i < values.length; i++) {
     const value = values[i];
     const side = value < 0.5 ? 0 : 1;
@@ -85,7 +103,7 @@ function stimulateState(model, observation) {
 };
 
 function feasibleActions(candidates) {
-  const present = new Set(candidates.map((candidate) => fruitflyFamily(candidate.action)));
+  const present = new Set(candidates.map((candidate) => fruitflyFamily(candidate)));
   return ACTIONS.filter((action) => present.has(action));
 }
 
@@ -101,16 +119,20 @@ function pickCandidate(model, observation, candidates, preferredDecision) {
   configureOutputs(model, actions);
   const baseValues = Array.from(model.learner.probabilities());
   const fruitflyProbabilities = Object.fromEntries(actions.map((key, i) => [key, baseValues[i]]));
+  // Utility scores screen candidates and still inform Fruitfly's final family
+  // and within-family choice; Fruitfly's learned action distribution remains active.
   const choice = chooseMixedCandidate(candidates, fruitflyProbabilities, {
     actionDraw: nextRandom(model), candidateDraw: nextRandom(model), config: DECISION_MIX
   });
-  return { ...choice, fruitflyProbabilities, utilityProbabilities: choice.components.utility,
+  const selectedIndex = candidates.findIndex((candidate) => candidate.id === choice.candidate?.id);
+  return { ...choice, candidate: selectedIndex >= 0 ? candidates[selectedIndex] : null,
+    fruitflyProbabilities, utilityProbabilities: choice.components.utility,
     distributionComponents: choice.components };
 }
 
 function prepareLearning(model, observation, candidates, selected) {
   const actions = feasibleActions(candidates);
-  const selectedFamily = fruitflyFamily(selected.action);
+  const selectedFamily = fruitflyFamily(selected);
   if (!actions.includes(selectedFamily)) throw new Error('Fruitfly selection is outside the feasible candidate set.');
   stimulateState(model, observation);
   configureOutputs(model, actions);
@@ -133,6 +155,15 @@ function outcomeReward(observation, candidate, result) {
   else if (candidate.action === 'build_scene' && result.scene?.id) contribution = 0.15;
   else if (candidate.action === 'travel' && candidate.sceneId
       && !(observation.mind?.memories || []).some((memory) => memory.kind === 'travel' && memory.sceneId === candidate.sceneId)) contribution = 0.15;
+  else if (candidate.action.startsWith('business_')) {
+    const initiative = result.initiative || result;
+    const realized = Number(initiative.realizedProfitUsdc ?? initiative.businessProfitLossUsdc);
+    if (Number.isFinite(realized)) contribution = clamp(realized / 100, -0.35, 0.35);
+    else if (candidate.action === 'business_service' && initiative.benefit) contribution = 0.12;
+    else if (candidate.action === 'business_work' && Number(initiative.wageUsdc) > 0) contribution = 0.12;
+    else if (candidate.action === 'business_found' && initiative.status === 'active') contribution = 0.04;
+    else if (candidate.action === 'business_close') contribution = -0.08;
+  }
   // Equal need weights plus a small, bounded bonus for successful world progress.
   return clamp(needDelta / 3 + contribution, -1, 1);
 }

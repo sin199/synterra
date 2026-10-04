@@ -6,7 +6,7 @@ import {
   DECISION_MIX, SOCIAL_COOLDOWN_WORLD_MINUTES, SOCIAL_SKILLS, addSkillGain, canCooperatePair, canSocializePair,
   chooseSocialPartner, clampPersonality, canonicalPair, clampSkill, deriveDominantRole, effectivePersonality,
   goalActionUtility, goalDescription, goalProgress, initialSkillValues, initialSocialProfile, lastRealizedSalePnl,
-  qualifyUtilityCandidates,
+  qualifyUtilityCandidates, qualifyLayeredStrategicCandidates,
   memoryForCompletedAction, recentMemoryUtility, reflectionDue, reflectionProposal, seededGoalSet,
   skillGainForAction
 } from './social-world.js';
@@ -22,6 +22,13 @@ import { foundWorldOrganization, decideOrganizationMembership, contributeOrganiz
   inviteWorldOrganization, listWorldOrganizations } from './world-organizations.js';
 import { shareWorldInformation, decideWorldInformationShare, expireInformationShares,
   listInformationInbox } from './world-information.js';
+import { applyToWorldBusinessJob, buildBusinessCandidates, closeWorldBusiness,
+  completeWorldBusinessShift, decideWorldBusinessApplication, distributeWorldBusinessProfit,
+  distributeWorldProjectRevenue, foundWorldBusiness, investInWorldBusiness, investInWorldProject,
+  leaveWorldBusinessJob, loadWorldBusinessContext, purchaseWorldBusinessService,
+  observeResidentEconomicMarket,
+  practiceWorldBusinessCapability, reviewWorldBusinessPrice, settleWorldBusinessMaintenance,
+  settleWorldPlaceMaintenance, explainBusinessOpportunityGaps } from './world-businesses.js';
 
 export const WORLD_TICK_MS = 1_000;
 const TYPE_SAFE_INTERVAL_MS = 30 * 60_000;
@@ -30,7 +37,11 @@ const ACTION_SECONDS = Object.freeze({ work: 16, cooperate: 16, learn: 11, rest:
   opportunity: 12, opportunity_reject: 8, opportunity_propose: 10, project_propose: 12, project_join: 10, project_reject: 8, project_contribute: 16,
   project_leave: 8, organization_found: 14, organization_join: 10, organization_reject: 8,
   organization_leave: 8, organization_invite: 10, organization_contribute: 12, information_share: 10,
-  information_accept: 8, information_ignore: 6, information_doubt: 8, goal_review: 10 });
+  information_accept: 8, information_ignore: 6, information_doubt: 8, goal_review: 10,
+  project_invest: 12, project_distribute: 10,
+  business_found: 18, business_service: 12, business_apply: 10, business_leave: 8, business_hire: 10,
+  business_work: 16, business_invest: 12, business_price: 10, business_distribute: 10, business_close: 10,
+  business_skill_practice: 12, business_seek_cofounder: 14 });
 const GOALS = Object.freeze(['wealth','learn','community','wellbeing','balanced','wealth','learn','community','wellbeing','balanced']);
 const RISK_TOLERANCE = Object.freeze([0.78,0.28,0.52,0.22,0.68,0.35,0.82,0.47,0.70,0.40]);
 const ALLOWED_GOALS = new Set(['wealth','learn','community','wellbeing','balanced']);
@@ -46,6 +57,7 @@ function initiativeSystem(action) {
   if (action.startsWith('project')) return 'project';
   if (action.startsWith('organization')) return 'organization';
   if (action.startsWith('information')) return 'information';
+  if (action.startsWith('business')) return 'business';
   return 'place';
 }
 
@@ -313,7 +325,8 @@ async function loadWorldInitiatives(client, worldId, worldMinutes, residents, sc
       FROM world_opportunities WHERE world_id=$1 AND creator_agent_id IS NOT NULL GROUP BY creator_agent_id`,
     [worldId, worldMinutes]),
     () => client.query(`SELECT agent_id AS "agentId",subject_type AS "subjectType",subject_key AS "subjectKey",
-        belief_key AS "beliefKey",estimate::text AS estimate,confidence::text AS confidence,sample_count AS "sampleCount"
+        belief_key AS "beliefKey",estimate::text AS estimate,confidence::text AS confidence,sample_count AS "sampleCount",
+        updated_world_minutes AS "updatedWorldMinutes",evidence
       FROM world_agent_beliefs WHERE world_id=$1 AND sample_count>0`, [worldId])
   ]);
   const byAgent = new Map(residents.map((resident) => [resident.agent_id, {
@@ -356,7 +369,8 @@ async function loadWorldInitiatives(client, worldId, worldMinutes, residents, sc
   });
   for (const pair of completedPairs.rows) byAgent.get(pair.agentId)?.organizationPartners.push(pair);
   for (const pair of completedPairs.rows) byAgent.get(pair.agentId)?.sharedProjectPartnerIds.push(pair.partnerId);
-  for (const belief of beliefs.rows) byAgent.get(belief.agentId)?.beliefs.push(belief);
+  for (const belief of beliefs.rows) byAgent.get(belief.agentId)?.beliefs.push({ ...belief,
+    updatedWorldMinutes: Number(belief.updatedWorldMinutes), evidence: safeJson(belief.evidence) });
   const residentById = new Map(residents.map((resident) => [resident.agent_id, resident]));
   const recentlyShared = new Map(recentShares.rows.map((share) =>
     [`${share.senderAgentId}:${share.recipientAgentId}`, Number(share.lastShareWorldTime)]));
@@ -423,7 +437,30 @@ async function loadWorldInitiatives(client, worldId, worldMinutes, residents, sc
     data.organizationPartners = data.organizationPartners.filter((partner) => !partner.alreadySharedOrganization);
     data.residentNames = residentById;
   }
-  return { byAgent, opportunities: activeOpportunities, projects: activeProjects, worldNeeds,
+  const economy = await loadWorldBusinessContext(client, worldId, worldMinutes, residents);
+  const organizationById = new Map(organizations.map((organization) => [organization.id, organization]));
+  for (const resident of residents) {
+    const data = byAgent.get(resident.agent_id);
+    if (!data) continue;
+    data.organizationMemberships = data.organizationMemberships.map((membership) => {
+      const organization = organizationById.get(membership.id);
+      return { ...membership, cashBalance: Number(organization?.cash_balance || 0) };
+    });
+    data.businesses = economy.businesses;
+    data.services = economy.services;
+    data.jobs = economy.jobs;
+    data.applications = economy.applications;
+    data.employment = economy.employment;
+    data.ownership = economy.ownership;
+    data.demand = economy.demand;
+    data.organizations = economy.organizations;
+    data.economicProjects = economy.projects;
+    data.places = economy.places;
+    data.residentSkills = economy.residentSkills;
+    data.worldMinutes = worldMinutes;
+    data.scenes = scenes;
+  }
+  return { byAgent, opportunities: activeOpportunities, projects: activeProjects, worldNeeds, economy,
     newIdeas: environmentOpportunityIdeas({ residents, scenes, worldMinutes, projects: activeProjects,
       opportunities: activeOpportunities }) };
 }
@@ -847,6 +884,12 @@ async function completeWorldInitiativeActivity(client, worldId, agent, runtime, 
         actionId: key, worldTime: nowWorld, contributionType: context.contributionType || 'work',
         skillValue: finite(agent.skills?.research) + finite(agent.skills?.engineering) + finite(agent.skills?.social)
           + finite(agent.skills?.trading), energy: agent.energy });
+    } else if (activity === 'project_invest') {
+      detail = await investInWorldProject(client, { worldId, projectId: context.projectId,
+        investorAgentId: agent.agentId, amount: context.amountUsdc, actionId: key, worldTime: nowWorld });
+    } else if (activity === 'project_distribute') {
+      detail = await distributeWorldProjectRevenue(client, { worldId, projectId: context.projectId,
+        ownerAgentId: agent.agentId, actionId: key, worldTime: nowWorld });
     } else if (activity === 'organization_found') {
       const proposal = safeJson(context.organizationProposal);
       detail = await foundWorldOrganization(client, { worldId, founderAgentId: agent.agentId,
@@ -863,7 +906,71 @@ async function completeWorldInitiativeActivity(client, worldId, agent, runtime, 
       const skillValue = Math.max(...Object.values(agent.skills || {}).map((value) => Number(value) || 0), 0);
       detail = await contributeOrganizationEffort(client, { worldId, organizationId: context.organizationId,
         agentId: agent.agentId, actionId: key, worldTime: nowWorld,
+        contributionType: context.contributionType || 'effort', amountUsdc: context.contributionAmountUsdc,
         effort: Math.max(0.1, Math.min(20, 1 + skillValue / 10 + finite(agent.energy) / 25)) });
+    } else if (activity === 'business_found') {
+      const proposal = safeJson(context.businessProposal);
+      detail = await foundWorldBusiness(client, { worldId, agentId: agent.agentId,
+        actionId: key, proposal, worldTime: nowWorld });
+    } else if (activity === 'business_skill_practice') {
+      detail = await practiceWorldBusinessCapability(client, { worldId, agentId: agent.agentId,
+        skill: context.preparationSkill, serviceType: context.preparationServiceType,
+        actionId: key, worldTime: nowWorld });
+    } else if (activity === 'business_seek_cofounder') {
+      const proposal = safeJson(context.cofounderProposal);
+      const organizationProposal = safeJson(proposal.organizationProposal);
+      const organization = await foundWorldOrganization(client, { worldId, founderAgentId: agent.agentId,
+        inviteAgentId: proposal.partnerId, projectId: organizationProposal.projectId,
+        name: organizationProposal.name, purpose: organizationProposal.purpose,
+        actionId: key, worldTime: nowWorld, metadata: { economicPreparation: true,
+          serviceType: proposal.serviceType, capabilityFit: proposal.capabilityFit } });
+      detail = { ...organization, partnerId: proposal.partnerId, partnerName: proposal.partnerName,
+        serviceType: proposal.serviceType, preparation: 'SEEK_COFOUNDER' };
+    } else if (activity === 'business_apply') {
+      detail = await applyToWorldBusinessJob(client, { worldId, jobId: context.jobId,
+        agentId: agent.agentId, actionId: key, worldTime: nowWorld });
+    } else if (activity === 'business_leave') {
+      detail = await leaveWorldBusinessJob(client, { worldId, employmentId: context.employmentId,
+        agentId: agent.agentId, actionId: key, worldTime: nowWorld });
+    } else if (activity === 'business_hire' || activity === 'business_reject') {
+      detail = await decideWorldBusinessApplication(client, { worldId, applicationId: context.applicationId,
+        founderAgentId: agent.agentId, decision: activity === 'business_hire' ? 'accept' : 'reject',
+        actionId: key, worldTime: nowWorld });
+    } else if (activity === 'business_work') {
+      detail = await completeWorldBusinessShift(client, { worldId, businessId: context.businessId,
+        serviceId: context.serviceId, employmentId: context.employmentId || null,
+        agentId: agent.agentId, actionId: key, worldTime: nowWorld });
+    } else if (activity === 'business_service') {
+      const service = (agent.services || []).find((item) => item.id === context.serviceId);
+      const demandRow = (agent.demand || []).find((item) => item.serviceType === service?.service_type);
+      const relation = agent.relationships.find((item) => item.otherAgentId === service?.founderAgentId);
+      const pricingContext = context.pricingContext || {};
+      detail = await purchaseWorldBusinessService(client, { worldId, serviceId: context.serviceId,
+        customerAgentId: agent.agentId, actionId: key, worldTime: nowWorld,
+        maxPriceUsdc: context.maxPriceUsdc,
+        demand: pricingContext.demand ?? demandRow?.demandCount ?? 1,
+        supply: pricingContext.supply ?? demandRow?.supplyCount ?? 0,
+        relationship: pricingContext.relationship ?? (relation ? Number(relation.familiarity) * 0.3
+          + Number(relation.trust) * 0.7 : 0),
+        wealth: pricingContext.wealth ?? agent.usdc,
+        priceSensitivity: pricingContext.priceSensitivity ?? agent.priceSensitivity });
+    } else if (activity === 'business_invest') {
+      detail = await investInWorldBusiness(client, { worldId, businessId: context.businessId,
+        investorAgentId: agent.agentId, amount: context.amountUsdc, fundingSource: context.fundingSource,
+        actionId: key, worldTime: nowWorld });
+    } else if (activity === 'business_price') {
+      const service = (agent.services || []).find((item) => item.id === context.serviceId);
+      const demandRow = (agent.demand || []).find((item) => item.serviceType === service?.service_type);
+      detail = await reviewWorldBusinessPrice(client, { worldId, businessId: context.businessId,
+        serviceId: context.serviceId, agentId: agent.agentId, direction: context.direction,
+        actionId: key, worldTime: nowWorld, demand: demandRow?.demandCount || 0,
+        supply: demandRow?.supplyCount || 0 });
+    } else if (activity === 'business_distribute') {
+      detail = await distributeWorldBusinessProfit(client, { worldId, businessId: context.businessId,
+        ownerAgentId: agent.agentId, actionId: key, worldTime: nowWorld });
+    } else if (activity === 'business_close') {
+      detail = await closeWorldBusiness(client, { worldId, businessId: context.businessId,
+        founderAgentId: agent.agentId, actionId: key, worldTime: nowWorld });
     } else if (activity === 'information_share') {
       const proposal = safeJson(context.informationProposal);
       detail = await shareWorldInformation(client, { worldId, senderAgentId: agent.agentId,
@@ -890,7 +997,8 @@ async function recordInitiativeOutcome(client, { worldId, agent, activity, resul
     : action.startsWith('opportunity') ? 'opportunity'
     : action.startsWith('project') ? 'project'
       : action.startsWith('organization') ? 'organization'
-        : action.startsWith('information') ? 'information' : null;
+        : action.startsWith('information') ? 'information'
+          : action.startsWith('business') ? 'business' : null;
   if (!system && action !== 'project_contribute') return;
   const stageForAction = {
     goal_review: details.replanned ? 'replanned' : 'blocked',
@@ -898,15 +1006,25 @@ async function recordInitiativeOutcome(client, { worldId, agent, activity, resul
     opportunity: 'accepted', opportunity_reject: 'rejected',
     project_propose: 'proposed', project_join: details.status === 'rejected' ? 'rejected' : 'joined',
     project_reject: 'rejected', project_contribute: details.completed ? 'completed' : 'progressed',
-    project_leave: 'abandoned', organization_found: details.status === 'active' ? 'formed' : 'proposed',
+    project_leave: 'abandoned', project_invest: 'invested', project_distribute: 'distributed',
+    organization_found: details.status === 'active' ? 'formed' : 'proposed',
     organization_join: 'joined',
     organization_reject: 'rejected', information_share: 'shared',
-    information_accept: 'accepted', information_ignore: 'ignored'
+    information_accept: 'accepted', information_ignore: 'ignored',
+    business_found: 'founded', business_service: 'purchased', business_apply: 'applied',
+    business_leave: 'left',
+    business_hire: 'hired', business_reject: 'rejected', business_work: 'produced',
+    business_invest: 'invested', business_price: 'price_changed', business_distribute: 'distributed',
+    business_close: 'closed', business_seek_cofounder: 'partner_sought',
+    business_skill_practice: 'capability_practiced'
   };
   const stage = result.abandoned ? 'blocked' : stageForAction[action];
   if (!stage) return;
-  const reasonCode = result.abandoned ? String(result.abandoned).toUpperCase().replace(/[^A-Z0-9_]/g, '_').slice(0, 64) : 'NONE';
-  const entityId = details.id || details.project?.id || details.opportunity?.id || null;
+  const reasonCode = result.abandoned ? String(result.abandoned).toUpperCase().replace(/[^A-Z0-9_]/g, '_').slice(0, 64)
+    : action === 'business_found' ? 'BUSINESS_STARTED'
+      : action === 'business_seek_cofounder' ? 'COFOUNDER_INVITED'
+        : action === 'business_skill_practice' ? 'CAPABILITY_PRACTICED' : 'NONE';
+  const entityId = details.id || details.businessId || details.orderId || details.project?.id || details.opportunity?.id || null;
   await recordEmergenceEvent(client, { worldId, agentId: agent.agentId, worldMinutes, tickCount, system, stage,
     reasonCode, eventKey: `initiative-outcome:${agent.agentId}:${tickCount}:${action}:${stage}`,
     candidateId: String(entityId || agent.planned_context?.projectId || agent.planned_context?.opportunityId || action),
@@ -958,6 +1076,70 @@ async function recordInitiativeOutcome(client, { worldId, agent, activity, resul
   }
 }
 
+async function recordEconomicBelief(client, { worldId, agentId, businessId, worldMinutes, evidence }) {
+  if (!businessId) return;
+  const result = await client.query(`SELECT business.founder_agent_id AS founder,
+      business.status,account.id AS account_id,
+      COALESCE(sum(posting.amount) FILTER (WHERE transaction.transaction_type='business_revenue'
+        AND posting.amount>0),0)::numeric AS revenue,
+      COALESCE(-sum(posting.amount) FILTER (WHERE transaction.transaction_type IN
+        ('business_expense','business_wage','maintenance') AND posting.amount<0),0)::numeric AS expenses
+    FROM world_businesses business LEFT JOIN world_economic_accounts account
+      ON account.world_id=business.world_id AND account.account_key='business:'||business.id::text
+        AND account.asset_symbol='USDC'
+    LEFT JOIN world_economic_postings posting ON posting.account_id=account.id
+    LEFT JOIN world_economic_transactions transaction ON transaction.id=posting.transaction_id
+    WHERE business.world_id=$1 AND business.id=$2
+    GROUP BY business.id,account.id`, [worldId, businessId]);
+  if (!result.rowCount) return;
+  const row = result.rows[0];
+  const revenue = Number(row.revenue) || 0;
+  const expenses = Number(row.expenses) || 0;
+  const netOperating = revenue - expenses;
+  const measuredRevenue = Number.isFinite(Number(evidence?.dailyRevenueUsdc))
+    ? Number(evidence.dailyRevenueUsdc) : revenue;
+  const measuredExpenses = Number.isFinite(Number(evidence?.dailyExpensesUsdc))
+    ? Number(evidence.dailyExpensesUsdc) : expenses;
+  const measuredNet = measuredRevenue - measuredExpenses;
+  const measuredEstimate = Math.max(-1, Math.min(1, measuredNet / Math.max(100, measuredRevenue + measuredExpenses)));
+  const stakeholders = await client.query(`SELECT $3::uuid AS agent_id
+      UNION SELECT owner_id FROM world_economic_ownership WHERE world_id=$1 AND asset_type='business'
+        AND asset_id=$2 AND owner_type='resident'
+      UNION SELECT agent_id FROM world_business_employment WHERE world_id=$1 AND business_id=$2`,
+  [worldId, businessId, row.founder]);
+  const upsert = async (residentId, beliefKey, value, confidence, details) => client.query(`INSERT INTO world_agent_beliefs(
+      world_id,agent_id,subject_type,subject_key,belief_key,estimate,confidence,sample_count,updated_world_minutes,evidence)
+    VALUES($1,$2,'business',$3,$4,$5,$6,1,$7,$8::jsonb)
+    ON CONFLICT(world_id,agent_id,subject_type,subject_key,belief_key) DO UPDATE SET
+      estimate=(world_agent_beliefs.estimate*world_agent_beliefs.sample_count+EXCLUDED.estimate)
+        /(world_agent_beliefs.sample_count+1),
+      confidence=LEAST(0.98,(world_agent_beliefs.sample_count+1)*0.08+EXCLUDED.confidence*0.2),
+      sample_count=world_agent_beliefs.sample_count+1,updated_world_minutes=EXCLUDED.updated_world_minutes,
+      evidence=EXCLUDED.evidence`, [worldId, residentId, businessId, beliefKey, value, confidence,
+    worldMinutes, JSON.stringify(details)]);
+  const financialEvidence = { ...(evidence || {}), status: row.status, revenueUsdc: measuredRevenue.toFixed(8),
+    operatingExpensesUsdc: measuredExpenses.toFixed(8), netOperatingResultUsdc: measuredNet.toFixed(8),
+    allTimeRevenueUsdc: revenue.toFixed(8), allTimeOperatingExpensesUsdc: expenses.toFixed(8),
+    allTimeNetOperatingResultUsdc: netOperating.toFixed(8),
+    measure: evidence?.action === 'business_daily_settlement'
+      ? 'posted_business_revenue_less_posted_daily_wages_expenses_and_maintenance'
+      : 'posted_business_revenue_less_posted_wages_expenses_and_maintenance' };
+  for (const stakeholder of stakeholders.rows) {
+    await upsert(stakeholder.agent_id, 'business_outcome', measuredEstimate,
+      Math.min(0.95, 0.25 + Math.log1p(revenue + expenses) / 20), financialEvidence);
+  }
+  if (evidence?.action === 'business_service') {
+    const benefit = evidence.benefit && typeof evidence.benefit === 'object' ? evidence.benefit : {};
+    const benefitValue = ['food','energy','social','happiness','knowledge']
+      .reduce((sum, key) => sum + Math.max(0, Number(benefit[key]) || 0), 0);
+    const price = Math.max(0, Number(evidence.amountUsdc) || 0);
+    const wealth = Math.max(1, Number(evidence.wealth) || 1);
+    const customerExperience = Math.max(-1, Math.min(1, benefitValue / 40 - price / wealth));
+    await upsert(agentId, 'service_experience', customerExperience, 0.35,
+      { ...financialEvidence, personalBenefit: benefit, paidUsdc: price.toFixed(8) });
+  }
+}
+
 async function completeActivity(client, worldId, agent, runtime, quotes, now, scene) {
   const activity = agent.planned_action;
   const place = agent.location;
@@ -968,11 +1150,9 @@ async function completeActivity(client, worldId, agent, runtime, quotes, now, sc
   let cooperativePartnerEventId = null;
   if (activity === 'work') {
     const dataCenter = agent.scene_type === 'data_center';
-    const amount = 20 + (stableInt(`${profile}:wage`) % (dataCenter ? 71 : 61));
-    await adjustUsdc(client, worldId, agent.agentId, `${amount}.00000000`, 'work_income',
-      `${actionId(agent.agentId, runtime.tick_count, 'work_income')}:USDC`, dataCenter ? 'simulated data center wages' : 'simulated workshop wages');
     needs = { energy: -8, food: -6, social: -2, happiness: 2, knowledge: dataCenter ? 3 : 1 };
-    result.income = { amount: `${amount}.00000000`, asset: 'USDC', simulated: true };
+    result.work = { output: dataCenter ? 'shared data-center operations' : 'shared workshop contribution',
+      usdcEarned: '0.00000000', fundedBy: null };
   } else if (activity === 'cooperate') {
     const pairId = canonicalPair(agent.agentId, agent.planned_partner_id);
     const partnerResult = pairId && scene && ['workshop', 'data_center'].includes(scene.sceneType) && scene.status === 'active'
@@ -995,13 +1175,6 @@ async function completeActivity(client, worldId, agent, runtime, quotes, now, sc
       needs.energy = -1;
     } else {
       const dataCenter = scene.sceneType === 'data_center';
-      const base = dataCenter ? 71 : 61;
-      const actorAmount = 20 + stableInt(`${profile}:coop-actor-wage`) % base;
-      const partnerAmount = 20 + stableInt(`${profile}:coop-partner-wage`) % base;
-      await adjustUsdc(client, worldId, agent.agentId, `${actorAmount}.00000000`, 'work_income',
-        `${actionId(agent.agentId, runtime.tick_count, 'cooperate_income')}:USDC`, 'simulated cooperative work income');
-      await adjustUsdc(client, worldId, partner.agentId, `${partnerAmount}.00000000`, 'work_income',
-        `${actionId(agent.agentId, runtime.tick_count, `cooperate_income:${agent.agentId}`)}:USDC`, 'simulated cooperative work income');
       needs = { energy: -8, food: -6, social: 1, happiness: 4, knowledge: dataCenter ? 3 : 2 };
       const partnerNeeds = updatedNeeds(partner, { energy: -6, food: -4, social: 1, happiness: 3, knowledge: dataCenter ? 2 : 1 });
       await client.query(`UPDATE world_members SET energy=$3,food=$4,social=$5 WHERE world_id=$1 AND agent_id=$2`,
@@ -1019,15 +1192,12 @@ async function completeActivity(client, worldId, agent, runtime, quotes, now, sc
         RETURNING familiarity::text AS familiarity,trust::text AS trust,affinity::text AS affinity,
           interaction_count AS "interactionCount"`, [worldId, pairId[0], pairId[1], runtime.world_minutes])).rows[0];
       result.cooperation = { partnerId: partner.agentId, partnerName: partner.name,
-        actorIncomeUsd: `${actorAmount}.00000000`, partnerIncomeUsd: `${partnerAmount}.00000000`,
-        incomeUsd: `${actorAmount + partnerAmount}.00000000`, relationship };
-      needs.incomeUsd = actorAmount;
+        output: dataCenter ? 'shared data-center operations' : 'shared workshop contribution', relationship };
       await setMindGoal(client, worldId, partner.agentId, partner.currentGoal || partner.goal, 'cooperate',
-        `Worked with ${agent.name} at ${place} and earned ${partnerAmount}.00000000 simulated USDC.`);
+        `Worked with ${agent.name} at ${place}; the shift improved shared capability and their relationship.`);
       await recordWorldEvent(client, worldId, agent.agentId, runtime.tick_count, 'world.cooperation_completed', {
         partnerId: partner.agentId, partnerName: partner.name, place, worldMinutes: runtime.world_minutes,
-        actorIncomeUsd: result.cooperation.actorIncomeUsd, partnerIncomeUsd: result.cooperation.partnerIncomeUsd,
-        relationship
+        output: result.cooperation.output, relationship
       });
     }
   } else if (activity === 'learn') {
@@ -1076,16 +1246,24 @@ async function completeActivity(client, worldId, agent, runtime, quotes, now, sc
       needs.energy = -1;
     }
   } else if (['goal_review','opportunity','opportunity_reject','opportunity_propose','project_propose','project_join','project_reject','project_contribute','project_leave',
+    'project_invest','project_distribute',
     'organization_found','organization_join','organization_reject','organization_leave','organization_invite',
-    'organization_contribute','information_share','information_accept','information_ignore','information_doubt'].includes(activity)) {
+    'organization_contribute','information_share','information_accept','information_ignore','information_doubt',
+    'business_found','business_service','business_apply','business_leave','business_hire','business_reject','business_work',
+    'business_invest','business_price','business_distribute','business_close','business_skill_practice','business_seek_cofounder'].includes(activity)) {
     const initiative = await completeWorldInitiativeActivity(client, worldId, agent, runtime, activity);
+    result.initiativeAction = activity;
     if (initiative.error) result.abandoned = initiative.error;
     else {
       result.initiative = initiative.detail;
-      result.initiativeAction = activity;
       needs = { energy: activity === 'project_contribute' ? -6 : -2, food: -1,
         social: activity === 'information_share' || activity === 'organization_found' ? 1 : 0,
         happiness: initiative.detail?.completed ? 3 : 1, knowledge: 0 };
+      if (activity === 'business_service' && initiative.detail?.benefit) {
+        for (const key of ['energy','food','social','happiness','knowledge']) {
+          needs[key] = (Number(needs[key]) || 0) + (Number(initiative.detail.benefit[key]) || 0);
+        }
+      }
       if (activity === 'opportunity' || activity === 'opportunity_reject') {
         result.opportunity = initiative.detail;
         if (activity === 'opportunity' && initiative.detail?.status === 'completed') needs.knowledge = 2;
@@ -1106,7 +1284,7 @@ async function completeActivity(client, worldId, agent, runtime, quotes, now, sc
       movement_started_at=NULL,movement_ends_at=NULL,action_started_at=NULL,action_ends_at=NULL,
       next_decision_at=$5,updated_at=$6 WHERE world_id=$1 AND agent_id=$2`,
   [worldId, agent.agentId, next.happiness, next.knowledge, new Date(now.getTime() + 5_000 + stableInt(`${profile}:think`) % 11_000), now]);
-  const summary = activity === 'work' ? `Completed a paid shift at ${place}.`
+  const summary = activity === 'work' ? `Contributed a work shift at ${place}; shared work does not mint simulated USDC.`
     : activity === 'learn' ? `Studied at ${place} and gained knowledge.`
       : activity === 'rest' ? `Rested at ${place}.`
         : activity === 'eat' ? `Ate at ${place}.`
@@ -1125,7 +1303,7 @@ async function completeActivity(client, worldId, agent, runtime, quotes, now, sc
     cooperativePartnerEventId = await recordWorldEvent(client, worldId, result.cooperation.partnerId,
       runtime.tick_count, 'world.action_completed', {
         action: 'cooperate', partnerId: agent.agentId, partnerName: agent.name, place, status: 'completed',
-        incomeUsd: result.cooperation.partnerIncomeUsd, worldMinutes: finite(runtime.world_minutes)
+        output: result.cooperation.output, worldMinutes: finite(runtime.world_minutes)
       });
   }
   if (socialInteraction) {
@@ -1136,7 +1314,7 @@ async function completeActivity(client, worldId, agent, runtime, quotes, now, sc
   } else if (activity === 'cooperate' && result.cooperation) {
     const actorMemory = memoryForCompletedAction({ action: 'cooperate', result, place, worldMinutes: runtime.world_minutes });
     const partnerMemory = memoryForCompletedAction({ action: 'cooperate', place, worldMinutes: runtime.world_minutes,
-      result: { cooperation: { partnerId: agent.agentId, partnerName: agent.name, incomeUsd: result.cooperation.partnerIncomeUsd } } });
+      result: { cooperation: { partnerId: agent.agentId, partnerName: agent.name, output: result.cooperation.output } } });
     await applySkillGains(client, worldId, agent.agentId, activity, place, true);
     await applySkillGains(client, worldId, result.cooperation.partnerId, activity, place, true);
     if (actorMemory) await recordResidentMemory(client, { worldId, agentId: agent.agentId, ...actorMemory,
@@ -1184,11 +1362,70 @@ async function completeActivity(client, worldId, agent, runtime, quotes, now, sc
         for (const participant of participants.rows) await refreshSocialProfile(client, worldId, participant.agent_id,
           runtime.world_minutes, completionEventId);
       }
+    } else if (initiativeAction === 'project_invest' || initiativeAction === 'project_distribute') {
+      const investment = initiativeAction === 'project_invest';
+      memoryType = 'economic';
+      importance = result.initiative?.idempotent ? 0.25 : 0.58;
+      const project = (agent.economicProjects || []).find((item) => item.id === result.initiative?.projectId
+        || item.id === agent.planned_context?.projectId);
+      const projectName = result.initiative?.title || project?.title || 'a shared project';
+      summary = investment
+        ? `Invested ${result.initiative?.amountUsdc || 'simulated USDC'} in ${projectName} and received a recorded ownership share.`
+        : `Distributed ${result.initiative?.distributedUsdc || 'simulated USDC'} from ${projectName} to its owners.`;
+      await client.query(`INSERT INTO world_agent_beliefs(world_id,agent_id,subject_type,subject_key,belief_key,
+          estimate,confidence,sample_count,updated_world_minutes,evidence)
+        VALUES($1,$2,'project',$3,'economic_outcome',$4,0.25,1,$5,$6::jsonb)
+        ON CONFLICT(world_id,agent_id,subject_type,subject_key,belief_key) DO UPDATE SET
+          estimate=(world_agent_beliefs.estimate*world_agent_beliefs.sample_count+EXCLUDED.estimate)
+            /(world_agent_beliefs.sample_count+1),
+          confidence=LEAST(0.95,(world_agent_beliefs.sample_count+1)*0.08),
+          sample_count=world_agent_beliefs.sample_count+1,updated_world_minutes=EXCLUDED.updated_world_minutes,
+          evidence=EXCLUDED.evidence`, [worldId, agent.agentId, result.initiative?.projectId || agent.planned_context?.projectId,
+        investment ? 0.1 : Number(result.initiative?.distributedUsdc) > 0 ? 0.55 : -0.1,
+        runtime.world_minutes, JSON.stringify({ action: initiativeAction,
+          amountUsdc: result.initiative?.amountUsdc || result.initiative?.distributedUsdc || null,
+          share: result.initiative?.share || null, projectName })]);
     } else if (initiativeAction.startsWith('organization_')) {
       skillAction = 'socialize';
       memoryType = 'organization';
       importance = result.initiative?.created ? 0.7 : 0.4;
       summary = `${initiativeAction.replaceAll('_', ' ')} updated a resident organization.`;
+    } else if (initiativeAction.startsWith('business_')) {
+      const business = (agent.businesses || []).find((item) => item.id === result.initiative?.businessId
+        || item.id === result.initiative?.id || item.id === result.initiative?.businessId);
+      const businessName = result.initiative?.name || result.initiative?.businessName || business?.name || 'a resident business';
+      memoryType = 'business';
+      importance = initiativeAction === 'business_found' || initiativeAction === 'business_close' ? 0.68 : 0.5;
+      skillAction = initiativeAction === 'business_work' ? 'work'
+        : initiativeAction === 'business_service' ? (result.initiative?.serviceType === 'food_service'
+          || result.initiative?.serviceType === 'social_service' ? 'social'
+          : result.initiative?.serviceType === 'engineering_service' ? 'work' : 'learn')
+          : initiativeAction === 'business_seek_cofounder' ? 'socialize'
+          : initiativeAction === 'business_found' ? 'work' : null;
+      if (initiativeAction === 'business_found') summary = `Committed ${result.initiative?.capitalUsdc || 'simulated USDC'} to start ${businessName} around observed demand.`;
+      else if (initiativeAction === 'business_skill_practice') {
+        memoryType = 'learning';
+        summary = `Practiced ${result.initiative?.skill || 'a skill'} after noticing demand for ${result.initiative?.serviceType || 'a service'}, gaining ${result.initiative?.skillGain || 0} capability.`;
+      }
+      else if (initiativeAction === 'business_seek_cofounder') summary = `Invited ${result.initiative?.partnerName || 'a trusted collaborator'} to explore a ${result.initiative?.serviceType || 'service'} partnership.`;
+      else if (initiativeAction === 'business_service') summary = `Paid ${result.initiative?.priceUsdc || 'simulated USDC'} for ${result.initiative?.serviceName || 'a service'}; the service changed personal needs and funded its provider.`;
+      else if (initiativeAction === 'business_work') summary = `Produced a ${result.initiative?.serviceType || 'service'} unit for ${businessName}${result.initiative?.wageUsdc ? ` and received a funded ${result.initiative.wageUsdc} shift wage` : ''}.`;
+      else if (initiativeAction === 'business_invest') summary = `Invested ${result.initiative?.amountUsdc || 'simulated USDC'} in ${businessName} for an ownership share.`;
+      else if (initiativeAction === 'business_close') summary = `Closed ${businessName} after its finances no longer supported continuing.`;
+      else if (initiativeAction === 'business_apply') summary = `Applied for a funded role at ${businessName}.`;
+      else if (initiativeAction === 'business_leave') summary = `Left the ${result.initiative?.role || 'role'} position at ${businessName}.`;
+      else if (initiativeAction === 'business_hire') summary = `Accepted an application and created paid employment at ${businessName}.`;
+      else if (initiativeAction === 'business_reject') summary = `Declined a job application at ${businessName}.`;
+      else if (initiativeAction === 'business_price') summary = `Adjusted the service price at ${businessName} after reviewing demand and supply.`;
+      else if (initiativeAction === 'business_distribute') summary = `Distributed ${result.initiative?.distributedUsdc || 'simulated USDC'} from realized profit at ${businessName}.`;
+      const businessId = result.initiative?.businessId || agent.planned_context?.businessId
+        || (['business_found','business_close'].includes(initiativeAction) ? result.initiative?.id : null);
+      await recordEconomicBelief(client, { worldId, agentId: agent.agentId,
+        businessId,
+        worldMinutes: runtime.world_minutes, evidence: { action: initiativeAction,
+          amountUsdc: result.initiative?.priceUsdc || result.initiative?.amountUsdc || null,
+          benefit: result.initiative?.benefit || null, wealth: agent.usdc,
+          serviceType: result.initiative?.serviceType || null, status: result.initiative?.status || null } });
     } else if (initiativeAction.startsWith('information_')) {
       memoryType = 'information';
       importance = initiativeAction === 'information_accept' ? 0.46 : 0.35;
@@ -1207,7 +1444,7 @@ async function completeActivity(client, worldId, agent, runtime, quotes, now, sc
       sourceEventId: completionEventId });
     await refreshSocialProfile(client, worldId, agent.agentId, runtime.world_minutes, completionEventId);
   } else if (activity !== 'socialize' && !result.abandoned) {
-    const meaningful = activity === 'work' && result.income || activity === 'learn' && result.learning || activity === 'trade' && result.trade;
+    const meaningful = activity === 'work' && result.work || activity === 'learn' && result.learning || activity === 'trade' && result.trade;
     if (meaningful) {
       await applySkillGains(client, worldId, agent.agentId, activity, place);
       const memory = memoryForCompletedAction({ action: activity, result, place, worldMinutes: runtime.world_minutes });
@@ -1262,10 +1499,13 @@ async function ensureAgentRows(pool, worldId) {
       const social = initialSocialProfile(member.agent_id, index);
       const skills = initialSkillValues(member.agent_id, index);
       await client.query(`INSERT INTO world_social_profiles(world_id,agent_id,sociability,curiosity,discipline,ambition,
-          primary_goal,goal_started_world_minutes,dominant_role)
-        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT(world_id,agent_id) DO NOTHING`,
+          price_sensitivity,primary_goal,goal_started_world_minutes,dominant_role)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT(world_id,agent_id) DO NOTHING`,
       [worldId, member.agent_id, social.sociability, social.curiosity, social.discipline, social.ambition,
-        social.primaryGoal, worldMinutes, deriveDominantRole(skills, social.primaryGoal)]);
+        social.priceSensitivity, social.primaryGoal, worldMinutes, deriveDominantRole(skills, social.primaryGoal)]);
+      await client.query(`UPDATE world_social_profiles SET price_sensitivity=$3,updated_at=now()
+        WHERE world_id=$1 AND agent_id=$2 AND price_sensitivity=0.500`,
+      [worldId, member.agent_id, social.priceSensitivity]);
       const currentProfile = (await client.query(`SELECT primary_goal FROM world_social_profiles
         WHERE world_id=$1 AND agent_id=$2`, [worldId, member.agent_id])).rows[0];
       const seeded = seededGoalSet(member.agent_id, index);
@@ -1313,6 +1553,7 @@ async function readEngineSnapshot(pool, worldId) {
         p.sociability::text AS sociability,p.curiosity::text AS curiosity,p.discipline::text AS discipline,p.ambition::text AS ambition,
         p.primary_goal AS "primaryGoal",p.goal_progress::text AS "goalProgress",p.dominant_role AS "dominantRole",
         p.personality_modifiers AS "personalityModifiers",p.risk_modifier::text AS "riskModifier",
+        p.price_sensitivity::text AS "priceSensitivity",
         COALESCE((SELECT jsonb_object_agg(skill_name,skill_value) FROM world_agent_skills k
           WHERE k.world_id=m.world_id AND k.agent_id=m.agent_id),'{}'::jsonb) AS skills,
         COALESCE((SELECT jsonb_agg(jsonb_build_object('goalType',g.goal_type,'category',g.category,
@@ -1398,6 +1639,9 @@ async function runStrategicTypeSafe(pool, worldId, chooseWithTypeSafe, runtimeSt
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+    // World ticks lock resident state before updating goals; use the same order to avoid deadlocks.
+    await client.query(`UPDATE world_agent_states SET goal=$3,updated_at=now() WHERE world_id=$1 AND agent_id=$2`,
+      [worldId, resident.agentId, goalCandidate.legacyGoal]);
     await client.query(`UPDATE world_agent_goals SET status='paused',updated_world_minutes=$3,updated_at=now()
       WHERE world_id=$1 AND agent_id=$2 AND goal_type='primary' AND status='active'`,
     [worldId, resident.agentId, snapshot.runtime.world_minutes]);
@@ -1406,8 +1650,6 @@ async function runStrategicTypeSafe(pool, worldId, chooseWithTypeSafe, runtimeSt
       VALUES($1,$2,'primary',$3,$4,1,$5,$5,'strategy',$6::jsonb) ON CONFLICT DO NOTHING`,
     [worldId, resident.agentId, selectedGoal, goalCandidate.goal, snapshot.runtime.world_minutes,
       JSON.stringify({ selectedBy: 'typesafe', model: selection.model || null })]);
-    await client.query(`UPDATE world_agent_states SET goal=$3,updated_at=now() WHERE world_id=$1 AND agent_id=$2`,
-      [worldId, resident.agentId, goalCandidate.legacyGoal]);
     await client.query(`UPDATE agent_minds SET current_goal=$3,updated_at=now() WHERE world_id=$1 AND agent_id=$2`,
       [worldId, resident.agentId, goalCandidate.description]);
     await client.query(`UPDATE world_social_profiles SET primary_goal=$3,goal_progress=0,goal_milestones=0,
@@ -1425,10 +1667,10 @@ async function runStrategicTypeSafe(pool, worldId, chooseWithTypeSafe, runtimeSt
     model: selection.model || null, costUsd: selection.costUsd ?? null };
 }
 
-export async function startWorldEngine(pool, { onError = () => {}, onStatus = () => {}, chooseWithTypeSafe = null,
+export async function startWorldEngine(pool, { worldId: requestedWorldId = null, onError = () => {}, onStatus = () => {}, chooseWithTypeSafe = null,
   runtimeState = null, fruitfly = null, tickMs = WORLD_TICK_MS, nowProvider = () => Date.now(), schedule = true } = {}) {
-  const worldResult = await pool.query(`SELECT w.id FROM worlds w WHERE w.open=true
-    ORDER BY w.created_at DESC LIMIT 1`);
+  const worldResult = await pool.query(`SELECT w.id FROM worlds w WHERE w.open=true AND ($1::uuid IS NULL OR w.id=$1)
+    ORDER BY w.created_at DESC LIMIT 1`, [requestedWorldId]);
   if (!worldResult.rowCount) return { running: false, reason: 'no_open_world', stop: async () => {} };
   const worldId = worldResult.rows[0].id;
   await ensureAgentRows(pool, worldId);
@@ -1477,12 +1719,37 @@ export async function startWorldEngine(pool, { onError = () => {}, onStatus = ()
         const elapsed = Math.max(1, Math.min(MAX_CATCH_UP_SECONDS,
           Math.floor((now.getTime() - (Number.isFinite(previousAt) ? previousAt : now.getTime())) / 1_000)));
         const tickCount = Number(clock.tick_count) + elapsed;
-        const worldMinutes = Number(clock.world_minutes) + elapsed;
-        const oldHour = Math.floor(Number(clock.world_minutes) / 60);
-        const newHour = Math.floor(worldMinutes / 60);
-        const decayHours = Math.min(24, Math.max(0, newHour - oldHour));
-        await client.query(`UPDATE world_runtime_state SET tick_count=$2,world_minutes=$3,last_tick_at=$4,updated_at=$4
+      const worldMinutes = Number(clock.world_minutes) + elapsed;
+      const oldHour = Math.floor(Number(clock.world_minutes) / 60);
+      const newHour = Math.floor(worldMinutes / 60);
+      const oldWorldDay = Math.floor(Number(clock.world_minutes) / 1_440);
+      const newWorldDay = Math.floor(worldMinutes / 1_440);
+      const decayHours = Math.min(24, Math.max(0, newHour - oldHour));
+      await client.query(`UPDATE world_runtime_state SET tick_count=$2,world_minutes=$3,last_tick_at=$4,updated_at=$4
           WHERE world_id=$1`, [worldId, tickCount, worldMinutes, now]);
+      if (newWorldDay > oldWorldDay) {
+        const businessSettlement = await settleWorldBusinessMaintenance(client, { worldId, worldTime: newWorldDay * 1_440 });
+        for (const outcome of businessSettlement.outcomes || []) {
+          await recordEconomicBelief(client, { worldId, agentId: outcome.founderAgentId, businessId: outcome.id,
+            worldMinutes: newWorldDay * 1_440, evidence: { action: 'business_daily_settlement',
+              dailyRevenueUsdc: outcome.dailyRevenueUsdc, dailyExpensesUsdc: outcome.dailyExpensesUsdc,
+              dailyOperatingResultUsdc: outcome.dailyNetOperatingResultUsdc,
+              consecutiveLossDays: outcome.consecutiveLossDays, missedMaintenanceDays: outcome.missedMaintenanceDays,
+              bankruptcyReason: outcome.bankruptcyReason } });
+          const result = Number(outcome.dailyNetOperatingResultUsdc) || 0;
+          const sign = result < -1e-8 ? 'lost' : result > 1e-8 ? 'earned' : 'broke even';
+          await recordConsolidatedMemory(client, { worldId, agentId: outcome.founderAgentId,
+            summary: `${outcome.name} ${sign} ${Math.abs(result).toFixed(2)} simulated USDC on world day ${businessSettlement.day}; status ${outcome.status}.`,
+            importance: outcome.status === 'bankrupt' ? 0.9 : result < 0 ? 0.58 : 0.48,
+            worldMinutes: newWorldDay * 1_440, key: `business:${outcome.id}:daily-outcome`,
+            metadata: { businessId: outcome.id, worldDay: businessSettlement.day, status: outcome.status,
+              dailyRevenueUsdc: outcome.dailyRevenueUsdc, dailyExpensesUsdc: outcome.dailyExpensesUsdc,
+              dailyNetOperatingResultUsdc: outcome.dailyNetOperatingResultUsdc,
+              consecutiveLossDays: outcome.consecutiveLossDays, missedMaintenanceDays: outcome.missedMaintenanceDays,
+              bankruptcyReason: outcome.bankruptcyReason } });
+        }
+        await settleWorldPlaceMaintenance(client, { worldId, worldTime: newWorldDay * 1_440 });
+      }
         const quoteResult = await client.query(`SELECT symbol,price_usd::text AS "priceUsd",quote_version AS "quoteVersion",as_of AS "asOf",source
           FROM crypto_market_quotes ORDER BY symbol`);
         const quotes = quoteResult.rows.map((quote) => ({ ...quote, quoteVersion: Number(quote.quoteVersion) }));
@@ -1518,6 +1785,7 @@ export async function startWorldEngine(pool, { onError = () => {}, onStatus = ()
             p.ambition::text AS ambition,p.primary_goal AS primary_goal,p.goal_progress::text AS goal_progress,
             p.goal_milestones AS goal_milestones,p.dominant_role AS dominant_role,
             p.personality_modifiers,p.risk_modifier::text AS risk_modifier,
+            p.price_sensitivity::text AS price_sensitivity,
             p.last_reflection_world_minutes AS last_reflection_world_minutes,
             COALESCE((SELECT jsonb_object_agg(k.skill_name,k.skill_value) FROM world_agent_skills k
               WHERE k.world_id=m.world_id AND k.agent_id=m.agent_id),'{}'::jsonb) AS skills,
@@ -1607,6 +1875,7 @@ export async function startWorldEngine(pool, { onError = () => {}, onStatus = ()
             lastTradeAt: row.last_trade_at, planned_paid_meal: row.planned_paid_meal,
             social_partner_id: row.planned_partner_id,
             riskTolerance: clamp(finite(row.risk_tolerance) + finite(row.risk_modifier), 0, 1),
+            priceSensitivity: finite(row.price_sensitivity, 0.5),
             sociability: finite(row.sociability, 0.5), curiosity: finite(row.curiosity, 0.5),
             discipline: finite(row.discipline, 0.5), ambition: finite(row.ambition, 0.5),
             personalityModifiers: safeJson(row.personality_modifiers),
@@ -1658,7 +1927,8 @@ export async function startWorldEngine(pool, { onError = () => {}, onStatus = ()
                 && other.agent_id !== agent.agentId && other.status === 'idle').map((other) => {
                   const relationship = agent.relationships.find((item) => item.otherAgentId === other.agent_id) || null;
                   return { agentId: other.agent_id, name: other.name, status: other.status, location: other.location,
-                    energy: other.energy, food: other.food, skills: safeJson(other.skills), relationship,
+                    energy: other.energy, food: other.food, social: other.social, knowledge: other.knowledge,
+                    primaryGoal: other.primary_goal, skills: safeJson(other.skills), relationship,
                     lastInteractionWorldMinutes: relationship?.lastInteractionWorldMinutes };
                 })]));
           const utilityCandidates = buildActivityCandidates(agent, scenes, { tick: tickCount, worldMinutes, nowMs, quotes,
@@ -1702,8 +1972,18 @@ export async function startWorldEngine(pool, { onError = () => {}, onStatus = ()
               crowdedPlaces: initiativeData.crowdedPlaces || [], opportunities: initiativeData.opportunities || [],
               projects: initiativeData.projects || [], goalStagnation: agent.goalStagnation || { stagnant: false },
               activePlaceCount: initiativeData.activePlaceCount || scenes.filter((scene) => scene.status === 'active').length };
+            let businessContext = initiativeContext;
+            if (strategicDue) {
+              const marketView = await observeResidentEconomicMarket(client, { worldId, agent,
+                context: { ...initiativeContext, residentsAtLocation }, worldMinutes });
+              agent.demand = marketView.demand;
+              agent.services = marketView.services;
+              businessContext = { ...initiativeContext, ...marketView,
+                residentsAtLocation, demand: marketView.demand };
+            }
+            const businessCandidates = strategicDue ? buildBusinessCandidates(agent, businessContext) : [];
             const initiativeCandidates = strategicDue
-              ? buildWorldInitiativeCandidates(agent, initiativeContext) : [];
+              ? [...buildWorldInitiativeCandidates(agent, initiativeContext), ...businessCandidates] : [];
             let candidates;
             let decisionLayer = 'tactical';
             let qualifiedStrategicCandidates = [];
@@ -1715,12 +1995,30 @@ export async function startWorldEngine(pool, { onError = () => {}, onStatus = ()
                 if (candidate.action === 'project_contribute' && (agent.energy < 20 || agent.food < 10)) return false;
                 return true;
               });
-              qualifiedStrategicCandidates = qualifyUtilityCandidates(permittedInitiatives);
+              qualifiedStrategicCandidates = qualifyLayeredStrategicCandidates(permittedInitiatives);
+              for (const gap of explainBusinessOpportunityGaps(agent, businessContext, businessCandidates)) {
+                const reasonCodes = [gap.reasonCode, ...(gap.additionalReasonCodes || [])];
+                for (const reasonCode of new Set(reasonCodes)) await recordEmergenceEvent(client, {
+                  worldId, agentId: agent.agentId, worldMinutes, tickCount, system: 'business',
+                  stage: reasonCode === 'CANDIDATE_CREATED' ? 'candidate_created' : 'blocked', reasonCode,
+                  eventKey: `business-opportunity:${agent.agentId}:${tickCount}:${gap.serviceType}:${reasonCode}`,
+                  candidateId: `${gap.serviceType}:${gap.action || 'none'}`, action: gap.action || 'business_found',
+                  utilityScore: businessCandidates.find((item) => item.businessProposal?.serviceType === gap.serviceType
+                    || item.preparationServiceType === gap.serviceType || item.cofounderProposal?.serviceType === gap.serviceType)?.score,
+                  details: { demandCount: gap.demandCount, supplyCount: gap.supplyCount, unmetCount: gap.unmetCount,
+                    capabilityFit: gap.capabilityFit, ownCapabilityFit: gap.ownCapabilityFit,
+                    teamCapabilityFit: gap.teamCapabilityFit, requiredSkill: gap.requiredSkill,
+                    capitalAvailable: gap.capitalAvailable, learningAvailable: gap.learningAvailable,
+                    partnerAvailable: gap.partnerAvailable, awareness: gap.awareness,
+                    marketKnown: gap.known, decisionLayer: 'economic' }
+                });
+              }
               for (const candidate of initiativeCandidates) {
                 const eligible = qualifiedStrategicCandidates.some((item) => item.id === candidate.id);
                 const reasonCode = needsBlocked ? (agent.energy < minimumEnergy ? 'ENERGY_LOW' : 'FOOD_LOW')
                   : eligible ? 'NONE' : candidate.action === 'project_contribute'
-                    && (agent.energy < 20 || agent.food < 10) ? 'NEEDS_HARD_GATE' : 'UTILITY_BELOW_THRESHOLD';
+                    && (agent.energy < 20 || agent.food < 10) ? 'NEEDS_HARD_GATE'
+                    : candidate.action.startsWith('business_') ? 'CANDIDATE_FILTERED' : 'UTILITY_BELOW_THRESHOLD';
                 await recordEmergenceEvent(client, { worldId, agentId: agent.agentId, worldMinutes, tickCount,
                   system: initiativeSystem(candidate.action),
                   stage: eligible ? 'eligible' : 'blocked', reasonCode,
@@ -1728,7 +2026,8 @@ export async function startWorldEngine(pool, { onError = () => {}, onStatus = ()
                   candidateId: candidate.id, action: candidate.action, utilityScore: candidate.score,
                   details: { goalStagnant: Boolean(agent.goalStagnation?.stagnant),
                     worldNeedCount: initiativeContext.worldNeeds?.length || 0,
-                    proposalReasons: candidate.projectProposal?.metadata?.proposalReasons || [] } });
+                    proposalReasons: candidate.projectProposal?.metadata?.proposalReasons || [],
+                    filterReason: !eligible && candidate.action.startsWith('business_') ? 'UTILITY_BELOW_THRESHOLD' : null } });
                 await recordEmergenceEvent(client, { worldId, agentId: agent.agentId, worldMinutes, tickCount,
                   system: initiativeSystem(candidate.action),
                   stage: 'considered', eventKey: `strategic-considered:${agent.agentId}:${tickCount}:${candidate.id}`,
@@ -1759,17 +2058,26 @@ export async function startWorldEngine(pool, { onError = () => {}, onStatus = ()
             let decision = null;
             let usedFruitfly = false;
             if (fruitfly && candidates.length) {
+              const businessBeliefs = agent.beliefs.filter((belief) => belief.subjectType === 'business'
+                && belief.beliefKey === 'business_outcome');
+              const marketBeliefs = agent.beliefs.filter((belief) => belief.subjectType === 'market'
+                && belief.beliefKey === 'unmet_demand');
+              const economicOutcome = businessBeliefs.length ? businessBeliefs.reduce((sum, belief) =>
+                sum + Number(belief.estimate || 0) * Number(belief.confidence || 0), 0) / businessBeliefs.length : 0;
               flyObservation = { self: { agentId: agent.agentId, energy: agent.energy, food: agent.food, social: agent.social,
-                  riskTolerance: agent.riskTolerance },
+                  riskTolerance: agent.riskTolerance, usdc: agent.usdc, knowledge: agent.knowledge },
                 mind: { archetype: agent.archetype || 'observer', traits: { ...safeJson(agent.traits),
                     curiosity: agent.curiosity, craft: finite(agent.skills?.engineering) / 100 },
                   actionsTaken: agent.actions_taken, memories: agent.recentMemories,
                   goals: agent.goals, beliefs: agent.beliefs, relationships: agent.relationships,
+                  skills: agent.skills, economic: { outcome: economicOutcome,
+                    marketOpportunity: marketBeliefs.reduce((sum, belief) => sum + Math.max(0, Number(belief.estimate) || 0), 0)
+                      / Math.max(1, marketBeliefs.length), capital: agent.usdc,
+                    recentExperience: agent.recentMemories.filter((memory) => memory.memoryType === 'business'
+                      || memory.memoryType === 'economic').length },
                   personality: { ...agent.personalityModifiers, sociability: agent.sociability, curiosity: agent.curiosity,
                     discipline: agent.discipline, ambition: agent.ambition } } };
-              flyCandidates = candidates.map(({ id, action, targetLocation, goal, description, plannedPaidMeal,
-                side, asset, quoteUnits, score, socialPartnerId, socialPartnerName }) => ({ id, action, targetLocation, goal, description, plannedPaidMeal,
-                side, asset, quoteUnits, score, socialPartnerId, socialPartnerName }));
+              flyCandidates = candidates.map((candidate) => ({ ...candidate }));
               try {
               const choice = fruitfly.choose(agent.agentId, flyObservation, flyCandidates, candidates[0]);
               const selectedCandidate = candidates.find((candidate) => candidate.id === choice?.candidate?.id);
@@ -1792,9 +2100,10 @@ export async function startWorldEngine(pool, { onError = () => {}, onStatus = ()
                 if (candidate.id === activity.id) continue;
                 await recordEmergenceEvent(client, { worldId, agentId: agent.agentId, worldMinutes, tickCount,
                   system: initiativeSystem(candidate.action),
-                  stage: 'not_selected', reasonCode: 'FRUITFLY_NOT_SELECTED',
+                  stage: 'not_selected', reasonCode: candidate.action.startsWith('business_') ? 'NOT_SELECTED' : 'FRUITFLY_NOT_SELECTED',
                   eventKey: `fruitfly-not-selected:${agent.agentId}:${tickCount}:${candidate.id}`,
-                  candidateId: candidate.id, action: candidate.action, utilityScore: candidate.score });
+                  candidateId: candidate.id, action: candidate.action, utilityScore: candidate.score,
+                  details: candidate.action.startsWith('business_') ? { filterReason: 'Fruitfly selected another qualified candidate.' } : {} });
               }
               const chosenSystem = initiativeSystem(activity.action);
               await recordEmergenceEvent(client, { worldId, agentId: agent.agentId, worldMinutes, tickCount,
@@ -1835,7 +2144,10 @@ export async function startWorldEngine(pool, { onError = () => {}, onStatus = ()
             const tradeFields = activity.action === 'trade'
               ? [activity.side, activity.asset, activity.quoteUnits] : [null, null, null];
             const plannedContext = Object.fromEntries(['opportunityId','opportunityProposal','projectId','decision','projectProposal','goalReviewProposal',
-              'organizationId','organizationProposal','inviteeAgentId','shareId','informationProposal','contributionType']
+              'organizationId','organizationProposal','inviteeAgentId','shareId','informationProposal','contributionType',
+              'businessProposal','cofounderProposal','preparationSkill','preparationServiceType',
+              'businessId','serviceId','jobId','applicationId','maxPriceUsdc','amountUsdc','fundingSource',
+              'direction','contributionAmountUsdc','employmentId','pricingContext']
               .filter((key) => activity[key] !== undefined).map((key) => [key, activity[key]]));
             if (activity.targetLocation !== agent.location) {
               const travelSeconds = 6 + stableInt(`${agent.agentId}:${tickCount}:travel`) % 11;

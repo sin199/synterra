@@ -61,29 +61,67 @@ test('utility qualification fills its minimum from the ranked candidates', () =>
   assert.deepEqual(qualifyUtilityCandidates(candidates).map((item) => item.score), [100, 20, 10]);
 });
 
-test('Fruitfly keeps its eight output families while learning from every V3 action family', async () => {
+test('Fruitfly exposes twelve output families and learns from V3 and V4 action families', async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'synterra-fruitfly-v3-'));
   try {
     const fruitfly = await createFruitflyRuntime(directory);
     const observation = { self: { agentId: 'resident-v3', energy: 80, food: 70, social: 60 },
       mind: { archetype: 'scholar', traits: { curiosity: 0.8, craft: 0.6 }, memories: [], goals: [],
         relationships: [], personality: {} } };
-    const actions = ['opportunity_propose', 'opportunity', 'opportunity_reject', 'project_propose',
+    const actions = ['eat', 'rest', 'socialize', 'work', 'cooperate', 'opportunity', 'trade', 'trade_hold',
+      'business_found', 'project_invest', 'business_apply', 'business_skill_practice',
+      'opportunity_propose', 'opportunity_reject', 'project_propose',
       'project_join', 'project_reject', 'project_contribute', 'project_leave', 'organization_found',
       'organization_join', 'organization_reject', 'organization_leave', 'organization_invite',
       'organization_contribute', 'information_share', 'information_accept', 'information_ignore', 'information_doubt'];
+    const families = new Set();
     for (const [index, action] of actions.entries()) {
       const candidate = { id: `v3-choice-${index}`, action, score: 20 + index };
       const decision = fruitfly.choose('resident-v3', observation, [candidate], candidate);
       assert.equal(decision.candidate.id, candidate.id);
+      families.add(decision.action);
       await fruitfly.learn('resident-v3', observation, [candidate], decision.candidate,
         { energy: 80, food: 70, social: 60 });
     }
-    assert.ok(fruitflyFamily('project_propose') === 'cooperate');
+    assert.equal(families.size, 12);
+    assert.ok(fruitflyFamily('business_found') === 'business');
+    assert.ok(fruitflyFamily('business_invest') === 'invest');
+    assert.ok(fruitflyFamily('business_apply') === 'job');
+    assert.ok(fruitflyFamily('business_skill_practice') === 'business_learn');
+    assert.ok(fruitflyFamily('project_propose') === 'business');
     assert.ok(fruitflyFamily('information_share') === 'socialize');
     assert.ok(fruitflyFamily('opportunity') === 'travel');
   } finally {
     await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('Fruitfly choice retains learned family probabilities while Utility ranks the eligible candidate set', async () => {
+  const directories = await Promise.all([0, 1].map(() => mkdtemp(path.join(os.tmpdir(), 'synterra-fruitfly-gate-'))));
+  try {
+    const runtimes = await Promise.all(directories.map((directory) => createFruitflyRuntime(directory)));
+    const observation = { self: { agentId: 'resident-gate', energy: 80, food: 70, social: 60 },
+      mind: { traits: { curiosity: 0.7, craft: 0.6 }, memories: [], goals: [], relationships: [] } };
+    const candidates = [
+      { id: 'business', action: 'business_found', score: 100 },
+      { id: 'shift', action: 'business_work', score: 75 },
+      { id: 'rest', action: 'rest', score: 50 },
+      { id: 'opportunity', action: 'opportunity', score: 25 }
+    ];
+    const reorderedScores = candidates.map((candidate, index) => ({ ...candidate, score: (index + 1) * 100 }));
+    const first = runtimes[0].choose('resident-gate', observation, candidates, candidates[0]);
+    const second = runtimes[1].choose('resident-gate', observation, reorderedScores, reorderedScores[0]);
+    assert.deepEqual(first.fruitflyProbabilities, second.fruitflyProbabilities,
+      'learned Fruitfly probabilities are stable for the same resident observation');
+    assert.notDeepEqual(first.utilityProbabilities, second.utilityProbabilities,
+      'Utility values still rank the already feasible alternatives');
+    assert.notDeepEqual(first.probabilities, second.probabilities,
+      'mixed action probability reflects both Fruitfly learning and candidate utility');
+    assert.ok(first.candidate && candidates.some((item) => item.id === first.candidate.id));
+    assert.ok(second.candidate && reorderedScores.some((item) => item.id === second.candidate.id));
+    assert.ok(Math.abs(Object.values(first.probabilities).reduce((sum, probability) => sum + probability, 0) - 1) < 1e-9);
+  } finally {
+    await Promise.all(directories.map((directory) => rm(directory, { recursive: true, force: true })));
   }
 });
 
@@ -170,19 +208,24 @@ test('goal stagnation can add a strategic replanning candidate and reasons expla
   assert.ok(gaps.some((item) => item.system === 'organization' && item.reasonCode === 'NO_PARTNER'));
 });
 
-test('organization gaps distinguish trust, repeated work, incompatible goals, and existing membership', () => {
+test('organization proposals need one completed shared project and trust, not matching long-term goals', () => {
   const resident = { agentId: 'resident-a', primaryGoal: 'MASTER_RESEARCH', relationships: [
     { otherAgentId: 'resident-b', trust: 12, familiarity: 40 }
   ], organizationMemberships: [] };
-  const context = { worldMinutes: 180, organizationPartners: [{ partnerId: 'resident-b', sharedProjectCount: 2,
-    partnerGoal: 'BUILD_ENGINEERING', trust: 12, familiarity: 40 }] };
-  assert.equal(explainWorldInitiativeGaps(resident, context).find((item) => item.system === 'organization').reasonCode,
-    'INCOMPATIBLE_GOALS');
+  const partner = { partnerId: 'resident-b', sharedProjectCount: 1, partnerGoal: 'BUILD_ENGINEERING',
+    trust: 12, familiarity: 40, projectId: 'project-a', projectTitle: 'Research Notes',
+    projectGoal: 'Continue the shared research.' };
+  const context = { worldMinutes: 180, organizationPartners: [partner] };
+  const candidateResident = { ...resident, name: 'Resident A', location: 'Library', energy: 75, food: 70,
+    skills: { research: 42, engineering: 17, trading: 11, social: 24 }, activeProjects: [],
+    projectMemberships: [], activeOpportunities: [], opportunityMembershipIds: [] };
+  const candidates = buildWorldInitiativeCandidates(candidateResident, context);
+  assert.ok(candidates.some((candidate) => candidate.action === 'organization_found'));
+  assert.ok(!explainWorldInitiativeGaps(candidateResident, context, candidates)
+    .some((item) => item.system === 'organization'));
   assert.equal(explainWorldInitiativeGaps({ ...resident, organizationMemberships: [
     { memberIds: ['resident-b'], status: 'active' }
-  ] }, { ...context, organizationPartners: [
-    { ...context.organizationPartners[0], partnerGoal: 'MASTER_RESEARCH' }
-  ] }).find((item) => item.system === 'organization').reasonCode, 'ALREADY_ORGANIZED');
+  ] }, context).find((item) => item.system === 'organization').reasonCode, 'ALREADY_ORGANIZED');
   assert.equal(explainWorldInitiativeGaps(resident, { ...context, organizationPartners: [] })
     .find((item) => item.system === 'organization').reasonCode, 'INSUFFICIENT_SHARED_WORK');
   assert.equal(explainWorldInitiativeGaps({ ...resident, relationships: [] }, { worldMinutes: 180 })
@@ -210,6 +253,19 @@ test('residents can autonomously propose bounded opportunities from personal ski
     .some((item) => item.action === 'opportunity_propose'), false);
 });
 
+test('residents propose new places when congestion is real, not to satisfy a simulation quota', () => {
+  const resident = { agentId: 'builder-a', primaryGoal: 'BUILD_ENGINEERING',
+    skills: { engineering: 32, research: 18, trading: 12, social: 20 }, organizationMemberships: [] };
+  const crowded = deriveProjectProposal(resident, { activePlaceCount: 6,
+    crowdedPlaces: [{ id: 'scene-a', name: 'Busy Library', congestion: 0.82 }] });
+  assert.equal(crowded.metadata.createPlace, true);
+  assert.equal(crowded.requiredResources.effortPoints, 45);
+
+  const notCrowded = deriveProjectProposal(resident, { activePlaceCount: 6, crowdedPlaces: [] });
+  assert.equal(notCrowded.metadata.createPlace, false);
+  assert.equal(notCrowded.requiredResources.effortPoints, 28);
+});
+
 test('place fallback names are deterministic but vary by project and ordinal', () => {
   const project = { id: 'project-a', projectType: 'RESEARCH' };
   assert.equal(generatedPlaceName(project), generatedPlaceName(project));
@@ -229,7 +285,7 @@ test('emergence audit is idempotent and upgrades the old stagnation source const
     await pool.query(schema);
     await pool.query(`ALTER TABLE world_agent_goals DROP CONSTRAINT IF EXISTS world_agent_goals_source_check;
       ALTER TABLE world_agent_goals ADD CONSTRAINT world_agent_goals_source_check
-        CHECK (source IN ('seed','experience','memory','relationship','opportunity','strategy','self_generated'))`);
+        CHECK (source IN ('seed','experience','memory','relationship','opportunity','strategy','self_generated')) NOT VALID`);
     await pool.query(schema);
     await pool.query(`INSERT INTO agents(id,name,public_key,gender) VALUES($1,'Emergence Test Resident',$2,'female')`,
       [agentId, `emergence-key-${agentId}`]);

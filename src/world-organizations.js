@@ -1,4 +1,5 @@
 import { actionIdentifier, boundedNumber, jsonObject, requireWorldMember, requiredText, worldError, writeWorldHistory } from './world-domain.js';
+import { ensureEconomicAccount, getEconomicAccount, transferBetweenAccounts } from './economic-ledger.js';
 
 async function relationshipBetween(client, worldId, leftId, rightId) {
   const [a, b] = [leftId, rightId].sort();
@@ -35,7 +36,9 @@ export async function foundWorldOrganization(client, { worldId, founderAgentId, 
   const details = jsonObject(metadata, 'organization_metadata');
   const relation = await relationshipBetween(client, worldId, founderAgentId, inviteAgentId);
   const sharedProject = await sharesCompletedProject(client, worldId, founderAgentId, inviteAgentId, projectId);
-  if (Number(relation.familiarity) < 25 || Number(relation.trust) < 5 || !sharedProject) {
+  const economicPreparation = details.economicPreparation === true
+    && ['research_service','engineering_service','social_service','food_service','trading_service'].includes(details.serviceType);
+  if (Number(relation.familiarity) < 25 || Number(relation.trust) < 5 || (!sharedProject && !economicPreparation)) {
     throw worldError('ORGANIZATION_FOUNDING_REQUIRES_TRUST_AND_SHARED_PROJECT');
   }
   const limits = await client.query(`SELECT count(*) FILTER (WHERE founder_agent_id=$2)::int AS own,
@@ -46,9 +49,14 @@ export async function foundWorldOrganization(client, { worldId, founderAgentId, 
       resources,action_id,created_world_time,updated_world_time,metadata)
     VALUES($1,$2,$3,$4,'forming','{"effort":0}'::jsonb,$5,$6,$6,$7::jsonb)
     ON CONFLICT(world_id,name) DO NOTHING RETURNING id,status,name`,
-  [worldId, founderAgentId, title, description, key, worldTime, JSON.stringify({ ...details, sharedProjectId: sharedProject.id })]);
+  [worldId, founderAgentId, title, description, key, worldTime,
+    JSON.stringify({ ...details, sharedProjectId: sharedProject?.id || null })]);
   if (!inserted.rowCount) throw worldError('ORGANIZATION_NAME_ALREADY_EXISTS');
   const organization = inserted.rows[0];
+  await ensureEconomicAccount(client, { worldId, accountType: 'organization', ownerId: organization.id });
+  await client.query(`INSERT INTO world_economic_ownership(world_id,asset_type,asset_id,owner_type,owner_id,share,invested_usdc,acquired_world_time)
+    VALUES($1,'organization',$2,'resident',$3,1,0,$4) ON CONFLICT DO NOTHING`,
+  [worldId, organization.id, founderAgentId, worldTime]);
   await client.query(`INSERT INTO world_organization_members(world_id,organization_id,agent_id,status,role,joined_world_time,
       updated_world_time,action_id)
     VALUES($1,$2,$3,'active','founder',$4,$4,$5),($1,$2,$6,'invited','member',$4,$4,$7)
@@ -57,14 +65,15 @@ export async function foundWorldOrganization(client, { worldId, founderAgentId, 
   await client.query(`INSERT INTO world_events(world_id,actor_id,event_type,data,action_id)
     VALUES($1,$2,'world.organization_founded',$3::jsonb,$4) ON CONFLICT(world_id,actor_id,action_id) DO NOTHING`,
   [worldId, founderAgentId, JSON.stringify({ organizationId: organization.id, name: title,
-    invitedAgentId: inviteAgentId, sharedProjectId: sharedProject.id, worldTime }), key]);
+    invitedAgentId: inviteAgentId, sharedProjectId: sharedProject?.id || null, economicPreparation, worldTime }), key]);
   await client.query(`INSERT INTO world_events(world_id,actor_id,event_type,data,action_id)
     VALUES($1,$2,'world.organization_invited',$3::jsonb,$4) ON CONFLICT(world_id,actor_id,action_id) DO NOTHING`,
   [worldId, inviteAgentId, JSON.stringify({ organizationId: organization.id, name: title,
     inviterAgentId: founderAgentId, purpose: description, worldTime }), `${key}:invite`]);
   await writeWorldHistory(client, { worldId, eventKey: `organization:${organization.id}:founded`,
     eventType: 'organization_founded', actorAgentId: founderAgentId, entityType: 'organization', entityId: organization.id,
-    worldTime, title, detail: description, metadata: { invitedAgentId: inviteAgentId, sharedProjectId: sharedProject.id } });
+    worldTime, title, detail: description, metadata: { invitedAgentId: inviteAgentId,
+      sharedProjectId: sharedProject?.id || null, economicPreparation } });
   await writeWorldHistory(client, { worldId, eventKey: `organization:${organization.id}:invite:${inviteAgentId}`,
     eventType: 'organization_invited', actorAgentId: founderAgentId, entityType: 'organization', entityId: organization.id,
     worldTime, title, detail: `Invited a trusted collaborator to consider joining ${title}.` });
@@ -125,6 +134,7 @@ export async function decideOrganizationMembership(client, { worldId, organizati
   const organization = await client.query(`SELECT * FROM world_organizations WHERE world_id=$1 AND id=$2 FOR UPDATE`,
     [worldId, organizationId]);
   if (!organization.rowCount) throw worldError('ORGANIZATION_NOT_FOUND', 404);
+  if (!['forming','active','dormant'].includes(organization.rows[0].status)) throw worldError('ORGANIZATION_NOT_ACTIVE');
   const lockedRetry = await client.query(`SELECT organization_id AS id,status FROM world_organization_members
     WHERE world_id=$1 AND agent_id=$2 AND action_id=$3`, [worldId, agentId, key]);
   if (lockedRetry.rowCount) return { ...lockedRetry.rows[0], idempotent: true };
@@ -172,6 +182,14 @@ export async function decideOrganizationMembership(client, { worldId, organizati
     await writeWorldHistory(client, { worldId, eventKey: `organization:${organizationId}:member:${agentId}:accepted`,
       eventType: 'organization_joined', actorAgentId: agentId, entityType: 'organization', entityId: organizationId,
       worldTime, title: organization.rows[0].name, detail: 'A resident accepted an invitation and joined.' });
+    await client.query(`INSERT INTO world_economic_ownership(world_id,asset_type,asset_id,owner_type,owner_id,share,invested_usdc,acquired_world_time)
+      VALUES($1,'organization',$2,'resident',$3,1,0,$4) ON CONFLICT DO NOTHING`,
+    [worldId, organizationId, agentId, worldTime]);
+    await client.query(`UPDATE world_economic_ownership SET share=1::numeric/$3::numeric,updated_at=now()
+      WHERE world_id=$1 AND asset_type='organization' AND asset_id=$2 AND owner_type='resident'
+        AND owner_id IN (SELECT agent_id FROM world_organization_members
+          WHERE world_id=$1 AND organization_id=$2 AND status='active')`,
+    [worldId, organizationId, Number(memberCount.rows[0].count)]);
   }
   await client.query(`INSERT INTO world_events(world_id,actor_id,event_type,data,action_id)
     VALUES($1,$2,'world.organization_membership_decided',$3::jsonb,$4) ON CONFLICT(world_id,actor_id,action_id) DO NOTHING`,
@@ -179,32 +197,55 @@ export async function decideOrganizationMembership(client, { worldId, organizati
   return { id: organizationId, status, organizationStatus: Number(memberCount.rows[0].count) >= 2 ? 'active' : organization.rows[0].status };
 }
 
-export async function contributeOrganizationEffort(client, { worldId, organizationId, agentId, actionId, worldTime, effort }) {
+export async function contributeOrganizationEffort(client, { worldId, organizationId, agentId, actionId, worldTime, effort,
+  contributionType = 'effort', amountUsdc = null }) {
   await requireWorldMember(client, worldId, agentId);
   const key = actionIdentifier(actionId);
   const organization = await client.query(`SELECT * FROM world_organizations WHERE world_id=$1 AND id=$2 FOR UPDATE`,
     [worldId, organizationId]);
   if (!organization.rowCount) throw worldError('ORGANIZATION_NOT_FOUND', 404);
-  const amount = boundedNumber(effort, 0.1, 20, 'effort');
+  if (!['effort','capital'].includes(contributionType)) throw worldError('ORGANIZATION_CONTRIBUTION_INVALID', 400);
+  const resourceKey = contributionType === 'capital' ? 'simulated_usdc' : 'effort';
+  const amount = contributionType === 'capital' ? boundedNumber(amountUsdc, 1, 100, 'organization_contribution')
+    : boundedNumber(effort, 0.1, 20, 'effort');
   const repeated = await client.query(`SELECT id,amount::text AS amount FROM world_organization_ledger
-    WHERE world_id=$1 AND organization_id=$2 AND action_id=$3 AND resource_key='effort'`, [worldId, organizationId, key]);
-  if (repeated.rowCount) return { id: organizationId, effort: repeated.rows[0].amount, idempotent: true };
+    WHERE world_id=$1 AND organization_id=$2 AND action_id=$3 AND resource_key=$4`, [worldId, organizationId, key, resourceKey]);
+  if (repeated.rowCount) return { id: organizationId, [resourceKey === 'effort' ? 'effort' : 'amountUsdc']:
+    repeated.rows[0].amount, idempotent: true };
   const member = await client.query(`SELECT 1 FROM world_organization_members
     WHERE world_id=$1 AND organization_id=$2 AND agent_id=$3 AND status='active' FOR UPDATE`,
   [worldId, organizationId, agentId]);
   if (!member.rowCount) throw worldError('ACTIVE_ORGANIZATION_MEMBERSHIP_REQUIRED');
-  const updated = await client.query(`UPDATE world_organizations SET resources=jsonb_set(resources,'{effort}',
-      to_jsonb(COALESCE((resources->>'effort')::numeric,0)+$3::numeric),true),updated_world_time=$4,updated_at=now()
-    WHERE world_id=$1 AND id=$2 AND status='active' RETURNING resources`, [worldId, organizationId, amount, worldTime]);
+  if (contributionType === 'capital') {
+    await ensureEconomicAccount(client, { worldId, accountType: 'organization', ownerId: organizationId });
+    const account = await getEconomicAccount(client, { worldId, accountType: 'resident', ownerId: agentId,
+      asset: 'USDC', forUpdate: true });
+    if (!account || Number(account.balance) < amount + 100) throw worldError('INSUFFICIENT_SIMULATED_USDC');
+    await transferBetweenAccounts(client, { worldId,
+      source: { accountType: 'resident', ownerId: agentId },
+      destination: { accountType: 'organization', ownerId: organizationId }, amount: amount.toFixed(8),
+      transactionType: 'organization_contribution', reason: 'Member contributed simulated USDC to the organization treasury.',
+      worldTime, actionId: `organization-capital:${key}`, referenceId: organizationId,
+      metadata: { contributingAgentId: agentId } });
+  }
+  const resourceField = contributionType === 'capital' ? 'capitalContributed' : 'effort';
+  const updated = await client.query(`UPDATE world_organizations SET resources=jsonb_set(resources,$3::text[],
+      to_jsonb(COALESCE((resources->>$4)::numeric,0)+$5::numeric),true),updated_world_time=$6,updated_at=now()
+    WHERE world_id=$1 AND id=$2 AND status IN ('forming','active') RETURNING resources`,
+  [worldId, organizationId, [resourceField], resourceField, amount, worldTime]);
   if (!updated.rowCount) throw worldError('ORGANIZATION_NOT_ACTIVE');
   await client.query(`INSERT INTO world_organization_ledger(world_id,organization_id,agent_id,action_id,entry_type,
-      resource_key,amount,reason,world_time) VALUES($1,$2,$3,$4,'contribution','effort',$5,
-      'Member contributed time and skill effort.',$6)`, [worldId, organizationId, agentId, key, amount, worldTime]);
-  return { id: organizationId, resources: updated.rows[0].resources, effort: amount };
+      resource_key,amount,reason,world_time) VALUES($1,$2,$3,$4,'contribution',$5,$6,$7,$8)`,
+  [worldId, organizationId, agentId, key, resourceKey, amount,
+    contributionType === 'capital' ? 'Member contributed simulated USDC to the organization treasury.'
+      : 'Member contributed time and skill effort.', worldTime]);
+  return { id: organizationId, resources: updated.rows[0].resources,
+    ...(contributionType === 'capital' ? { amountUsdc: amount } : { effort: amount }), idempotent: false };
 }
 
 export async function listWorldOrganizations(client, { worldId, statuses = ['forming','active','dormant'], limit = 20 }) {
-  const rows = await client.query(`SELECT organization.*,
+  const rows = await client.query(`SELECT organization.*,account.balance::text AS cash_balance,
+      COALESCE((organization.resources->>'capitalContributed')::numeric,0)::text AS contributed_capital,
       COALESCE((SELECT jsonb_agg(jsonb_build_object('agentId',member.agent_id,'name',agent.name,'status',member.status,
         'role',member.role) ORDER BY member.joined_world_time,member.agent_id) FROM world_organization_members member
         JOIN agents agent ON agent.id=member.agent_id WHERE member.world_id=organization.world_id
@@ -213,7 +254,10 @@ export async function listWorldOrganizations(client, { worldId, statuses = ['for
         'progress',project.progress) ORDER BY project.updated_world_time DESC) FROM world_projects project
         WHERE project.world_id=organization.world_id AND project.organization_id=organization.id
           AND project.status IN ('proposed','recruiting','active')),'[]'::jsonb) AS projects
-    FROM world_organizations organization WHERE organization.world_id=$1 AND organization.status=ANY($2::text[])
+    FROM world_organizations organization LEFT JOIN world_economic_accounts account
+      ON account.world_id=organization.world_id AND account.account_key='organization:'||organization.id::text
+        AND account.asset_symbol='USDC'
+    WHERE organization.world_id=$1 AND organization.status=ANY($2::text[])
     ORDER BY organization.reputation DESC,organization.created_world_time DESC,organization.id LIMIT $3`,
   [worldId, statuses, Math.trunc(boundedNumber(limit, 1, 100, 'limit'))]);
   return rows.rows;

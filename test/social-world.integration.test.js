@@ -71,7 +71,7 @@ test('isolated 24-hour world keeps social state durable and records real simulat
       import('../src/agent-runtime/typesafe.js'), import('../src/agent-runtime/client.js')
     ]);
     const runtimeState = await loadState();
-    const engineOptions = { schedule: false, fruitfly, nowProvider: () => simulatedNow,
+    const engineOptions = { worldId, schedule: false, fruitfly, nowProvider: () => simulatedNow,
       chooseWithTypeSafe, runtimeState,
       onError: (error, phase) => onErrors.push({ message: error.message, phase }),
       onStatus: (status) => { if (status.typeSafe) typeSafeResults.push(status.typeSafe); } };
@@ -105,7 +105,7 @@ test('isolated 24-hour world keeps social state durable and records real simulat
       WHERE world_id=$1 AND agent_id=$2`, [worldId, agentIds[0]])).rows[0];
     const clockBeforeDuplicate = Number((await pool.query('SELECT world_minutes FROM world_runtime_state WHERE world_id=$1',
       [worldId])).rows[0].world_minutes);
-    const duplicateEngine = await startWorldEngine(pool, { schedule: false, nowProvider: () => simulatedNow });
+    const duplicateEngine = await startWorldEngine(pool, { worldId, schedule: false, nowProvider: () => simulatedNow });
     assert.equal(duplicateEngine.running, false, 'the engine advisory lock should reject a second instance');
     assert.equal(Number((await pool.query('SELECT world_minutes FROM world_runtime_state WHERE world_id=$1',
       [worldId])).rows[0].world_minutes), clockBeforeDuplicate);
@@ -116,6 +116,7 @@ test('isolated 24-hour world keeps social state durable and records real simulat
       if (minute % 15 === 14) await verifyNewExchangeTrades();
     }
     await engine.stop();
+    await verifyNewExchangeTrades();
     engine = null;
 
     const memoriesBeforeRestart = Number((await pool.query(`SELECT count(*)::int AS count FROM agent_memories WHERE world_id=$1`,
@@ -140,7 +141,7 @@ test('isolated 24-hour world keeps social state durable and records real simulat
 
     const resumedFruitfly = await createFruitflyRuntime(stateDir);
     engineOptions.fruitfly = resumedFruitfly;
-    engine = await startWorldEngine(pool, { schedule: false, fruitfly: resumedFruitfly, nowProvider: () => simulatedNow,
+    engine = await startWorldEngine(pool, { worldId, schedule: false, fruitfly: resumedFruitfly, nowProvider: () => simulatedNow,
       chooseWithTypeSafe, runtimeState,
       onError: (error, phase) => onErrors.push({ message: error.message, phase }),
       onStatus: (status) => { if (status.typeSafe) typeSafeResults.push(status.typeSafe); } });
@@ -150,6 +151,7 @@ test('isolated 24-hour world keeps social state durable and records real simulat
       if (minute % 15 === 14) await verifyNewExchangeTrades();
     }
     await engine.stop();
+    await verifyNewExchangeTrades();
     engine = null;
 
     const runtime = (await pool.query('SELECT world_minutes FROM world_runtime_state WHERE world_id=$1', [worldId])).rows[0];
@@ -251,7 +253,7 @@ test('isolated 24-hour world keeps social state durable and records real simulat
         planned_side=NULL,planned_asset=NULL,planned_quote_units=NULL,planned_paid_meal=false,movement_started_at=NULL,
         movement_ends_at=NULL,action_started_at=NULL,action_ends_at=NULL,next_decision_at=$2 WHERE world_id=$1`,
     [worldId, new Date(fallbackNow - 1_000)]);
-    const noFruitflyEngine = await startWorldEngine(pool, { schedule: false, nowProvider: () => fallbackNow,
+    const noFruitflyEngine = await startWorldEngine(pool, { worldId, schedule: false, nowProvider: () => fallbackNow,
       onError: (error, phase) => onErrors.push({ message: error.message, phase }) });
     assert.equal(noFruitflyEngine.running, true);
     await noFruitflyEngine.stop();
@@ -302,10 +304,12 @@ test('a trusted cooperative action settles for both residents and reserves the p
     await pool.query(`INSERT INTO crypto_risk_limits(world_id) VALUES($1) ON CONFLICT DO NOTHING`, [worldId]);
     const fruitfly = await createFruitflyRuntime(stateDir);
     let forcedActionUsed = false;
+    const actorCandidateHistory = [];
     const cooperativeFruitfly = {
       choose(id, observation, candidates, preferredDecision) {
         const choice = fruitfly.choose(id, observation, candidates, preferredDecision);
         if (forcedActionUsed || id !== actorId) return choice;
+        actorCandidateHistory.push(candidates.map((item) => item.action));
         const candidate = candidates.find((item) => item.action === 'cooperate' && item.socialPartnerId === partnerId);
         if (!candidate) return choice;
         forcedActionUsed = true;
@@ -316,10 +320,15 @@ test('a trusted cooperative action settles for both residents and reserves the p
       learn: (...args) => fruitfly.learn(...args)
     };
     process.env.SYNTERRA_STATE_DIR = stateDir;
-    engine = await startWorldEngine(pool, { schedule: false, fruitfly: cooperativeFruitfly,
+    engine = await startWorldEngine(pool, { worldId, schedule: false, fruitfly: cooperativeFruitfly,
       nowProvider: () => simulatedNow });
-    await pool.query(`UPDATE world_agent_states SET next_decision_at=$3 WHERE world_id=$1 AND agent_id=ANY($2::uuid[])`,
-      [worldId, agentIds, new Date(simulatedNow - 1_000)]);
+    await pool.query(`UPDATE world_agent_states SET next_decision_at=$3,next_strategic_decision_world_minutes=100000,
+        goal=CASE WHEN agent_id=$4 THEN 'community' ELSE goal END,
+        risk_tolerance=0.1
+      WHERE world_id=$1 AND agent_id=ANY($2::uuid[])`,
+      [worldId, agentIds, new Date(simulatedNow - 1_000), actorId]);
+    await pool.query(`UPDATE world_agent_goals SET category='COOPERATE_AND_BUILD'
+      WHERE world_id=$1 AND agent_id=$2 AND goal_type='primary' AND status='active'`, [worldId, actorId]);
     for (let tick = 0; tick < 45; tick++) {
       simulatedNow += 1_000;
       await engine.tickOnce();
@@ -328,8 +337,8 @@ test('a trusted cooperative action settles for both residents and reserves the p
       WHERE world_id=$1 AND event_type='world.cooperation_completed'`, [worldId]);
     const actionEvents = await pool.query(`SELECT count(DISTINCT actor_id)::int AS count FROM world_events
       WHERE world_id=$1 AND event_type='world.action_completed' AND data->>'action'='cooperate'`, [worldId]);
-    const settlements = await pool.query(`SELECT count(*)::int AS count FROM crypto_ledger
-      WHERE world_id=$1 AND entry_type='work_income' AND reason='simulated cooperative work income'`, [worldId]);
+    const freeWages = await pool.query(`SELECT count(*)::int AS count FROM world_economic_transactions
+      WHERE world_id=$1 AND transaction_type='world_reward' AND reason='simulated cooperative work income'`, [worldId]);
     const balances = await pool.query(`SELECT agent_id,balance::text AS balance FROM crypto_balances
       WHERE world_id=$1 AND asset_symbol='USDC' ORDER BY agent_id`, [worldId]);
     const memories = await pool.query(`SELECT count(DISTINCT agent_id)::int AS count FROM agent_memories
@@ -338,15 +347,15 @@ test('a trusted cooperative action settles for both residents and reserves the p
       WHERE world_id=$1 AND skill_name='engineering' AND actions_completed>0`, [worldId]);
     const needsChanged = await pool.query(`SELECT count(*)::int AS count FROM world_members
       WHERE world_id=$1 AND (energy<100 OR food<100 OR social<100)`, [worldId]);
-    assert.equal(forcedActionUsed, true, 'the fixture should select an eligible cooperative candidate once');
+    assert.equal(forcedActionUsed, true, `the fixture should select an eligible cooperative candidate once; seen ${JSON.stringify(actorCandidateHistory)}`);
     assert.equal(completed.rows[0].count, 1, 'one cooperative work event should settle');
     assert.equal(actionEvents.rows[0].count, 2, 'both residents should have a completed-action event');
-    assert.equal(settlements.rows[0].count, 2, 'both residents should receive exactly one internal wage entry');
+    assert.equal(freeWages.rows[0].count, 0, 'cooperative work must not mint wages outside a funded business');
     assert.equal(memories.rows[0].count, 2, 'both residents should retain a cooperation memory');
     assert.equal(skillActions.rows[0].count, 2, 'both residents should gain engineering experience');
     assert.equal(needsChanged.rows[0].count, 2, 'both residents should incur real work needs');
     assert.equal(balances.rows.length, 2);
-    assert.ok(balances.rows.every((row) => Number(row.balance) > 10_000), 'both residents should retain the cooperative wages');
+    assert.ok(balances.rows.every((row) => Number(row.balance) === 10_000), 'cooperative work preserves both residents\' cash balances');
   } finally {
     if (engine) await engine.stop();
     if (priorStateDir === undefined) delete process.env.SYNTERRA_STATE_DIR;

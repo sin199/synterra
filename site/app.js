@@ -23,6 +23,8 @@ const evolutionStats = document.querySelector('#world-evolution-stats');
 const opportunityList = document.querySelector('#world-opportunity-list');
 const projectList = document.querySelector('#world-project-list');
 const organizationList = document.querySelector('#world-organization-list');
+const businessList = document.querySelector('#world-business-list');
+const economicDemandList = document.querySelector('#world-economic-demand-list');
 const historyList = document.querySelector('#world-history-list');
 const emergenceCountsList = document.querySelector('#world-emergence-counts');
 const emergenceBlockersList = document.querySelector('#world-emergence-blockers');
@@ -308,6 +310,36 @@ function renderAgentPanel(agent, detail = selectedResidentDetail) {
   }
   card.append(facts);
 
+  const economy = detail?.economy;
+  const economicSection = document.createElement('section');
+  economicSection.className = 'agent-social-section';
+  const economicHeading = document.createElement('h4');
+  economicHeading.textContent = '模拟经济与所有权';
+  const economicList = document.createElement('ul');
+  economicList.className = 'agent-memory-list';
+  if (!economy) {
+    const item = document.createElement('li');
+    item.className = 'agent-social-empty';
+    item.textContent = '正在读取经济账本…';
+    economicList.append(item);
+  } else {
+    const entries = [
+      `模拟净值 $${Number(economy.netWorthUsd || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
+      `余额 ${(economy.balances || []).map((row) => `${row.asset} ${row.balance}`).join(' · ') || '尚无经济账户'}`,
+      ...(economy.employment || []).map((job) => `就业 ${job.businessName} · ${job.role} · ${job.wageUsdc} USDC/班`),
+      ...(economy.ownership || []).map((holding) => `持有 ${holding.name} · ${Math.round(Number(holding.share) * 10000) / 100}% · ${holding.assetType}`),
+      ...(economy.recentTransactions || []).slice(0, 5).map((tx) => `${tx.flow === 'income' ? '收入' : '支出'} ${tx.amount} ${tx.asset} · ${tx.type} · 第 ${Math.floor(Number(tx.worldTime) / 1440) + 1} 天`),
+      ...(economy.recentPurchases || []).slice(0, 3).map((purchase) => `购买 ${purchase.serviceName} · ${purchase.businessName} · ${purchase.priceUsdc} USDC`)
+    ];
+    for (const text of entries.length ? entries : ['尚无收入、就业、投资或购买记录']) {
+      const item = document.createElement('li');
+      item.textContent = text;
+      economicList.append(item);
+    }
+  }
+  economicSection.append(economicHeading, economicList);
+  card.append(economicSection);
+
   const goal = document.createElement('div');
   goal.className = 'agent-goal';
   const goalLabel = document.createElement('span');
@@ -352,7 +384,7 @@ function renderAgentPanel(agent, detail = selectedResidentDetail) {
     ['社交', 'sociability'], ['好奇', 'curiosity'], ['自律', 'discipline'], ['进取', 'ambition']
   ].map(([label, key]) => `${label} ${Math.round(Math.max(0, Math.min(1, Number(agent[key] || detail?.resident?.[key] || 0.5) + Number(modifiers[key] || 0))) * 100)}`);
   const traitItem = document.createElement('li');
-  traitItem.textContent = `${effectiveTraits.join(' · ')} · 风险适应 ${Math.round(Number(agent.riskTolerance || 0) * 100)}%`;
+  traitItem.textContent = `${effectiveTraits.join(' · ')} · 价格敏感 ${Math.round(Number(detail?.resident?.priceSensitivity ?? agent.priceSensitivity ?? 0.5) * 100)}% · 风险适应 ${Math.round(Number(agent.riskTolerance || 0) * 100)}%`;
   personalityList.append(traitItem);
   const reflectionItem = document.createElement('li');
   reflectionItem.textContent = detail?.reflections?.[0]
@@ -563,7 +595,13 @@ function renderWorldEvolution() {
     ['开放机会', displayCount(dashboard.activeOpportunities)], ['已完成项目', displayCount(dashboard.completedProjects)],
     ['世界年龄', `${displayCount(dashboard.worldAgeDays)} 天`],
     ['模拟资产', `$${Number(dashboard.totalSimulatedWealthUsd || 0).toLocaleString('en-US', { maximumFractionDigits: 2 })}`],
-    ['内部单位净额', Number(dashboard.totalInternalUnits || 0).toLocaleString('zh-CN', { maximumFractionDigits: 2 })]
+    ['内部单位净额', Number(dashboard.totalInternalUnits || 0).toLocaleString('zh-CN', { maximumFractionDigits: 2 })],
+    ['居民 USDC 流通', `${Number(evolution.economy?.dashboard?.usdc_circulation || 0).toLocaleString('en-US', { maximumFractionDigits: 2 })} USDC`],
+    ['在营企业', displayCount(evolution.economy?.dashboard?.active_businesses)],
+    ['就业关系', displayCount(evolution.economy?.dashboard?.employment_count)],
+    ['企业累计收入', `${Number(evolution.economy?.dashboard?.business_revenue || 0).toLocaleString('en-US', { maximumFractionDigits: 2 })} USDC`],
+    ['企业盈亏', `${Number(evolution.economy?.dashboard?.business_profit_loss || 0).toLocaleString('en-US', { maximumFractionDigits: 2 })} USDC`],
+    ['模拟投资额', `${Number(evolution.economy?.dashboard?.investment_volume || 0).toLocaleString('en-US', { maximumFractionDigits: 2 })} USDC`]
   ]) {
     const item = document.createElement('div');
     item.className = 'world-evolution-stat';
@@ -591,6 +629,17 @@ function renderWorldEvolution() {
     const projects = (item.projects || []).length;
     return `${item.status === 'active' ? '运作中' : item.status === 'dormant' ? '休眠' : '组建中'} · ${members} 位成员 · ${projects} 个项目`;
   });
+  renderEvolutionList(businessList, evolution.economy?.businesses, '居民还没有创建企业。', (item) => {
+    const services = (item.services || []).map((service) => `${service.name} · ${service.stockUnits} 件库存`).join('；');
+    const workers = (item.workers || []).length;
+    return `${item.status} · 现金 ${item.cashBalance} USDC · 收入 ${item.revenue} · 盈亏 ${item.profitLoss} · ${workers} 名员工${services ? ` · ${services}` : ''}`;
+  });
+  const serviceLabels = { research_service: '研究服务', engineering_service: '工程服务', social_service: '社交服务',
+    food_service: '餐饮服务', trading_service: '市场研究' };
+  const demandRows = (evolution.economy?.demand || []).filter((item) => Number(item.demandCount) > 0)
+    .map((item) => ({ ...item, title: serviceLabels[item.serviceType] || item.serviceType }));
+  renderEvolutionList(economicDemandList, demandRows, '今天还没有形成可观察的服务需求。', (item) =>
+    `需求 ${item.demandCount} · 供给 ${item.supplyCount} · 未满足 ${item.unmetCount}`);
   renderEvolutionList(historyList, evolution.history, '世界还没有留下重要历史。', (item) =>
     `${item.detail || item.eventType || ''} · 第 ${Math.max(1, Math.floor(Number(item.worldTime || 0) / 1_440) + 1)} 天`);
   const systemLabels = { opportunity: '机会', project: '项目', organization: '组织', information: '信息分享', place: '新地点', goal: '目标' };

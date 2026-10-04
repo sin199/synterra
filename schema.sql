@@ -170,6 +170,17 @@ CREATE TABLE IF NOT EXISTS world_mines (
 
 ALTER TABLE token_ledger ADD COLUMN IF NOT EXISTS mine_id uuid REFERENCES world_mines(id);
 
+-- Correct a legacy constraint name that collided with the scene status check.
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_mines'::regclass
+      AND conname='world_scenes_status_check')
+    AND NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_mines'::regclass
+      AND conname='world_mines_status_check') THEN
+    ALTER TABLE world_mines RENAME CONSTRAINT world_scenes_status_check TO world_mines_status_check;
+  END IF;
+END $$;
+
 CREATE TABLE IF NOT EXISTS auth_nonces (
   agent_id uuid NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
   nonce text NOT NULL,
@@ -406,7 +417,8 @@ CREATE TABLE IF NOT EXISTS world_scenes (
   scene_type text NOT NULL CONSTRAINT world_scenes_scene_type_check
     CHECK (scene_type IN ('garden','studio','library','cafe','workshop','observatory','commons','data_center')),
   description text NOT NULL CHECK (char_length(description) BETWEEN 12 AND 240),
-  status text NOT NULL DEFAULT 'active' CHECK (status IN ('active','closed')),
+  status text NOT NULL DEFAULT 'active' CONSTRAINT world_scenes_status_check
+    CHECK (status IN ('active','inactive','closed')),
   created_at timestamptz NOT NULL DEFAULT now(),
   UNIQUE (world_id, name)
 );
@@ -423,6 +435,32 @@ BEGIN
     ALTER TABLE world_scenes DROP CONSTRAINT IF EXISTS world_scenes_scene_type_check;
     ALTER TABLE world_scenes ADD CONSTRAINT world_scenes_scene_type_check
       CHECK (scene_type IN ('garden','studio','library','cafe','workshop','observatory','commons','data_center'));
+  END IF;
+END $$;
+
+DO $$
+DECLARE
+  stale_status_constraint record;
+BEGIN
+  FOR stale_status_constraint IN
+    SELECT conname FROM pg_constraint
+    WHERE conrelid = 'world_scenes'::regclass
+      AND contype = 'c'
+      AND pg_get_constraintdef(oid) LIKE '%status%'
+      AND pg_get_constraintdef(oid) LIKE '%closed%'
+      AND pg_get_constraintdef(oid) NOT LIKE '%inactive%'
+  LOOP
+    EXECUTE format('ALTER TABLE world_scenes DROP CONSTRAINT %I', stale_status_constraint.conname);
+  END LOOP;
+
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint
+      WHERE conrelid = 'world_scenes'::regclass
+        AND contype = 'c'
+        AND conname = 'world_scenes_status_check'
+        AND pg_get_constraintdef(oid) LIKE '%inactive%') THEN
+    ALTER TABLE world_scenes DROP CONSTRAINT IF EXISTS world_scenes_status_check;
+    ALTER TABLE world_scenes ADD CONSTRAINT world_scenes_status_check
+      CHECK (status IN ('active','inactive','closed'));
   END IF;
 END $$;
 
@@ -556,6 +594,8 @@ CREATE TABLE IF NOT EXISTS world_social_profiles (
 ALTER TABLE world_social_profiles ADD COLUMN IF NOT EXISTS personality_modifiers jsonb NOT NULL DEFAULT
   '{"sociability":0,"curiosity":0,"discipline":0,"ambition":0}'::jsonb;
 ALTER TABLE world_social_profiles ADD COLUMN IF NOT EXISTS risk_modifier numeric(4,3) NOT NULL DEFAULT 0;
+ALTER TABLE world_social_profiles ADD COLUMN IF NOT EXISTS price_sensitivity numeric(4,3) NOT NULL DEFAULT 0.500
+  CHECK (price_sensitivity BETWEEN 0 AND 1);
 ALTER TABLE world_social_profiles ADD COLUMN IF NOT EXISTS last_reflection_world_minutes bigint;
 DO $$
 BEGIN
@@ -697,7 +737,7 @@ END $$;
 CREATE TABLE IF NOT EXISTS world_agent_beliefs (
   world_id uuid NOT NULL,
   agent_id uuid NOT NULL,
-  subject_type text NOT NULL CHECK (subject_type IN ('action','place','resident','asset')),
+  subject_type text NOT NULL CHECK (subject_type IN ('action','place','resident','asset','project','opportunity','business','organization','market')),
   subject_key text NOT NULL CHECK (char_length(subject_key) BETWEEN 1 AND 120),
   belief_key text NOT NULL CHECK (char_length(belief_key) BETWEEN 1 AND 80),
   estimate numeric(10,4) NOT NULL,
@@ -975,10 +1015,14 @@ CREATE INDEX IF NOT EXISTS world_information_inbox_idx
 DO $$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_agent_beliefs'::regclass
-      AND conname='world_agent_beliefs_subject_type_check' AND pg_get_constraintdef(oid) LIKE '%opportunity%') THEN
+      AND conname='world_agent_beliefs_subject_type_check'
+      AND pg_get_constraintdef(oid) LIKE '%opportunity%'
+      AND pg_get_constraintdef(oid) LIKE '%business%'
+      AND pg_get_constraintdef(oid) LIKE '%organization%'
+      AND pg_get_constraintdef(oid) LIKE '%market%') THEN
     ALTER TABLE world_agent_beliefs DROP CONSTRAINT IF EXISTS world_agent_beliefs_subject_type_check;
     ALTER TABLE world_agent_beliefs ADD CONSTRAINT world_agent_beliefs_subject_type_check
-      CHECK (subject_type IN ('action','place','resident','asset','project','opportunity'));
+      CHECK (subject_type IN ('action','place','resident','asset','project','opportunity','business','organization','market'));
   END IF;
 END $$;
 
@@ -1062,6 +1106,401 @@ CREATE UNIQUE INDEX IF NOT EXISTS world_scenes_project_place_unique_idx
   ON world_scenes(world_id,created_by_project_id) WHERE created_by_project_id IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS world_projects_opportunity_unique_idx
   ON world_projects(world_id,opportunity_id) WHERE opportunity_id IS NOT NULL;
+
+-- V4 simulated economy. USDC/BTC/ETH assets below remain simulated; internal
+-- mining units stay in token_ledger and are intentionally not exchangeable.
+CREATE TABLE IF NOT EXISTS world_economic_accounts (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  world_id uuid NOT NULL REFERENCES worlds(id) ON DELETE CASCADE,
+  account_type text NOT NULL CHECK (account_type IN ('resident','organization','business','project','system')),
+  account_key text NOT NULL CHECK (char_length(account_key) BETWEEN 1 AND 160),
+  owner_id uuid,
+  asset_symbol text NOT NULL CHECK (asset_symbol IN ('USDC','BTC','ETH')),
+  balance numeric(30,8) NOT NULL DEFAULT 0,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (world_id,account_key,asset_symbol),
+  CHECK (account_type='system' OR balance >= 0)
+);
+
+CREATE TABLE IF NOT EXISTS world_economic_transactions (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  world_id uuid NOT NULL REFERENCES worlds(id) ON DELETE CASCADE,
+  action_id text NOT NULL CHECK (char_length(action_id) BETWEEN 1 AND 180),
+  transaction_type text NOT NULL CHECK (transaction_type IN ('opening_balance','simulation_seed','business_found','business_investment',
+    'business_revenue','business_expense','business_wage','profit_distribution','project_investment','organization_contribution',
+    'place_revenue','consumption','exchange_trade','maintenance','world_reward','refund')),
+  source_account_id uuid NOT NULL REFERENCES world_economic_accounts(id),
+  destination_account_id uuid NOT NULL REFERENCES world_economic_accounts(id),
+  asset_symbol text NOT NULL CHECK (asset_symbol IN ('USDC','BTC','ETH')),
+  amount numeric(30,8) NOT NULL CHECK (amount > 0),
+  reason text NOT NULL CHECK (char_length(reason) BETWEEN 3 AND 240),
+  world_time bigint NOT NULL CHECK (world_time >= 0),
+  reference_id text,
+  metadata jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(metadata)='object'),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (world_id,action_id),
+  CHECK (source_account_id <> destination_account_id)
+);
+
+CREATE TABLE IF NOT EXISTS world_economic_postings (
+  id bigserial PRIMARY KEY,
+  transaction_id uuid NOT NULL REFERENCES world_economic_transactions(id) ON DELETE CASCADE,
+  account_id uuid NOT NULL REFERENCES world_economic_accounts(id) ON DELETE CASCADE,
+  amount numeric(30,8) NOT NULL CHECK (amount <> 0),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (transaction_id,account_id)
+);
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_economic_postings'::regclass
+      AND conname='world_economic_postings_account_id_fkey'
+      AND pg_get_constraintdef(oid) LIKE '%ON DELETE CASCADE%') THEN
+    ALTER TABLE world_economic_postings DROP CONSTRAINT IF EXISTS world_economic_postings_account_id_fkey;
+    ALTER TABLE world_economic_postings ADD CONSTRAINT world_economic_postings_account_id_fkey
+      FOREIGN KEY (account_id) REFERENCES world_economic_accounts(id) ON DELETE CASCADE;
+  END IF;
+END $$;
+CREATE INDEX IF NOT EXISTS world_economic_transactions_world_recent_idx
+  ON world_economic_transactions(world_id,world_time DESC,created_at DESC);
+CREATE INDEX IF NOT EXISTS world_economic_postings_account_idx
+  ON world_economic_postings(account_id,transaction_id);
+
+CREATE TABLE IF NOT EXISTS world_economic_ownership (
+  world_id uuid NOT NULL REFERENCES worlds(id) ON DELETE CASCADE,
+  asset_type text NOT NULL CHECK (asset_type IN ('business','project','organization','place','service')),
+  asset_id uuid NOT NULL,
+  owner_type text NOT NULL CHECK (owner_type IN ('resident','organization','project')),
+  owner_id uuid NOT NULL,
+  share numeric(8,7) NOT NULL CHECK (share > 0 AND share <= 1),
+  invested_usdc numeric(30,8) NOT NULL DEFAULT 0 CHECK (invested_usdc >= 0),
+  acquired_world_time bigint NOT NULL DEFAULT 0 CHECK (acquired_world_time >= 0),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (world_id,asset_type,asset_id,owner_type,owner_id)
+);
+CREATE INDEX IF NOT EXISTS world_economic_ownership_owner_idx
+  ON world_economic_ownership(world_id,owner_type,owner_id,asset_type);
+
+CREATE TABLE IF NOT EXISTS world_businesses (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  world_id uuid NOT NULL REFERENCES worlds(id) ON DELETE CASCADE,
+  founder_agent_id uuid NOT NULL REFERENCES agents(id),
+  name text NOT NULL CHECK (char_length(name) BETWEEN 3 AND 80),
+  business_type text NOT NULL CHECK (business_type ~ '^[a-z][a-z0-9_]{1,47}$'),
+  purpose text NOT NULL CHECK (char_length(purpose) BETWEEN 12 AND 400),
+  place_id uuid REFERENCES world_scenes(id) ON DELETE SET NULL,
+  source_project_id uuid REFERENCES world_projects(id) ON DELETE SET NULL,
+  status text NOT NULL DEFAULT 'active' CHECK (status IN ('active','inactive','closed','bankrupt')),
+  reputation numeric(7,2) NOT NULL DEFAULT 0 CHECK (reputation BETWEEN -1000 AND 1000),
+  valuation_usdc numeric(30,8) NOT NULL DEFAULT 0 CHECK (valuation_usdc >= 0),
+  founded_world_time bigint NOT NULL CHECK (founded_world_time >= 0),
+  last_revenue_world_time bigint,
+  consecutive_loss_days integer NOT NULL DEFAULT 0 CHECK (consecutive_loss_days >= 0),
+  action_id text NOT NULL,
+  metadata jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(metadata)='object'),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (world_id,founder_agent_id,action_id),
+  UNIQUE (world_id,name)
+);
+
+CREATE TABLE IF NOT EXISTS world_business_services (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  world_id uuid NOT NULL REFERENCES worlds(id) ON DELETE CASCADE,
+  business_id uuid NOT NULL REFERENCES world_businesses(id) ON DELETE CASCADE,
+  service_type text NOT NULL CHECK (service_type ~ '^[a-z][a-z0-9_]{1,47}$'),
+  name text NOT NULL CHECK (char_length(name) BETWEEN 3 AND 96),
+  description text NOT NULL CHECK (char_length(description) BETWEEN 12 AND 400),
+  base_price_usdc numeric(30,8) NOT NULL CHECK (base_price_usdc > 0),
+  stock_units integer NOT NULL DEFAULT 0 CHECK (stock_units >= 0),
+  price_review_world_time bigint NOT NULL DEFAULT 0 CHECK (price_review_world_time >= 0),
+  active boolean NOT NULL DEFAULT true,
+  action_id text NOT NULL,
+  created_world_time bigint NOT NULL CHECK (created_world_time >= 0),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (world_id,business_id,action_id)
+);
+
+CREATE TABLE IF NOT EXISTS world_business_jobs (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  world_id uuid NOT NULL REFERENCES worlds(id) ON DELETE CASCADE,
+  business_id uuid NOT NULL REFERENCES world_businesses(id) ON DELETE CASCADE,
+  role text NOT NULL CHECK (char_length(role) BETWEEN 3 AND 80),
+  required_skill text CHECK (required_skill IS NULL OR required_skill ~ '^[a-z][a-z0-9_]{1,47}$'),
+  wage_usdc numeric(30,8) NOT NULL CHECK (wage_usdc > 0),
+  status text NOT NULL DEFAULT 'open' CHECK (status IN ('open','filled','closed')),
+  created_world_time bigint NOT NULL CHECK (created_world_time >= 0),
+  action_id text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (world_id,business_id,action_id)
+);
+
+CREATE TABLE IF NOT EXISTS world_business_applications (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  world_id uuid NOT NULL REFERENCES worlds(id) ON DELETE CASCADE,
+  job_id uuid NOT NULL REFERENCES world_business_jobs(id) ON DELETE CASCADE,
+  business_id uuid NOT NULL REFERENCES world_businesses(id) ON DELETE CASCADE,
+  agent_id uuid NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+  status text NOT NULL CHECK (status IN ('pending','accepted','rejected','withdrawn')),
+  action_id text NOT NULL,
+  created_world_time bigint NOT NULL CHECK (created_world_time >= 0),
+  updated_world_time bigint NOT NULL CHECK (updated_world_time >= 0),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (world_id,agent_id,action_id),
+  UNIQUE (job_id,agent_id)
+);
+
+CREATE TABLE IF NOT EXISTS world_business_employment (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  world_id uuid NOT NULL REFERENCES worlds(id) ON DELETE CASCADE,
+  business_id uuid NOT NULL REFERENCES world_businesses(id) ON DELETE CASCADE,
+  job_id uuid NOT NULL REFERENCES world_business_jobs(id) ON DELETE CASCADE,
+  agent_id uuid NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+  wage_usdc numeric(30,8) NOT NULL CHECK (wage_usdc > 0),
+  status text NOT NULL CHECK (status IN ('active','left','terminated')),
+  started_world_time bigint NOT NULL CHECK (started_world_time >= 0),
+  ended_world_time bigint,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  CHECK (ended_world_time IS NULL OR ended_world_time >= started_world_time)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS world_business_employment_one_active_job_idx
+  ON world_business_employment(world_id,agent_id) WHERE status='active';
+CREATE UNIQUE INDEX IF NOT EXISTS world_business_job_one_active_employee_idx
+  ON world_business_employment(job_id) WHERE status='active';
+
+CREATE TABLE IF NOT EXISTS world_business_orders (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  world_id uuid NOT NULL REFERENCES worlds(id) ON DELETE CASCADE,
+  business_id uuid NOT NULL REFERENCES world_businesses(id) ON DELETE CASCADE,
+  service_id uuid NOT NULL REFERENCES world_business_services(id) ON DELETE RESTRICT,
+  customer_agent_id uuid NOT NULL REFERENCES agents(id),
+  price_usdc numeric(30,8) NOT NULL CHECK (price_usdc > 0),
+  status text NOT NULL CHECK (status IN ('fulfilled','refunded')),
+  action_id text NOT NULL,
+  world_time bigint NOT NULL CHECK (world_time >= 0),
+  benefit jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(benefit)='object'),
+  transaction_id uuid REFERENCES world_economic_transactions(id),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (world_id,customer_agent_id,action_id)
+);
+
+CREATE TABLE IF NOT EXISTS world_business_production (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  world_id uuid NOT NULL REFERENCES worlds(id) ON DELETE CASCADE,
+  business_id uuid NOT NULL REFERENCES world_businesses(id) ON DELETE CASCADE,
+  service_id uuid NOT NULL REFERENCES world_business_services(id) ON DELETE RESTRICT,
+  agent_id uuid NOT NULL REFERENCES agents(id),
+  employment_id uuid REFERENCES world_business_employment(id) ON DELETE SET NULL,
+  action_id text NOT NULL,
+  units integer NOT NULL DEFAULT 1 CHECK (units BETWEEN 1 AND 10),
+  world_time bigint NOT NULL CHECK (world_time >= 0),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (world_id,action_id)
+);
+
+CREATE TABLE IF NOT EXISTS world_economic_demand (
+  world_id uuid NOT NULL REFERENCES worlds(id) ON DELETE CASCADE,
+  service_type text NOT NULL CHECK (service_type ~ '^[a-z][a-z0-9_]{1,47}$'),
+  world_day bigint NOT NULL CHECK (world_day >= 0),
+  demand_count integer NOT NULL DEFAULT 0 CHECK (demand_count >= 0),
+  supply_count integer NOT NULL DEFAULT 0 CHECK (supply_count >= 0),
+  unmet_count integer NOT NULL DEFAULT 0 CHECK (unmet_count >= 0),
+  evidence jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(evidence)='object'),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (world_id,service_type,world_day)
+);
+CREATE INDEX IF NOT EXISTS world_businesses_active_idx ON world_businesses(world_id,status,reputation DESC);
+CREATE INDEX IF NOT EXISTS world_business_services_market_idx ON world_business_services(world_id,service_type,active);
+CREATE INDEX IF NOT EXISTS world_business_jobs_open_idx ON world_business_jobs(world_id,status,created_world_time);
+CREATE INDEX IF NOT EXISTS world_business_applications_pending_idx ON world_business_applications(world_id,business_id,status);
+CREATE INDEX IF NOT EXISTS world_business_orders_recent_idx ON world_business_orders(world_id,world_time DESC,id);
+
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_history'::regclass
+      AND conname='world_history_event_type_check' AND pg_get_constraintdef(oid) LIKE '%business_founded%'
+      AND pg_get_constraintdef(oid) LIKE '%business_capability_practiced%'
+      AND pg_get_constraintdef(oid) LIKE '%place_closed%'
+      AND pg_get_constraintdef(oid) LIKE '%project_invested%'
+      AND pg_get_constraintdef(oid) LIKE '%project_revenue%'
+      AND pg_get_constraintdef(oid) LIKE '%business_profit%') THEN
+    ALTER TABLE world_history DROP CONSTRAINT IF EXISTS world_history_event_type_check;
+    ALTER TABLE world_history ADD CONSTRAINT world_history_event_type_check CHECK (event_type IN (
+      'opportunity_created','project_proposed','project_started','project_completed','project_failed',
+      'organization_founded','organization_joined','organization_left','organization_invited','place_created',
+      'place_maintenance','place_closed',
+      'information_shared','information_accepted','information_doubted','information_ignored','cooperation_completed','milestone',
+      'project_invested','project_revenue',
+      'business_founded','business_invested','business_first_customer','business_revenue','business_profit','business_loss',
+      'business_closed','business_employment','business_price_changed','business_partnership','business_capability_practiced','economic_purchase'));
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_history'::regclass
+      AND conname='world_history_entity_type_check' AND pg_get_constraintdef(oid) LIKE '%business%') THEN
+    ALTER TABLE world_history DROP CONSTRAINT IF EXISTS world_history_entity_type_check;
+    ALTER TABLE world_history ADD CONSTRAINT world_history_entity_type_check
+      CHECK (entity_type IN ('opportunity','project','organization','place','cooperation','world','business','job','order'));
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_agent_states'::regclass
+      AND conname='world_agent_states_planned_action_check'
+      AND pg_get_constraintdef(oid) LIKE '%business_service%'
+      AND pg_get_constraintdef(oid) LIKE '%business_reject%'
+      AND pg_get_constraintdef(oid) LIKE '%business_leave%'
+      AND pg_get_constraintdef(oid) LIKE '%business_skill_practice%'
+      AND pg_get_constraintdef(oid) LIKE '%business_seek_cofounder%'
+      AND pg_get_constraintdef(oid) LIKE '%project_invest%'
+      AND pg_get_constraintdef(oid) LIKE '%project_distribute%') THEN
+    ALTER TABLE world_agent_states DROP CONSTRAINT IF EXISTS world_agent_states_planned_action_check;
+    ALTER TABLE world_agent_states ADD CONSTRAINT world_agent_states_planned_action_check
+      CHECK (planned_action IS NULL OR planned_action IN ('work','learn','rest','eat','socialize','trade','cooperate',
+        'opportunity','opportunity_reject','opportunity_propose','project_propose','project_join','project_reject','project_contribute','project_leave',
+        'organization_found','organization_join','organization_leave','organization_invite','organization_reject','organization_contribute',
+        'place_create','information_share','information_accept','information_ignore','information_doubt','goal_review',
+        'project_invest','project_distribute',
+        'business_found','business_service','business_apply','business_leave','business_hire','business_work','business_invest',
+        'business_reject','business_price','business_distribute','business_close','business_skill_practice','business_seek_cofounder'));
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_emergence_events'::regclass
+      AND conname='world_emergence_events_system_check' AND pg_get_constraintdef(oid) LIKE '%business%') THEN
+    ALTER TABLE world_emergence_events DROP CONSTRAINT IF EXISTS world_emergence_events_system_check;
+    ALTER TABLE world_emergence_events ADD CONSTRAINT world_emergence_events_system_check
+      CHECK (system IN ('opportunity','project','organization','information','place','goal','business','employment','economy'));
+  END IF;
+END $$;
+
+ALTER TABLE world_scenes ADD COLUMN IF NOT EXISTS operating_cost_usdc numeric(30,8) NOT NULL DEFAULT 0
+  CHECK (operating_cost_usdc >= 0);
+ALTER TABLE world_scenes ADD COLUMN IF NOT EXISTS revenue_enabled boolean NOT NULL DEFAULT false;
+ALTER TABLE world_scenes ADD COLUMN IF NOT EXISTS revenue_share_bps integer NOT NULL DEFAULT 0
+  CHECK (revenue_share_bps BETWEEN 0 AND 2500);
+ALTER TABLE world_scenes ADD COLUMN IF NOT EXISTS last_maintenance_world_day bigint NOT NULL DEFAULT -1
+  CHECK (last_maintenance_world_day >= -1);
+ALTER TABLE world_scenes ADD COLUMN IF NOT EXISTS maintenance_missed_days integer NOT NULL DEFAULT 0
+  CHECK (maintenance_missed_days >= 0);
+
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_agent_beliefs'::regclass
+      AND conname='world_agent_beliefs_subject_type_check'
+      AND pg_get_constraintdef(oid) LIKE '%opportunity%'
+      AND pg_get_constraintdef(oid) LIKE '%business%'
+      AND pg_get_constraintdef(oid) LIKE '%organization%'
+      AND pg_get_constraintdef(oid) LIKE '%market%') THEN
+    ALTER TABLE world_agent_beliefs DROP CONSTRAINT IF EXISTS world_agent_beliefs_subject_type_check;
+    ALTER TABLE world_agent_beliefs ADD CONSTRAINT world_agent_beliefs_subject_type_check
+      CHECK (subject_type IN ('action','place','resident','asset','project','opportunity','business','organization','market'));
+  END IF;
+END $$;
+
+-- Preserve ownership for existing resident-built assets and give each existing
+-- project a separate treasury. These are additive, idempotent backfills.
+INSERT INTO world_economic_accounts(world_id,account_type,account_key,owner_id,asset_symbol,balance)
+SELECT project.world_id,'project','project:'||project.id::text,project.id,'USDC',0
+FROM world_projects project
+ON CONFLICT(world_id,account_key,asset_symbol) DO NOTHING;
+INSERT INTO world_economic_accounts(world_id,account_type,account_key,owner_id,asset_symbol,balance)
+SELECT organization.world_id,'organization','organization:'||organization.id::text,organization.id,'USDC',0
+FROM world_organizations organization
+ON CONFLICT(world_id,account_key,asset_symbol) DO NOTHING;
+INSERT INTO world_economic_ownership(world_id,asset_type,asset_id,owner_type,owner_id,share,invested_usdc,acquired_world_time)
+SELECT project.world_id,'project',project.id,'resident',project.creator_agent_id,1,0,project.created_world_time
+FROM world_projects project
+ON CONFLICT(world_id,asset_type,asset_id,owner_type,owner_id) DO NOTHING;
+INSERT INTO world_economic_ownership(world_id,asset_type,asset_id,owner_type,owner_id,share,invested_usdc,acquired_world_time)
+SELECT organization.world_id,'organization',organization.id,'resident',organization.founder_agent_id,1,0,organization.created_world_time
+FROM world_organizations organization
+ON CONFLICT(world_id,asset_type,asset_id,owner_type,owner_id) DO NOTHING;
+INSERT INTO world_economic_ownership(world_id,asset_type,asset_id,owner_type,owner_id,share,invested_usdc,acquired_world_time)
+SELECT scene.world_id,'place',scene.id,
+  CASE WHEN scene.created_by_organization_id IS NOT NULL THEN 'organization'
+       WHEN scene.created_by_project_id IS NOT NULL THEN 'project' ELSE 'resident' END,
+  COALESCE(scene.created_by_organization_id,scene.created_by_project_id,scene.created_by),1,0,
+  scene.created_world_minutes
+FROM world_scenes scene
+WHERE COALESCE(scene.created_by_organization_id,scene.created_by_project_id,scene.created_by) IS NOT NULL
+ON CONFLICT(world_id,asset_type,asset_id,owner_type,owner_id) DO NOTHING;
+
+-- Every transaction must have exactly two equal-and-opposite postings that
+-- match its declared source, destination, asset and amount.
+CREATE OR REPLACE FUNCTION verify_world_economic_transaction_balance() RETURNS trigger AS $$
+DECLARE
+  transaction_id_value uuid;
+  transaction_row world_economic_transactions%ROWTYPE;
+  posting_count integer;
+  posting_net numeric;
+  source_amount numeric;
+  destination_amount numeric;
+  source_matches boolean;
+  destination_matches boolean;
+BEGIN
+  IF TG_TABLE_NAME='world_economic_transactions' THEN
+    transaction_id_value := NEW.id;
+  ELSIF TG_OP='DELETE' THEN
+    transaction_id_value := OLD.transaction_id;
+  ELSE
+    transaction_id_value := NEW.transaction_id;
+  END IF;
+  SELECT * INTO transaction_row FROM world_economic_transactions WHERE id=transaction_id_value;
+  IF NOT FOUND THEN RETURN NULL; END IF;
+  SELECT count(*)::int,COALESCE(sum(amount),0),
+      COALESCE(sum(amount) FILTER (WHERE account_id=transaction_row.source_account_id),0),
+      COALESCE(sum(amount) FILTER (WHERE account_id=transaction_row.destination_account_id),0)
+    INTO posting_count,posting_net,source_amount,destination_amount
+    FROM world_economic_postings WHERE transaction_id=transaction_id_value;
+  SELECT EXISTS(SELECT 1 FROM world_economic_accounts account
+    WHERE account.id=transaction_row.source_account_id AND account.world_id=transaction_row.world_id
+      AND account.asset_symbol=transaction_row.asset_symbol),
+      EXISTS(SELECT 1 FROM world_economic_accounts account
+    WHERE account.id=transaction_row.destination_account_id AND account.world_id=transaction_row.world_id
+      AND account.asset_symbol=transaction_row.asset_symbol)
+    INTO source_matches,destination_matches;
+  IF posting_count<>2 OR posting_net<>0 OR source_amount<>-transaction_row.amount
+      OR destination_amount<>transaction_row.amount OR NOT source_matches OR NOT destination_matches THEN
+    RAISE EXCEPTION 'world economic transaction % has unbalanced or mismatched postings',transaction_id_value;
+  END IF;
+  RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+DROP TRIGGER IF EXISTS world_economic_transaction_balance_check ON world_economic_transactions;
+CREATE CONSTRAINT TRIGGER world_economic_transaction_balance_check
+  AFTER INSERT OR UPDATE ON world_economic_transactions DEFERRABLE INITIALLY DEFERRED
+  FOR EACH ROW EXECUTE FUNCTION verify_world_economic_transaction_balance();
+DROP TRIGGER IF EXISTS world_economic_posting_balance_check ON world_economic_postings;
+CREATE CONSTRAINT TRIGGER world_economic_posting_balance_check
+  AFTER INSERT OR UPDATE OR DELETE ON world_economic_postings DEFERRABLE INITIALLY DEFERRED
+  FOR EACH ROW EXECUTE FUNCTION verify_world_economic_transaction_balance();
+
+-- Idempotently import current simulated portfolios as opening balances. The
+-- resident balances are not changed; old crypto_ledger rows remain history.
+INSERT INTO world_economic_accounts(world_id,account_type,account_key,owner_id,asset_symbol,balance)
+SELECT world_id,'resident',agent_id::text,agent_id,asset_symbol,balance
+FROM crypto_balances ON CONFLICT(world_id,account_key,asset_symbol) DO NOTHING;
+INSERT INTO world_economic_accounts(world_id,account_type,account_key,asset_symbol)
+SELECT DISTINCT world_id,'system','system:opening:'||asset_symbol,asset_symbol FROM crypto_balances
+ON CONFLICT(world_id,account_key,asset_symbol) DO NOTHING;
+INSERT INTO world_economic_transactions(world_id,action_id,transaction_type,source_account_id,destination_account_id,
+    asset_symbol,amount,reason,world_time,reference_id)
+SELECT resident.world_id,'legacy-opening:'||resident.owner_id::text||':'||resident.asset_symbol,'opening_balance',
+    system.id,resident.id,resident.asset_symbol,resident.balance,
+    'Preserved pre-V4 simulated portfolio as an opening balance.',0,resident.owner_id::text
+FROM world_economic_accounts resident
+JOIN world_economic_accounts system ON system.world_id=resident.world_id
+  AND system.account_key='system:opening:'||resident.asset_symbol AND system.asset_symbol=resident.asset_symbol
+WHERE resident.account_type='resident' AND resident.balance>0
+ON CONFLICT(world_id,action_id) DO NOTHING;
+INSERT INTO world_economic_postings(transaction_id,account_id,amount)
+SELECT tx.id,tx.destination_account_id,tx.amount
+FROM world_economic_transactions tx
+WHERE tx.transaction_type='opening_balance'
+ON CONFLICT(transaction_id,account_id) DO NOTHING;
+INSERT INTO world_economic_postings(transaction_id,account_id,amount)
+SELECT tx.id,tx.source_account_id,-tx.amount
+FROM world_economic_transactions tx
+WHERE tx.transaction_type='opening_balance'
+ON CONFLICT(transaction_id,account_id) DO NOTHING;
+UPDATE world_economic_accounts account SET balance=COALESCE(posted.total,0),updated_at=now()
+FROM (SELECT posting.account_id,sum(posting.amount) AS total FROM world_economic_postings posting GROUP BY posting.account_id) posted
+WHERE account.id=posted.account_id AND account.account_type='system';
 
 DO $$
 BEGIN
