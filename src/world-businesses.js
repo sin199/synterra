@@ -1,6 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import { formatUnits, parsePositiveUnits } from './crypto-market.js';
 import { ensureEconomicAccount, getEconomicAccount, postEconomicTransfer, transferBetweenAccounts } from './economic-ledger.js';
+import { activeServicePriceAgreement, createSystemEmploymentAgreement, recordEmploymentShift,
+  settleActiveRevenueShares, settleServiceDelivery } from './world-institutions.js';
 
 const SERVICE_INFO = Object.freeze({
   research_service: { type: 'research', label: 'Research Notes', skill: 'research', base: '35.00000000',
@@ -1297,6 +1299,9 @@ export async function decideWorldBusinessApplication(client, { worldId, applicat
   }
   const employment = await client.query(`INSERT INTO world_business_employment(world_id,business_id,job_id,agent_id,wage_usdc,status,started_world_time)
     VALUES($1,$2,$3,$4,$5,'active',$6) RETURNING id`, [worldId, row.business_id, row.jobId, row.agent_id, row.wage, worldTime]);
+  const employmentAgreement = await createSystemEmploymentAgreement(client, { worldId, employmentId: employment.rows[0].id,
+    businessId: row.business_id, jobId: row.jobId, founderAgentId, employeeAgentId: row.agent_id,
+    wageUsdc: row.wage, role: row.role, worldTime });
   await client.query(`UPDATE world_business_applications SET status='accepted',action_id=$3,updated_world_time=$4
     WHERE id=$1 AND world_id=$2`, [applicationId, worldId, actionId, worldTime]);
   await client.query(`UPDATE world_business_jobs SET status='filled' WHERE id=$1`, [row.jobId]);
@@ -1306,7 +1311,7 @@ export async function decideWorldBusinessApplication(client, { worldId, applicat
     detail: `A resident accepted the ${row.role} job at ${row.businessName} with a ${row.wage} simulated USDC shift wage.`,
     metadata: { employmentId: employment.rows[0].id, employeeId: row.agent_id, wage: row.wage,
       expiredApplications: expiredApplications.expired } });
-  return { id: employment.rows[0].id, applicationId, status: 'active', employeeId: row.agent_id, wage: row.wage,
+  return { id: employment.rows[0].id, applicationId, agreementId: employmentAgreement.id, status: 'active', employeeId: row.agent_id, wage: row.wage,
     expiredApplications: expiredApplications.expired };
 }
 
@@ -1329,7 +1334,9 @@ export async function purchaseWorldBusinessService(client, { worldId, serviceId,
   if (service.placeId && service.placeStatus !== 'active') throw error('BUSINESS_VENUE_CLOSED');
   await assertNotBusinessBeneficiary(client, worldId, service.business_id, customerAgentId);
   if (service.stock_units < 1) throw error('BUSINESS_SERVICE_OUT_OF_STOCK');
-  const quotedPrice = quoteBusinessPrice({ basePrice: service.base_price_usdc, demand, supply,
+  const serviceAgreement = await activeServicePriceAgreement(client, { worldId, businessId: service.business_id,
+    serviceId, customerAgentId, providerAgentId: service.founderAgentId, worldTime });
+  const quotedPrice = serviceAgreement?.terms.priceUsdc || quoteBusinessPrice({ basePrice: service.base_price_usdc, demand, supply,
     reputation: service.businessReputation, relationship, wealth, priceSensitivity });
   if (maxPriceUsdc && Number(quotedPrice) > Number(maxPriceUsdc) + 1e-8) throw error('BUSINESS_PRICE_CHANGED');
   const customer = await getEconomicAccount(client, { worldId, accountType: 'resident', ownerId: customerAgentId, forUpdate: true });
@@ -1367,14 +1374,20 @@ export async function purchaseWorldBusinessService(client, { worldId, serviceId,
       metadata: { serviceId, businessId: service.business_id, customerAgentId, ownerShare: ownerShare.toString() } });
     venueTransactions.push(paid.transactionId);
   }
+  const revenueShareSettlements = await settleActiveRevenueShares(client, { worldId, businessId: service.business_id,
+    businessRevenueUsdc: businessRevenue, orderActionId: actionId, customerAgentId, worldTime });
   await client.query(`UPDATE world_business_services SET stock_units=stock_units-1 WHERE id=$1 AND stock_units>0`, [serviceId]);
   const benefit = SERVICE_BENEFITS[service.service_type] || { knowledge: 10 };
   const order = await client.query(`INSERT INTO world_business_orders(world_id,business_id,service_id,customer_agent_id,
-      price_usdc,status,action_id,world_time,benefit,transaction_id)
-    VALUES($1,$2,$3,$4,$5,'fulfilled',$6,$7,$8::jsonb,$9) RETURNING id`,
+      price_usdc,status,action_id,world_time,benefit,transaction_id,agreement_id)
+    VALUES($1,$2,$3,$4,$5,'fulfilled',$6,$7,$8::jsonb,$9,$10) RETURNING id`,
   [worldId, service.business_id, serviceId, customerAgentId, quotedPrice, actionId, worldTime,
     JSON.stringify({ serviceType: service.service_type, name: service.name, benefits: benefit,
-      venueFee, venueTransactionIds: venueTransactions }), transaction.transactionId]);
+      venueFee, venueTransactionIds: venueTransactions, revenueShareSettlements }), transaction.transactionId,
+    serviceAgreement?.id || null]);
+  await settleServiceDelivery(client, { worldId, agreementId: serviceAgreement?.id || null,
+    customerAgentId, providerAgentId: service.founderAgentId, businessId: service.business_id,
+    orderId: order.rows[0].id, worldTime, actionId });
   await client.query(`UPDATE world_businesses SET reputation=LEAST(1000,reputation+1),last_revenue_world_time=$3,updated_at=now()
     WHERE world_id=$1 AND id=$2`, [worldId, service.business_id, worldTime]);
   const previousOrders = await client.query(`SELECT count(*)::int AS count FROM world_business_orders WHERE business_id=$1 AND id<>$2`,
@@ -1386,7 +1399,9 @@ export async function purchaseWorldBusinessService(client, { worldId, serviceId,
     metadata: { businessId: service.business_id, serviceId, customerAgentId, amount: quotedPrice } });
   return { orderId: order.rows[0].id, businessId: service.business_id, serviceId, status: 'fulfilled',
     priceUsdc: quotedPrice, transactionId: transaction.transactionId,
-    businessRevenueUsdc: businessRevenue, venueFeeUsdc: venueFee, venueTransactionIds: venueTransactions,
+    businessRevenueUsdc: businessRevenue, revenueShareSettlements,
+    revenueShareUsdc: formatUnits(revenueShareSettlements.reduce((sum, item) => sum+parsePositiveUnits(item.amountUsdc), 0n)),
+    venueFeeUsdc: venueFee, venueTransactionIds: venueTransactions,
     benefit, serviceType: service.service_type, serviceName: service.name, businessName: service.businessName,
     businessFounderAgentId: service.founderAgentId, idempotent: false };
 }
@@ -1404,27 +1419,36 @@ export async function completeWorldBusinessShift(client, { worldId, businessId, 
     AND id=$3 AND active=true FOR UPDATE`, [worldId, businessId, serviceId]);
   if (!service.rowCount) throw error('BUSINESS_SERVICE_UNAVAILABLE', 404);
   let wage = null;
+  let employmentAgreementId = null;
   if (employmentId) {
     const employment = await client.query(`SELECT * FROM world_business_employment WHERE world_id=$1 AND business_id=$2
       AND agent_id=$3 AND id=$4 AND status='active' FOR UPDATE`, [worldId, businessId, agentId, employmentId]);
     if (!employment.rowCount) throw error('BUSINESS_EMPLOYMENT_REQUIRED', 403);
-    wage = employment.rows[0].wage_usdc;
+    const agreement = await client.query(`SELECT id,terms->>'wageUsdc' AS "wageUsdc" FROM world_agreements
+      WHERE world_id=$1 AND agreement_type='employment' AND status='active' AND terms->>'employmentId'=$2
+      ORDER BY updated_world_time DESC LIMIT 1 FOR UPDATE`, [worldId, employmentId]);
+    employmentAgreementId = agreement.rows[0]?.id || null;
+    wage = agreement.rows[0]?.wageUsdc || employment.rows[0].wage_usdc;
     await transferBetweenAccounts(client, { worldId,
       source: { accountType: 'business', ownerId: businessId, key: `business:${businessId}` },
       destination: { accountType: 'resident', ownerId: agentId }, amount: wage,
       transactionType: 'business_wage', reason: `Paid shift wage for ${business.name}.`, worldTime,
-      actionId: `business-wage:${actionId}`, referenceId: employmentId, metadata: { businessId, employmentId } });
+      actionId: `business-wage:${actionId}`, referenceId: employmentId,
+      metadata: { businessId, employmentId, agreementId: employmentAgreementId } });
   } else {
     if (business.founder_agent_id !== agentId) await requireBusinessOwner(client, worldId, businessId, agentId);
   }
   await client.query(`INSERT INTO world_business_production(world_id,business_id,service_id,agent_id,employment_id,
-      action_id,units,world_time) VALUES($1,$2,$3,$4,$5,$6,1,$7)`,
-  [worldId, businessId, serviceId, agentId, employmentId, actionId, worldTime]);
+      agreement_id,action_id,units,world_time) VALUES($1,$2,$3,$4,$5,$6,$7,1,$8)`,
+  [worldId, businessId, serviceId, agentId, employmentId, employmentAgreementId, actionId, worldTime]);
+  if (employmentId) await recordEmploymentShift(client, { worldId, employmentId, workActionId: actionId,
+    worldTime, businessId, agentId });
   const updated = await client.query(`UPDATE world_business_services SET stock_units=stock_units+1
     WHERE id=$1 RETURNING stock_units`, [serviceId]);
   return { businessId, serviceId, serviceType: service.rows[0].service_type,
     businessName: business.name, businessFounderAgentId: business.founder_agent_id,
-    stockUnits: updated.rows[0].stock_units, wageUsdc: wage, producerAgentId: agentId, employmentId };
+    stockUnits: updated.rows[0].stock_units, wageUsdc: wage, producerAgentId: agentId, employmentId,
+    agreementId: employmentAgreementId };
 }
 
 export async function investInWorldBusiness(client, { worldId, businessId, investorAgentId, amount, actionId, worldTime,
@@ -1842,6 +1866,7 @@ export async function listWorldBusinesses(client, { worldId, limit = 100 } = {})
       COALESCE(services.items,'[]'::jsonb) AS services,
       COALESCE(jobs.items,'[]'::jsonb) AS jobs,
       COALESCE(workers.items,'[]'::jsonb) AS workers,
+      COALESCE(agreements.items,'[]'::jsonb) AS agreements,
       COALESCE(customers.order_count,0)::int AS "orderCount",
       COALESCE(customers.customer_count,0)::int AS "customerCount",
       COALESCE(history.items,'[]'::jsonb) AS history
@@ -1878,6 +1903,11 @@ export async function listWorldBusinesses(client, { worldId, limit = 100 } = {})
       FROM world_business_employment employment JOIN agents employee ON employee.id=employment.agent_id
       JOIN world_business_jobs job ON job.world_id=employment.world_id AND job.id=employment.job_id
       WHERE employment.world_id=business.world_id AND employment.business_id=business.id AND employment.status='active') workers ON true
+    LEFT JOIN LATERAL (SELECT jsonb_agg(jsonb_build_object('id',agreement.id,'type',agreement.agreement_type,
+        'status',agreement.status,'terms',agreement.terms,'updatedWorldTime',agreement.updated_world_time)
+        ORDER BY agreement.updated_world_time DESC,agreement.created_at DESC) AS items
+      FROM (SELECT * FROM world_agreements WHERE world_id=business.world_id
+        AND terms->>'businessId'=business.id::text ORDER BY updated_world_time DESC,created_at DESC LIMIT 12) agreement) agreements ON true
     LEFT JOIN LATERAL (SELECT count(*)::int AS order_count,count(DISTINCT customer_agent_id)::int AS customer_count
       FROM world_business_orders WHERE world_id=business.world_id AND business_id=business.id AND status='fulfilled') customers ON true
     LEFT JOIN LATERAL (SELECT jsonb_agg(jsonb_build_object('eventType',event_type,'worldTime',world_time,

@@ -21,6 +21,8 @@ import { foundWorldOrganization, inviteWorldOrganization, decideOrganizationMemb
   contributeOrganizationEffort, listWorldOrganizations } from './world-organizations.js';
 import { shareWorldInformation, decideWorldInformationShare, listInformationInbox } from './world-information.js';
 import { readEmergenceReport } from './world-emergence.js';
+import { createWorldCommitment, listWorldAgreements, listWorldInstitutionSummary, proposeOrganizationGovernance,
+  proposeWorldAgreement, resolveWorldCommitment, respondToWorldAgreement, voteOrganizationProposal } from './world-institutions.js';
 import { closeWorldBusiness, distributeWorldBusinessProfit, distributeWorldProjectRevenue,
   economicDashboardSql, foundWorldBusiness, investInWorldBusiness, investInWorldProject, listWorldBusinesses,
   purchaseWorldBusinessService, reviewWorldBusinessPrice, completeWorldBusinessShift, applyToWorldBusinessJob,
@@ -374,12 +376,13 @@ app.get('/local/map-data', async (_request, reply) => {
       FROM world_history WHERE world_id=$1 ORDER BY world_time DESC,id DESC LIMIT 8`, [worldId]),
     pool.query('SELECT COALESCE(sum(amount),0)::text AS units FROM token_ledger WHERE world_id=$1', [worldId])
   ]);
+  const institutions = await listWorldInstitutionSummary(pool, { worldId, limit: 10 });
   const worldEvolution = { dashboard: { ...counts.rows[0], worldMinutes, worldAgeHours: Math.round(worldMinutes / 60),
       worldAgeDays: Math.floor(worldMinutes / 1_440) + 1,
       totalSimulatedWealthUsd: (Number(economyDashboard.rows[0]?.total_resident_net_worth_usd || 0)
         + [...memeValueByAgent.values()].reduce((sum, value) => sum + value, 0)).toFixed(2),
-      totalInternalUnits: internalUnits.rows[0].units }, opportunities: opportunities.rows, projects,
-    organizations, history: history.rows };
+        totalInternalUnits: internalUnits.rows[0].units }, opportunities: opportunities.rows, projects,
+    organizations, institutions, history: history.rows };
   worldEvolution.economy = { dashboard: economyDashboard.rows[0] || {}, businesses,
     demand: economicDemand.rows, history: economyHistory.rows,
     settlement: 'simulated_internal_ledger', chainSettlementEnabled: false };
@@ -520,8 +523,43 @@ app.get('/local/map-data/residents/:agentId', async (request, reply) => {
     [worldId, agentId])
   ]);
   if (!profile.rowCount) return fail(reply, 404, 'RESIDENT_NOT_FOUND');
+  const institutions = (await pool.query(`SELECT
+      COALESCE((SELECT jsonb_agg(jsonb_build_object('id',recent.id,'type',recent.agreement_type,
+          'status',recent.status,'terms',recent.terms,'round',recent.negotiation_round,'worldTime',recent.updated_world_time,
+          'otherAgentId',CASE WHEN recent.proposer_agent_id=$2 THEN recent.counterparty_agent_id ELSE recent.proposer_agent_id END,
+          'otherName',CASE WHEN recent.proposer_agent_id=$2 THEN counterparty.name ELSE proposer.name END)
+        ORDER BY recent.updated_world_time DESC,recent.created_at DESC)
+        FROM (SELECT * FROM world_agreements WHERE world_id=$1 AND $2 IN (proposer_agent_id,counterparty_agent_id)
+          ORDER BY updated_world_time DESC,created_at DESC LIMIT 12) recent
+        JOIN agents proposer ON proposer.id=recent.proposer_agent_id
+        JOIN agents counterparty ON counterparty.id=recent.counterparty_agent_id),'[]'::jsonb) AS agreements,
+      COALESCE((SELECT jsonb_agg(jsonb_build_object('id',recent.id,'type',recent.commitment_type,
+          'description',recent.description,'status',recent.status,'dueWorldTime',recent.due_world_time,
+          'outcomeReason',recent.outcome_reason)
+        ORDER BY recent.due_world_time,recent.created_at)
+        FROM (SELECT * FROM world_commitments WHERE world_id=$1 AND agent_id=$2
+          ORDER BY due_world_time DESC,created_at DESC LIMIT 12) recent),'[]'::jsonb) AS commitments,
+      (SELECT jsonb_build_object('reliability',reliability,'professional',professional,'financial',financial,
+          'cooperation',cooperation,'fulfilledCount',fulfilled_count,'breachCount',breach_count)
+        FROM world_agent_reputations WHERE world_id=$1 AND agent_id=$2) AS reputation,
+      COALESCE((SELECT jsonb_agg(jsonb_build_object('organizationId',organization.id,'name',organization.name,
+          'role',member.role,'status',member.status,'governanceMode',organization.governance_mode)
+        ORDER BY member.joined_world_time DESC)
+        FROM world_organization_members member JOIN world_organizations organization
+          ON organization.world_id=member.world_id AND organization.id=member.organization_id
+        WHERE member.world_id=$1 AND member.agent_id=$2 AND member.status IN ('active','invited')),'[]'::jsonb) AS "organizationRoles",
+      COALESCE((SELECT jsonb_agg(jsonb_build_object('eventType',recent.event_type,'title',recent.title,
+          'detail',recent.detail,'worldTime',recent.world_time,'agreementId',recent.entity_id)
+        ORDER BY recent.world_time DESC,recent.id DESC)
+        FROM (SELECT history.* FROM world_history history JOIN world_agreements agreement
+          ON agreement.world_id=history.world_id AND agreement.id=history.entity_id
+          WHERE history.world_id=$1 AND history.entity_type='agreement'
+            AND $2 IN (agreement.proposer_agent_id,agreement.counterparty_agent_id)
+          ORDER BY history.world_time DESC,history.id DESC LIMIT 8) recent),'[]'::jsonb) AS "recentNegotiations"
+    `, [worldId, agentId])).rows[0];
   return { resident: profile.rows[0], skills: skills.rows, relationships: relationships.rows, recentMemories: memories.rows,
     goals: goals.rows, beliefs: beliefs.rows, decisions: decisions.rows, reflections: reflections.rows,
+    institutions,
     economy: { netWorthUsd: residentNetWorth.rows[0]?.netWorthUsd || '0.00000000', balances: balances.rows,
       employment: employment.rows, ownership: ownership.rows, recentTransactions: recentTransactions.rows,
       recentPurchases: recentPurchases.rows } };
@@ -1797,6 +1835,109 @@ app.post('/v1/worlds/:worldId/organizations/:organizationId/contributions', asyn
       : Number(body.effort);
     return contributeOrganizationEffort(client, { worldId, organizationId, agentId: request.agentId, actionId,
       worldTime: await readWorldMinutes(client, worldId), effort });
+  });
+  return reply.send(result);
+});
+
+app.get('/v1/worlds/:worldId/agreements', async (request, reply) => {
+  const { worldId } = request.params;
+  if (!validUuid(worldId)) return fail(reply, 400, 'WORLD_ID_INVALID');
+  await assertMember(pool, worldId, request.agentId);
+  return { agreements: await listWorldAgreements(pool, { worldId, agentId: request.agentId,
+    limit: Math.min(250, Math.max(1, Number(request.query.limit) || 100)) }) };
+});
+
+app.post('/v1/worlds/:worldId/agreements', async (request, reply) => {
+  const { worldId } = request.params;
+  const body = request.body || {};
+  if (!validUuid(worldId) || !validUuid(body.counterpartyAgentId)) return fail(reply, 400, 'AGREEMENT_PARTIES_INVALID');
+  const actionId = requireActionId(body);
+  const agreement = await transaction(async (client) => {
+    await assertMember(client, worldId, request.agentId, true);
+    return proposeWorldAgreement(client, { worldId, proposerAgentId: request.agentId,
+      counterpartyAgentId: body.counterpartyAgentId, agreementType: body.agreementType, terms: body.terms,
+      actionId, worldTime: await readWorldMinutes(client, worldId),
+      expiresInWorldMinutes: body.expiresInWorldMinutes });
+  });
+  return reply.code(agreement.idempotent ? 200 : 201).send({ agreement });
+});
+
+app.post('/v1/worlds/:worldId/agreements/:agreementId/response', async (request, reply) => {
+  const { worldId, agreementId } = request.params;
+  const body = request.body || {};
+  if (!validUuid(worldId) || !validUuid(agreementId)) return fail(reply, 400, 'AGREEMENT_ID_INVALID');
+  const actionId = requireActionId(body);
+  const result = await transaction(async (client) => {
+    await assertMember(client, worldId, request.agentId, true);
+    return respondToWorldAgreement(client, { worldId, agreementId, agentId: request.agentId,
+      decision: body.decision, counterTerms: body.counterTerms, actionId,
+      worldTime: await readWorldMinutes(client, worldId) });
+  });
+  return reply.send(result);
+});
+
+app.post('/v1/worlds/:worldId/agreements/:agreementId/commitments', async (request, reply) => {
+  const { worldId, agreementId } = request.params;
+  const body = request.body || {};
+  if (!validUuid(worldId) || !validUuid(agreementId) || !validUuid(body.counterpartyAgentId)) {
+    return fail(reply, 400, 'COMMITMENT_FIELDS_INVALID');
+  }
+  const actionId = requireActionId(body);
+  const commitment = await transaction(async (client) => {
+    await assertMember(client, worldId, request.agentId, true);
+    const worldTime = await readWorldMinutes(client, worldId);
+    return createWorldCommitment(client, { worldId, agreementId, agentId: request.agentId,
+      counterpartyAgentId: body.counterpartyAgentId, commitmentType: body.commitmentType,
+      description: body.description, actionId, dueWorldTime: body.dueWorldTime, worldTime });
+  });
+  return reply.code(201).send({ commitment });
+});
+
+app.post('/v1/worlds/:worldId/commitments/:commitmentId/resolve', async (request, reply) => {
+  const { worldId, commitmentId } = request.params;
+  const body = request.body || {};
+  if (!validUuid(worldId) || !validUuid(commitmentId)) return fail(reply, 400, 'COMMITMENT_ID_INVALID');
+  const actionId = requireActionId(body);
+  const result = await transaction(async (client) => {
+    await assertMember(client, worldId, request.agentId, true);
+    return resolveWorldCommitment(client, { worldId, commitmentId, agentId: request.agentId,
+      outcome: body.outcome, actionId, worldTime: await readWorldMinutes(client, worldId) });
+  });
+  return reply.send(result);
+});
+
+app.get('/v1/worlds/:worldId/institutions', async (request, reply) => {
+  const { worldId } = request.params;
+  if (!validUuid(worldId)) return fail(reply, 400, 'WORLD_ID_INVALID');
+  await assertMember(pool, worldId, request.agentId);
+  return listWorldInstitutionSummary(pool, { worldId, agentId: request.query.all === 'true' ? null : request.agentId,
+    limit: Math.min(200, Math.max(1, Number(request.query.limit) || 100)) });
+});
+
+app.post('/v1/worlds/:worldId/organizations/:organizationId/proposals', async (request, reply) => {
+  const { worldId, organizationId } = request.params;
+  const body = request.body || {};
+  if (!validUuid(worldId) || !validUuid(organizationId)) return fail(reply, 400, 'ORGANIZATION_ID_INVALID');
+  const actionId = requireActionId(body);
+  const proposal = await transaction(async (client) => {
+    await assertMember(client, worldId, request.agentId, true);
+    return proposeOrganizationGovernance(client, { worldId, organizationId, proposerAgentId: request.agentId,
+      proposalType: body.proposalType, payload: body.payload, actionId,
+      worldTime: await readWorldMinutes(client, worldId), expiresInWorldMinutes: body.expiresInWorldMinutes,
+      parentProposalId: body.parentProposalId || null });
+  });
+  return reply.code(proposal.idempotent ? 200 : 201).send({ proposal });
+});
+
+app.post('/v1/worlds/:worldId/organization-proposals/:proposalId/votes', async (request, reply) => {
+  const { worldId, proposalId } = request.params;
+  const body = request.body || {};
+  if (!validUuid(worldId) || !validUuid(proposalId)) return fail(reply, 400, 'ORGANIZATION_PROPOSAL_ID_INVALID');
+  const actionId = requireActionId(body);
+  const result = await transaction(async (client) => {
+    await assertMember(client, worldId, request.agentId, true);
+    return voteOrganizationProposal(client, { worldId, proposalId, agentId: request.agentId,
+      decision: body.decision, actionId, worldTime: await readWorldMinutes(client, worldId) });
   });
   return reply.send(result);
 });

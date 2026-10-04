@@ -45,11 +45,23 @@ export async function foundWorldOrganization(client, { worldId, founderAgentId, 
       count(*)::int AS total FROM world_organizations WHERE world_id=$1 AND status IN ('forming','active','dormant')`,
   [worldId, founderAgentId]);
   if (Number(limits.rows[0].own) >= 2 || Number(limits.rows[0].total) >= 20) throw worldError('ORGANIZATION_CAPACITY_REACHED');
+  const founderProfile = await client.query(`SELECT profile.primary_goal,profile.sociability,profile.discipline,
+      COALESCE((SELECT skill_name FROM world_agent_skills skill WHERE skill.world_id=member.world_id
+        AND skill.agent_id=member.agent_id ORDER BY skill.skill_value DESC,skill.skill_name LIMIT 1),'') AS top_skill
+    FROM world_members member LEFT JOIN world_social_profiles profile
+      ON profile.world_id=member.world_id AND profile.agent_id=member.agent_id
+    WHERE member.world_id=$1 AND member.agent_id=$2`, [worldId, founderAgentId]);
+  const founderTraits = founderProfile.rows[0] || {};
+  const founderGoal = String(founderTraits.primary_goal || '').toLowerCase();
+  const governanceMode = founderGoal.includes('community') || founderGoal.includes('social')
+      || Number(founderTraits.sociability) >= 0.78 ? 'member_vote'
+    : ['research','engineering','trading'].includes(founderTraits.top_skill) ? 'skill_based'
+      : Number(founderTraits.discipline) <= 0.3 ? 'delegated' : 'founder_led';
   const inserted = await client.query(`INSERT INTO world_organizations(world_id,founder_agent_id,name,purpose,status,
-      resources,action_id,created_world_time,updated_world_time,metadata)
-    VALUES($1,$2,$3,$4,'forming','{"effort":0}'::jsonb,$5,$6,$6,$7::jsonb)
-    ON CONFLICT(world_id,name) DO NOTHING RETURNING id,status,name`,
-  [worldId, founderAgentId, title, description, key, worldTime,
+      resources,action_id,created_world_time,updated_world_time,governance_mode,governance_rules,metadata)
+    VALUES($1,$2,$3,$4,'forming','{"effort":0}'::jsonb,$5,$6,$6,$7,'{}'::jsonb,$8::jsonb)
+    ON CONFLICT(world_id,name) DO NOTHING RETURNING id,status,name,governance_mode`,
+  [worldId, founderAgentId, title, description, key, worldTime, governanceMode,
     JSON.stringify({ ...details, sharedProjectId: sharedProject?.id || null })]);
   if (!inserted.rowCount) throw worldError('ORGANIZATION_NAME_ALREADY_EXISTS');
   const organization = inserted.rows[0];

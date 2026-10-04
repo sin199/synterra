@@ -23,6 +23,7 @@ const evolutionStats = document.querySelector('#world-evolution-stats');
 const opportunityList = document.querySelector('#world-opportunity-list');
 const projectList = document.querySelector('#world-project-list');
 const organizationList = document.querySelector('#world-organization-list');
+const institutionsList = document.querySelector('#world-institutions-list');
 const businessList = document.querySelector('#world-business-list');
 const economicDemandList = document.querySelector('#world-economic-demand-list');
 const historyList = document.querySelector('#world-history-list');
@@ -340,6 +341,32 @@ function renderAgentPanel(agent, detail = selectedResidentDetail) {
   economicSection.append(economicHeading, economicList);
   card.append(economicSection);
 
+  const institutionSection = document.createElement('section');
+  institutionSection.className = 'agent-social-section';
+  const institutionHeading = document.createElement('h4');
+  institutionHeading.textContent = '协商、承诺与信誉';
+  const institutionList = document.createElement('ul');
+  institutionList.className = 'agent-memory-list';
+  const institutionState = detail?.institutions;
+  const reputation = institutionState?.reputation;
+  const institutionRows = [
+    ...(reputation ? [`信誉 · 履约 ${Number(reputation.reliability).toFixed(1)} · 专业 ${Number(reputation.professional).toFixed(1)} · 财务 ${Number(reputation.financial).toFixed(1)} · 合作 ${Number(reputation.cooperation).toFixed(1)} · 完成 ${displayCount(reputation.fulfilledCount)} / 违约 ${displayCount(reputation.breachCount)}`] : []),
+    ...(institutionState?.organizationRoles || []).map((role) => `组织 · ${role.name} · ${role.role} · ${role.governanceMode}`),
+    ...(institutionState?.agreements || []).slice(0, 6).map((agreement) =>
+      `协议 · ${agreement.type} · ${agreement.status} · 与 ${agreement.otherName} · 第 ${agreement.round} 轮`),
+    ...(institutionState?.commitments || []).filter((commitment) => commitment.status === 'active').slice(0, 4).map((commitment) =>
+      `承诺 · ${commitment.type} · ${commitment.description} · ${commitment.status}`),
+    ...(institutionState?.recentNegotiations || []).slice(0, 3).map((item) =>
+      `历史 · ${item.title} · 第 ${displayCount(item.worldTime)} 世界分钟`)
+  ];
+  for (const text of institutionRows.length ? institutionRows : [detail ? '还没有协议、承诺或信誉记录' : '正在读取制度状态…']) {
+    const item = document.createElement('li');
+    item.textContent = text;
+    institutionList.append(item);
+  }
+  institutionSection.append(institutionHeading, institutionList);
+  card.append(institutionSection);
+
   const goal = document.createElement('div');
   goal.className = 'agent-goal';
   const goalLabel = document.createElement('span');
@@ -627,12 +654,35 @@ function renderWorldEvolution() {
   renderEvolutionList(organizationList, evolution.organizations, '还没有形成组织。', (item) => {
     const members = (item.members || []).filter((member) => member.status === 'active').length;
     const projects = (item.projects || []).length;
-    return `${item.status === 'active' ? '运作中' : item.status === 'dormant' ? '休眠' : '组建中'} · ${members} 位成员 · ${projects} 个项目`;
+    return `${item.status === 'active' ? '运作中' : item.status === 'dormant' ? '休眠' : '组建中'} · ${members} 位成员 · ${projects} 个项目 · ${item.governance_mode || 'founder_led'}`;
   });
+  const institutional = evolution.institutions || {};
+  const agreementCounts = institutional.agreements || {};
+  const commitmentCounts = institutional.commitments || {};
+  const governanceCounts = institutional.governanceProposals || {};
+  const institutionRows = [
+    { title: '协议与谈判', detail: `提案 ${displayCount(agreementCounts.proposed)} · 反提案 ${displayCount(agreementCounts.countered)} · 履行中 ${displayCount(agreementCounts.active)} · 完成 ${displayCount(agreementCounts.completed)} · 违约 ${displayCount(agreementCounts.breached)}` },
+    { title: '未来承诺', detail: `履行中 ${displayCount(commitmentCounts.active)} · 已履行 ${displayCount(commitmentCounts.fulfilled)} · 违约 ${displayCount(commitmentCounts.breached)}` },
+    { title: '组织治理', detail: `开放 ${displayCount(governanceCounts.open)} · 执行 ${displayCount(governanceCounts.executed)} · 否决 ${displayCount(governanceCounts.rejected)}` },
+    ...(institutional.institutionalBeliefs || []).slice(0, 4).map((belief) => ({
+      title: `${belief.institutionType === 'business' ? '企业' : '组织'}对${belief.subjectName || '居民'}的履约判断`,
+      detail: `${belief.estimate >= 0 ? '正向' : '负向'} ${Math.round(Math.abs(Number(belief.estimate)) * 100)}% · 信心 ${Math.round(Number(belief.confidence) * 100)}% · ${belief.sampleCount} 次记录`
+    })),
+    ...(institutional.norms || []).slice(0, 5).map((norm) => ({
+      title: `规范 · ${norm.normKey}`,
+      detail: `${norm.scopeType} · 信心 ${Math.round(Number(norm.confidence) * 100)}% · 支持 ${norm.supportCount} / 违反 ${norm.violationCount}`
+    })),
+    ...(institutional.templates || []).slice(0, 3).map((template) => ({
+      title: `历史模板 · ${template.templateKey}`,
+      detail: `${template.agreementType} · 成功 ${template.successCount} / 样本 ${template.sampleCount}`
+    }))
+  ];
+  renderEvolutionList(institutionsList, institutionRows, '还没有形成制度互动。', (item) => item.detail);
   renderEvolutionList(businessList, evolution.economy?.businesses, '居民还没有创建企业。', (item) => {
     const services = (item.services || []).map((service) => `${service.name} · ${service.stockUnits} 件库存`).join('；');
     const workers = (item.workers || []).length;
-    return `${item.status} · 现金 ${item.cashBalance} USDC · 收入 ${item.revenue} · 盈亏 ${item.profitLoss} · ${workers} 名员工${services ? ` · ${services}` : ''}`;
+    const activeAgreements = (item.agreements || []).filter((agreement) => agreement.status === 'active').length;
+    return `${item.status} · 现金 ${item.cashBalance} USDC · 收入 ${item.revenue} · 盈亏 ${item.profitLoss} · ${workers} 名员工 · ${activeAgreements} 份有效协议${services ? ` · ${services}` : ''}`;
   });
   const serviceLabels = { research_service: '研究服务', engineering_service: '工程服务', social_service: '社交服务',
     food_service: '餐饮服务', trading_service: '市场研究' };

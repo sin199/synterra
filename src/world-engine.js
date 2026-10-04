@@ -22,6 +22,8 @@ import { foundWorldOrganization, decideOrganizationMembership, contributeOrganiz
   inviteWorldOrganization, listWorldOrganizations } from './world-organizations.js';
 import { shareWorldInformation, decideWorldInformationShare, expireInformationShares,
   listInformationInbox } from './world-information.js';
+import { expireInstitutionalState, planInstitutionalAction, proposeWorldAgreement, proposeOrganizationGovernance,
+  resolveWorldCommitment, respondToWorldAgreement, voteOrganizationProposal } from './world-institutions.js';
 import { applyToWorldBusinessJob, buildBusinessCandidates, closeWorldBusiness,
   completeWorldBusinessShift, decideWorldBusinessApplication, distributeWorldBusinessProfit,
   distributeWorldProjectRevenue, foundWorldBusiness, investInWorldBusiness, investInWorldProject,
@@ -43,7 +45,8 @@ const ACTION_SECONDS = Object.freeze({ work: 16, cooperate: 16, learn: 11, rest:
   business_found: 18, business_service: 12, business_apply: 10, business_leave: 8, business_hire: 10,
   business_withdraw: 6,
   business_work: 16, business_invest: 12, business_price: 10, business_distribute: 10, business_close: 10,
-  business_skill_practice: 12, business_seek_cofounder: 14 });
+  business_skill_practice: 12, business_seek_cofounder: 14,
+  agreement_propose: 12, agreement_respond: 8, commitment_resolve: 8, organization_propose: 12, organization_vote: 8 });
 const GOALS = Object.freeze(['wealth','learn','community','wellbeing','balanced','wealth','learn','community','wellbeing','balanced']);
 const RISK_TOLERANCE = Object.freeze([0.78,0.28,0.52,0.22,0.68,0.35,0.82,0.47,0.70,0.40]);
 const ALLOWED_GOALS = new Set(['wealth','learn','community','wellbeing','balanced']);
@@ -55,6 +58,7 @@ function stableInt(input) {
 
 function initiativeSystem(action) {
   if (action === 'goal_review') return 'goal';
+  if (action.startsWith('agreement') || action === 'commitment_resolve') return 'institution';
   if (action.startsWith('opportunity')) return 'opportunity';
   if (action.startsWith('project')) return 'project';
   if (action.startsWith('organization')) return 'organization';
@@ -980,6 +984,26 @@ async function completeWorldInitiativeActivity(client, worldId, agent, runtime, 
     } else if (activity === 'business_close') {
       detail = await closeWorldBusiness(client, { worldId, businessId: context.businessId,
         founderAgentId: agent.agentId, actionId: key, worldTime: nowWorld });
+    } else if (activity === 'agreement_propose') {
+      detail = await proposeWorldAgreement(client, { worldId, proposerAgentId: agent.agentId,
+        counterpartyAgentId: context.counterpartyAgentId, agreementType: context.agreementType,
+        terms: context.agreementTerms, actionId: key, worldTime: nowWorld,
+        expiresInWorldMinutes: context.expiresInWorldMinutes || 4_320,
+        parentAgreementId: context.parentAgreementId || null });
+    } else if (activity === 'agreement_respond') {
+      detail = await respondToWorldAgreement(client, { worldId, agreementId: context.agreementId,
+        agentId: agent.agentId, decision: context.decision, counterTerms: context.counterTerms,
+        actionId: key, worldTime: nowWorld });
+    } else if (activity === 'commitment_resolve') {
+      detail = await resolveWorldCommitment(client, { worldId, commitmentId: context.commitmentId,
+        agentId: agent.agentId, outcome: context.outcome, actionId: key, worldTime: nowWorld });
+    } else if (activity === 'organization_propose') {
+      detail = await proposeOrganizationGovernance(client, { worldId, organizationId: context.organizationId,
+        proposerAgentId: agent.agentId, proposalType: context.proposalType, payload: context.proposalPayload,
+        actionId: key, worldTime: nowWorld, expiresInWorldMinutes: context.expiresInWorldMinutes || 4_320 });
+    } else if (activity === 'organization_vote') {
+      detail = await voteOrganizationProposal(client, { worldId, proposalId: context.proposalId,
+        agentId: agent.agentId, decision: context.decision, actionId: key, worldTime: nowWorld });
     } else if (activity === 'information_share') {
       const proposal = safeJson(context.informationProposal);
       detail = await shareWorldInformation(client, { worldId, senderAgentId: agent.agentId,
@@ -1006,6 +1030,7 @@ async function recordInitiativeOutcome(client, { worldId, agent, activity, resul
     : action.startsWith('opportunity') ? 'opportunity'
     : action.startsWith('project') ? 'project'
       : action.startsWith('organization') ? 'organization'
+        : action.startsWith('agreement') || action === 'commitment_resolve' ? 'institution'
         : action.startsWith('information') ? 'information'
           : action.startsWith('business') ? 'business' : null;
   if (!system && action !== 'project_contribute') return;
@@ -1026,7 +1051,10 @@ async function recordInitiativeOutcome(client, { worldId, agent, activity, resul
     business_hire: 'hired', business_reject: 'rejected', business_work: 'produced',
     business_invest: 'invested', business_price: 'price_changed', business_distribute: 'distributed',
     business_close: 'closed', business_seek_cofounder: 'partner_sought',
-    business_skill_practice: 'capability_practiced'
+    business_skill_practice: 'capability_practiced',
+    agreement_propose: 'proposed', agreement_respond: details.status || 'responded',
+    commitment_resolve: details.status || 'resolved', organization_propose: 'proposed',
+    organization_vote: details.status || 'voted'
   };
   const stage = result.abandoned ? 'blocked' : stageForAction[action];
   if (!stage) return;
@@ -1260,7 +1288,8 @@ async function completeActivity(client, worldId, agent, runtime, quotes, now, sc
     'organization_found','organization_join','organization_reject','organization_leave','organization_invite',
     'organization_contribute','information_share','information_accept','information_ignore','information_doubt',
     'business_found','business_service','business_apply','business_withdraw','business_leave','business_hire','business_reject','business_work',
-    'business_invest','business_price','business_distribute','business_close','business_skill_practice','business_seek_cofounder'].includes(activity)) {
+    'business_invest','business_price','business_distribute','business_close','business_skill_practice','business_seek_cofounder',
+    'agreement_propose','agreement_respond','commitment_resolve','organization_propose','organization_vote'].includes(activity)) {
     const initiative = await completeWorldInitiativeActivity(client, worldId, agent, runtime, activity);
     result.initiativeAction = activity;
     if (initiative.error) result.abandoned = initiative.error;
@@ -1339,6 +1368,7 @@ async function completeActivity(client, worldId, agent, runtime, quotes, now, sc
     let memoryType = 'initiative';
     let importance = 0.42;
     let summary = `${initiativeAction.replaceAll('_', ' ')} changed persistent world state.`;
+    let relatedAgentId = null;
     if (initiativeAction === 'opportunity' || initiativeAction === 'opportunity_reject') {
       const type = result.opportunity?.type;
       skillAction = initiativeAction === 'opportunity_reject' ? null : type === 'RESEARCH' || type === 'LEARNING' ? 'learn'
@@ -1395,6 +1425,16 @@ async function completeActivity(client, worldId, agent, runtime, quotes, now, sc
         runtime.world_minutes, JSON.stringify({ action: initiativeAction,
           amountUsdc: result.initiative?.amountUsdc || result.initiative?.distributedUsdc || null,
           share: result.initiative?.share || null, projectName })]);
+    } else if (initiativeAction.startsWith('agreement_') || initiativeAction === 'commitment_resolve') {
+      memoryType = 'contract';
+      importance = ['agreement_propose','agreement_respond'].includes(initiativeAction) ? 0.66 : 0.56;
+      relatedAgentId = result.initiative?.counterpartyAgentId || agent.planned_context?.counterpartyAgentId
+        || result.initiative?.proposerAgentId || null;
+      summary = initiativeAction === 'agreement_propose'
+        ? `Proposed a ${agent.planned_context?.agreementType?.replaceAll('_',' ') || 'social'} agreement with another resident.`
+        : initiativeAction === 'agreement_respond'
+          ? `Responded to a ${agent.planned_context?.agreementType?.replaceAll('_',' ') || 'social'} agreement proposal: ${result.initiative?.status || 'reviewed'}.`
+          : `Reviewed a future commitment and recorded the outcome ${result.initiative?.status || 'resolved'}.`;
     } else if (initiativeAction.startsWith('organization_')) {
       skillAction = 'socialize';
       memoryType = 'organization';
@@ -1450,7 +1490,7 @@ async function completeActivity(client, worldId, agent, runtime, quotes, now, sc
       initiativeAction.startsWith('organization_') || initiativeAction === 'project_contribute');
     await recordResidentMemory(client, { worldId, agentId: agent.agentId, memoryType, summary, importance,
       worldMinutes: runtime.world_minutes, location: place,
-      relatedAgentId: result.initiative?.inviteAgentId || result.initiative?.partnerId || null,
+      relatedAgentId: relatedAgentId || result.initiative?.inviteAgentId || result.initiative?.partnerId || null,
       metadata: { action: initiativeAction, initiative: result.initiative || {}, outcome: result.opportunity?.status || 'success' },
       sourceEventId: completionEventId });
     if (['business_work','business_service'].includes(initiativeAction) && result.initiative?.businessId) {
@@ -1805,6 +1845,7 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
             s.goal,s.risk_tolerance AS risk_tolerance,s.happiness,s.knowledge,s.status,s.planned_action,s.target_location,
             s.planned_partner_id AS planned_partner_id,s.planned_side,s.planned_asset,s.planned_quote_units::text AS planned_quote_units,s.planned_paid_meal,
             s.planned_context,s.next_strategic_decision_world_minutes AS next_strategic_decision_world_minutes,
+            s.next_institutional_review_world_minutes AS next_institutional_review_world_minutes,
             s.strategic_goal_category AS strategic_goal_category,
             s.strategic_goal_progress::text AS strategic_goal_progress,
             s.strategic_goal_progress_world_minutes AS strategic_goal_progress_world_minutes,
@@ -1862,6 +1903,7 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
           && new Date(member.next_decision_at).getTime() <= now.getTime());
         let initiativeState = null;
         if (newHour > oldHour) {
+          await expireInstitutionalState(client, { worldId, worldTime: worldMinutes });
           await expirePendingWorldBusinessApplications(client, { worldId, worldTime: worldMinutes });
           const expiredOpportunities = await expireWorldOpportunities(client, worldId, worldMinutes);
           for (const opportunity of expiredOpportunities) await recordEmergenceEvent(client, { worldId,
@@ -1904,6 +1946,8 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
         for (const row of membersResult.rows) {
           const agent = { ...row, agentId: row.agent_id,
             lastTradeAt: row.last_trade_at, planned_paid_meal: row.planned_paid_meal,
+            nextInstitutionalReviewWorldMinutes: row.next_institutional_review_world_minutes === null
+              ? null : Number(row.next_institutional_review_world_minutes),
             social_partner_id: row.planned_partner_id,
             riskTolerance: clamp(finite(row.risk_tolerance) + finite(row.risk_modifier), 0, 1),
             priceSensitivity: finite(row.price_sensitivity, 0.5),
@@ -1977,6 +2021,20 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
                 || agent.next_strategic_decision_world_minutes === undefined || strategicDue) {
               await client.query(`UPDATE world_agent_states SET next_strategic_decision_world_minutes=$3,updated_at=$4
                 WHERE world_id=$1 AND agent_id=$2`, [worldId, agent.agentId, nextStrategicAt, now]);
+            }
+            let institutionalDue = false;
+            let nextInstitutionalAt = agent.nextInstitutionalReviewWorldMinutes;
+            if (nextInstitutionalAt === null || nextInstitutionalAt === undefined) {
+              const phase = stableInt(`${agent.agentId}:institutional-phase`) % 1_440;
+              nextInstitutionalAt = worldMinutes + phase;
+              institutionalDue = phase === 0;
+            } else if (nextInstitutionalAt <= worldMinutes) institutionalDue = true;
+            if (institutionalDue) nextInstitutionalAt = worldMinutes + 1_440;
+            if (agent.nextInstitutionalReviewWorldMinutes === null || agent.nextInstitutionalReviewWorldMinutes === undefined
+                || institutionalDue) {
+              await client.query(`UPDATE world_agent_states SET next_institutional_review_world_minutes=$3,updated_at=$4
+                WHERE world_id=$1 AND agent_id=$2`, [worldId, agent.agentId, nextInstitutionalAt, now]);
+              agent.nextInstitutionalReviewWorldMinutes = nextInstitutionalAt;
             }
             if (strategicDue) {
               const primaryGoal = agent.goals.find((goal) => goal.goalType === 'primary' && goal.status === 'active');
@@ -2082,13 +2140,30 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
                 decisionLayer = 'strategic';
               } else candidates = qualifyUtilityCandidates(utilityCandidates);
             } else candidates = qualifyUtilityCandidates(utilityCandidates);
-            let activity = null;
+            let institutionalPlan = null;
+            if (institutionalDue) {
+              institutionalPlan = await planInstitutionalAction(client, { worldId, agent, worldTime: worldMinutes });
+              if (institutionalPlan) {
+                candidates = [institutionalPlan];
+                qualifiedStrategicCandidates = [];
+                decisionLayer = 'institutional';
+                await recordEmergenceEvent(client, { worldId, agentId: agent.agentId, worldMinutes, tickCount,
+                  system: 'institution', stage: 'considered', eventKey: `institution:${agent.agentId}:${tickCount}:considered`,
+                  candidateId: institutionalPlan.id, action: institutionalPlan.action, utilityScore: institutionalPlan.score,
+                  details: institutionalPlan.institutionalTrace || {} });
+                await recordEmergenceEvent(client, { worldId, agentId: agent.agentId, worldMinutes, tickCount,
+                  system: 'institution', stage: 'eligible', eventKey: `institution:${agent.agentId}:${tickCount}:eligible`,
+                  candidateId: institutionalPlan.id, action: institutionalPlan.action, utilityScore: institutionalPlan.score,
+                  details: institutionalPlan.institutionalTrace || {} });
+              }
+            }
+            let activity = institutionalPlan;
             let flyObservation = null;
             let flyCandidates = [];
             let flySelected = null;
             let decision = null;
             let usedFruitfly = false;
-            if (fruitfly && candidates.length) {
+            if (fruitfly && candidates.length && decisionLayer !== 'institutional') {
               const businessBeliefs = agent.beliefs.filter((belief) => belief.subjectType === 'business'
                 && belief.beliefKey === 'business_outcome');
               const marketBeliefs = agent.beliefs.filter((belief) => belief.subjectType === 'market'
@@ -2126,6 +2201,10 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
                 WHERE world_id=$1 AND agent_id=$2`, [worldId, agent.agentId, new Date(now.getTime() + 30_000), now]);
               continue;
             }
+            if (decisionLayer === 'institutional') await recordEmergenceEvent(client, { worldId,
+              agentId: agent.agentId, worldMinutes, tickCount, system: 'institution', stage: 'selected',
+              eventKey: `institution:${agent.agentId}:${tickCount}:selected`, candidateId: activity.id,
+              action: activity.action, utilityScore: activity.score, details: activity.institutionalTrace || {} });
             if (decisionLayer === 'strategic') {
               for (const candidate of qualifiedStrategicCandidates) {
                 if (candidate.id === activity.id) continue;
@@ -2178,7 +2257,9 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
               'organizationId','organizationProposal','inviteeAgentId','shareId','informationProposal','contributionType',
               'businessProposal','cofounderProposal','preparationSkill','preparationServiceType',
               'businessId','serviceId','jobId','applicationId','maxPriceUsdc','amountUsdc','fundingSource',
-              'direction','contributionAmountUsdc','employmentId','pricingContext']
+              'direction','contributionAmountUsdc','employmentId','pricingContext','counterpartyAgentId','agreementType',
+              'agreementTerms','agreementId','counterTerms','expiresInWorldMinutes','parentAgreementId','commitmentId','outcome',
+              'proposalId','proposalType','proposalPayload','institutionalTrace']
               .filter((key) => activity[key] !== undefined).map((key) => [key, activity[key]]));
             if (activity.targetLocation !== agent.location) {
               const travelSeconds = 6 + stableInt(`${agent.agentId}:${tickCount}:travel`) % 11;

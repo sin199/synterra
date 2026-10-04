@@ -174,6 +174,37 @@ test(`isolated Fruitfly world simulation runs 10 seeded scenarios for ${hours} w
         (SELECT count(*)::int FROM world_economic_transactions tx WHERE tx.world_id=$1
           AND tx.transaction_type='maintenance') AS maintenance_settlements,
         (SELECT count(*)::int FROM world_economic_demand demand WHERE demand.world_id=$1) AS demand_days`, [worldId]);
+    const institutionAudit = await pool.query(`SELECT
+        (SELECT count(*)::int FROM world_agreements WHERE world_id=$1) AS agreements_total,
+        (SELECT count(*)::int FROM world_agreements WHERE world_id=$1 AND status='proposed') AS agreements_proposed,
+        (SELECT count(*)::int FROM world_agreements WHERE world_id=$1 AND status='countered') AS agreements_countered,
+        (SELECT count(*)::int FROM world_agreements WHERE world_id=$1 AND status='active') AS agreements_active,
+        (SELECT count(*)::int FROM world_agreements WHERE world_id=$1 AND status='completed') AS agreements_completed,
+        (SELECT count(*)::int FROM world_agreements WHERE world_id=$1 AND status='accepted') AS agreements_accepted,
+        (SELECT count(*)::int FROM world_agreements WHERE world_id=$1 AND status='breached') AS agreements_breached,
+        (SELECT count(*)::int FROM world_agreements WHERE world_id=$1 AND status='expired') AS agreements_expired,
+        (SELECT count(*)::int FROM world_agreements WHERE world_id=$1 AND status='rejected') AS agreements_rejected,
+        (SELECT count(*)::int FROM world_agreements WHERE world_id=$1 AND status='cancelled') AS agreements_cancelled,
+        (SELECT count(*)::int FROM world_agreements WHERE world_id=$1 AND parent_agreement_id IS NOT NULL) AS counteroffers,
+        (SELECT count(*)::int FROM world_agreements WHERE world_id=$1 AND negotiation_round>8) AS rounds_over_limit,
+        (SELECT count(*)::int FROM world_commitments WHERE world_id=$1) AS commitments_total,
+        (SELECT count(*)::int FROM world_commitments WHERE world_id=$1 AND status='active') AS commitments_active,
+        (SELECT count(*)::int FROM world_commitments WHERE world_id=$1 AND status='fulfilled') AS commitments_fulfilled,
+        (SELECT count(*)::int FROM world_commitments WHERE world_id=$1 AND status='breached') AS commitments_breached,
+        (SELECT count(*)::int FROM world_commitments WHERE world_id=$1 AND status='active' AND due_world_time<=$2) AS overdue_commitments,
+        (SELECT count(*)::int FROM world_organization_proposals WHERE world_id=$1) AS governance_total,
+        (SELECT count(*)::int FROM world_organization_proposals WHERE world_id=$1 AND status='proposed') AS governance_open,
+        (SELECT count(*)::int FROM world_organization_proposals WHERE world_id=$1 AND status='executed') AS governance_executed,
+        (SELECT count(*)::int FROM world_organization_proposals WHERE world_id=$1 AND status='rejected') AS governance_rejected,
+        (SELECT count(*)::int FROM world_organization_proposals WHERE world_id=$1 AND status='proposed' AND expires_world_time<=$2) AS overdue_proposals,
+        (SELECT count(*)::int FROM world_social_norms WHERE world_id=$1) AS norms,
+        (SELECT count(*)::int FROM world_agreement_templates WHERE world_id=$1) AS templates,
+        (SELECT count(*)::int FROM world_agent_reputations WHERE world_id=$1) AS reputation_records,
+        (SELECT count(*)::int FROM world_institutional_memories WHERE world_id=$1) AS institutional_memories,
+        (SELECT count(*)::int FROM world_history WHERE world_id=$1 AND event_type='ownership_transferred') AS ownership_transfers,
+        (SELECT count(*)::int FROM (SELECT asset_id FROM world_economic_ownership WHERE world_id=$1 AND asset_type='business'
+          GROUP BY asset_id HAVING abs(sum(share)-1)>0.000001) unbalanced_ownership) AS unbalanced_business_ownership`,
+    [worldId, simulatedMinutes]);
     const purchaseFailureReasons = await pool.query(`SELECT reason_code AS "reasonCode",
         details->>'abandoned' AS abandoned,count(*)::int AS count
       FROM world_emergence_events WHERE world_id=$1 AND system='business' AND stage='blocked'
@@ -291,7 +322,8 @@ test(`isolated Fruitfly world simulation runs 10 seeded scenarios for ${hours} w
     const summary = { seed, simulationId, worldId, simulatedHours: hours, worldMinutes: final.rows[0].world_minutes,
       elapsedSeconds: Math.round((performance.now() - openedAt) / 1_000), fruitfly: 'local bundled runtime',
       typesafe: 'disabled; no provider/network call', errors: Object.fromEntries(errors), errorSamples,
-      state: final.rows[0], economy, economicAudit: economicAudit.rows[0], topDemand: demand.rows,
+      state: final.rows[0], economy, economicAudit: economicAudit.rows[0], institutionAudit: institutionAudit.rows[0],
+      topDemand: demand.rows,
       purchaseFailureReasons: purchaseFailureReasons.rows,
       businessOutcomes: businessOutcomes.rows, economicChains: economicChains.rows, businessPrices: businessPrices.rows,
       actionDistribution: actionDistribution.rows,
@@ -304,12 +336,16 @@ test(`isolated Fruitfly world simulation runs 10 seeded scenarios for ${hours} w
         (SELECT count(*)::int FROM world_projects WHERE world_id=$1) AS projects,
         (SELECT count(*)::int FROM world_organizations WHERE world_id=$1) AS organizations,
         (SELECT count(*)::int FROM world_scenes WHERE world_id=$1 AND created_by_project_id IS NOT NULL) AS generated_places,
+        (SELECT count(*)::int FROM world_agreements WHERE world_id=$1) AS agreements,
+        (SELECT count(*)::int FROM world_commitments WHERE world_id=$1) AS commitments,
+        (SELECT count(*)::int FROM world_social_norms WHERE world_id=$1) AS norms,
+        (SELECT count(*)::int FROM world_agreement_templates WHERE world_id=$1) AS templates,
         (SELECT world_minutes::int FROM world_runtime_state WHERE world_id=$1) AS world_minutes`, [worldId]);
     summary.persistenceAfterReconnect = afterReconnect.rows[0];
     seedSummaries.push(summary);
     t.diagnostic(JSON.stringify({ seed, worldMinutes: summary.worldMinutes, engineWorldId: engine?.worldId || worldId,
       completedActions: summary.state.completed_actions, errors: summary.errors, errorSamples: summary.errorSamples,
-      emergenceMetrics, topBlockers: blockerCounts.slice(0, 5) }));
+      institutionAudit: summary.institutionAudit, emergenceMetrics, topBlockers: blockerCounts.slice(0, 5) }));
 
     assert.equal(summary.state.world_minutes, simulatedMinutes, 'simulation must advance the exact requested world time');
     assert.equal(Object.values(errors).reduce((sum, count) => sum + count, 0), 0, 'simulation should complete without engine errors');
@@ -321,10 +357,27 @@ test(`isolated Fruitfly world simulation runs 10 seeded scenarios for ${hours} w
     assert.deepEqual(summary.persistenceAfterReconnect.projects, summary.state.projects);
     assert.deepEqual(summary.persistenceAfterReconnect.organizations, summary.state.organizations);
     assert.deepEqual(summary.persistenceAfterReconnect.generated_places, summary.state.generated_places);
+    assert.equal(summary.persistenceAfterReconnect.agreements, Number(summary.institutionAudit.agreements_total),
+      'institution history persists across a fresh database connection');
+    assert.equal(summary.persistenceAfterReconnect.commitments, Number(summary.institutionAudit.commitments_total),
+      'commitment history persists across a fresh database connection');
+    assert.equal(summary.persistenceAfterReconnect.norms, Number(summary.institutionAudit.norms));
+    assert.equal(summary.persistenceAfterReconnect.templates, Number(summary.institutionAudit.templates));
     assert.ok(summary.residentActivity.every((resident) => resident.actions > 0), 'all residents should remain active');
     assert.equal(Number(summary.economicAudit.unbalanced_transactions), 0, 'every economic transfer must balance');
     assert.equal(Number(summary.economicAudit.negative_accounts), 0, 'no resident or business account may go negative');
     assert.equal(Number(summary.economicAudit.unsettled_orders), 0, 'every fulfilled service order must settle revenue');
+    assert.equal(Number(summary.institutionAudit.rounds_over_limit), 0, 'negotiation rounds stay bounded');
+    assert.equal(Number(summary.institutionAudit.agreements_total),
+      Number(summary.institutionAudit.agreements_proposed) + Number(summary.institutionAudit.agreements_countered)
+        + Number(summary.institutionAudit.agreements_active) + Number(summary.institutionAudit.agreements_completed)
+        + Number(summary.institutionAudit.agreements_accepted) + Number(summary.institutionAudit.agreements_breached)
+        + Number(summary.institutionAudit.agreements_expired) + Number(summary.institutionAudit.agreements_rejected)
+        + Number(summary.institutionAudit.agreements_cancelled), 'every agreement remains in a defined lifecycle state');
+    assert.equal(Number(summary.institutionAudit.overdue_commitments), 0, 'overdue commitments are resolved during ticks');
+    assert.equal(Number(summary.institutionAudit.overdue_proposals), 0, 'expired governance proposals leave the open queue');
+    assert.equal(Number(summary.institutionAudit.unbalanced_business_ownership), 0,
+      'ownership agreement execution preserves each business share total');
     } finally {
       if (engine) await engine.stop();
       if (pool) {
@@ -354,6 +407,13 @@ test(`isolated Fruitfly world simulation runs 10 seeded scenarios for ${hours} w
   economicAggregate.transactions = summarize(seedSummaries.map((summary) => Number(summary.economicAudit.transactions)));
   economicAggregate.negativeSystemSeedAccounts = summarize(seedSummaries.map((summary) =>
     Number(summary.economicAudit.negative_system_accounts)));
+  const institutionalMetricKeys = ['agreements_total','agreements_proposed','agreements_countered','agreements_active',
+    'agreements_completed','agreements_accepted','agreements_breached','agreements_expired','agreements_rejected',
+    'agreements_cancelled','counteroffers','commitments_total','commitments_active','commitments_fulfilled',
+    'commitments_breached','governance_total','governance_open','governance_executed','governance_rejected',
+    'norms','templates','reputation_records','institutional_memories','ownership_transfers'];
+  const institutionalAggregate = Object.fromEntries(institutionalMetricKeys.map((key) => [key, summarize(seedSummaries.map((summary) =>
+    Number(summary.institutionAudit[key] || 0)))]));
   const allBusinessOutcomes = seedSummaries.flatMap((summary) => summary.businessOutcomes.map((business) => ({
     seed: summary.seed, ...business
   })));
@@ -437,7 +497,7 @@ test(`isolated Fruitfly world simulation runs 10 seeded scenarios for ${hours} w
       .reduce((sum, item) => sum + Number(item.count), 0));
     return [`${system}.${stage}.${action || 'none'}`, summarize(perSeed)];
   }));
-  t.diagnostic(JSON.stringify({ simulation: '10 seeded scenarios x 30 world days', aggregate, economicAggregate,
+  t.diagnostic(JSON.stringify({ simulation: '10 seeded scenarios x 30 world days', aggregate, economicAggregate, institutionalAggregate,
     economicSeedOutcomes, perSeedEconomics, observedEconomicChains: observedEconomicChains.slice(0, 10), seedsWithOutcomes,
     stochasticOutcomes: {
       organizationsFormedSeeds: seedSummaries.filter((summary) => summary.emergenceMetrics.organizationsFormed > 0).length,
