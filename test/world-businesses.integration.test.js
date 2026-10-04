@@ -11,8 +11,10 @@ import { applyToWorldBusinessJob, closeWorldBusiness, completeWorldBusinessShift
   decideWorldBusinessApplication, distributeWorldBusinessProfit, distributeWorldProjectRevenue,
   economicDashboardSql, foundWorldBusiness, investInWorldBusiness, investInWorldProject,
   leaveWorldBusinessJob, listWorldBusinesses, purchaseWorldBusinessService,
-  observeResidentEconomicMarket, practiceWorldBusinessCapability, settleWorldBusinessMaintenance,
-  settleWorldPlaceMaintenance } from '../src/world-businesses.js';
+  expirePendingWorldBusinessApplications, observeResidentEconomicMarket, practiceWorldBusinessCapability,
+  settleWorldBusinessMaintenance, settleWorldPlaceMaintenance,
+  withdrawWorldBusinessApplication } from '../src/world-businesses.js';
+import { recordConsolidatedMemory } from '../src/world-engine.js';
 import { contributeOrganizationEffort, decideOrganizationMembership, foundWorldOrganization } from '../src/world-organizations.js';
 import { decideProjectMembership, proposeWorldProject } from '../src/world-projects.js';
 
@@ -56,7 +58,17 @@ test('V4 economy settles business, project, organization and place value without
   try {
     const schema = await readFile(path.join(repoRoot, 'schema.sql'), 'utf8');
     await pool.query(schema);
+    // Rows marked expired cannot exist under the legacy constraint being simulated below.
+    // This integration suite shares an isolated database with tests that exercise expiry.
+    await pool.query(`DELETE FROM world_business_applications WHERE status='expired'`);
+    await pool.query(`ALTER TABLE world_business_applications DROP CONSTRAINT world_business_applications_status_check`);
+    await pool.query(`ALTER TABLE world_business_applications ADD CONSTRAINT world_business_applications_status_check
+      CHECK (status IN ('pending','accepted','rejected','withdrawn'))`);
     await pool.query(schema);
+    const applicationStatusConstraint = await pool.query(`SELECT pg_get_constraintdef(oid) AS definition FROM pg_constraint
+      WHERE conrelid='world_business_applications'::regclass AND conname='world_business_applications_status_check'`);
+    assert.match(applicationStatusConstraint.rows[0].definition, /expired/,
+      'schema startup upgrades the old application-status constraint');
     await pool.query(`INSERT INTO agents(id,name,public_key,gender) VALUES
       ($1::uuid,'V4 Founder','v4-founder-key-'||$1::text,'male'),($2::uuid,'V4 Worker','v4-worker-key-'||$2::text,'female'),
       ($3::uuid,'V4 Customer','v4-customer-key-'||$3::text,'female'),($4::uuid,'V4 Investor','v4-investor-key-'||$4::text,'male')`, agents);
@@ -117,11 +129,39 @@ test('V4 economy settles business, project, organization and place value without
       [worldId, businessId])).rows[0].id;
     const application = await inTransaction(pool, (client) => applyToWorldBusinessJob(client, { worldId,
       jobId, agentId: workerId, actionId: 'v4-application-1', worldTime: 610 }));
+    const siblingApplication = await inTransaction(pool, (client) => applyToWorldBusinessJob(client, { worldId,
+      jobId, agentId: customerId, actionId: 'v4-application-sibling', worldTime: 611 }));
     const hired = await inTransaction(pool, (client) => decideWorldBusinessApplication(client, { worldId,
       applicationId: application.id, founderAgentId: founderId, decision: 'accept', actionId: 'v4-hire-1', worldTime: 620 }));
     assert.equal(hired.status, 'active');
+    assert.equal(Number((await pool.query(`SELECT count(*)::int AS count FROM world_business_applications
+      WHERE world_id=$1 AND id=$2 AND status='expired'`, [worldId, siblingApplication.id])).rows[0].count), 1,
+    'filling a job expires its sibling pending applications');
     assert.equal((await inTransaction(pool, (client) => decideWorldBusinessApplication(client, { worldId,
       applicationId: application.id, founderAgentId: founderId, decision: 'accept', actionId: 'v4-hire-1', worldTime: 621 }))).idempotent, true);
+
+    const lifecycleJobs = [randomUUID(), randomUUID()];
+    await pool.query(`INSERT INTO world_business_jobs(id,world_id,business_id,role,required_skill,wage_usdc,status,
+        created_world_time,action_id) VALUES
+      ($1,$2,$3,'Temporary Researcher','research',15,'open',1000,'v4-ttl-job'),
+      ($4,$2,$3,'Optional Researcher','research',15,'open',1000,'v4-withdraw-job')`,
+    [lifecycleJobs[0], worldId, businessId, lifecycleJobs[1]]);
+    const staleApplication = await inTransaction(pool, (client) => applyToWorldBusinessJob(client, { worldId,
+      jobId: lifecycleJobs[0], agentId: investorId, actionId: 'v4-stale-application', worldTime: 1_000 }));
+    const ttlResult = await inTransaction(pool, (client) => expirePendingWorldBusinessApplications(client,
+      { worldId, worldTime: 3_880 }));
+    assert.ok(ttlResult.applications.some((item) => item.id === staleApplication.id && item.reason === 'application_ttl'),
+      'an application expires after 2,880 world minutes');
+    const withdrawable = await inTransaction(pool, (client) => applyToWorldBusinessJob(client, { worldId,
+      jobId: lifecycleJobs[1], agentId: customerId, actionId: 'v4-withdrawable-application', worldTime: 1_000 }));
+    const withdrawn = await inTransaction(pool, (client) => withdrawWorldBusinessApplication(client, { worldId,
+      applicationId: withdrawable.id, agentId: customerId, actionId: 'v4-withdraw-action', worldTime: 1_010 }));
+    assert.equal(withdrawn.status, 'withdrawn');
+    assert.equal((await inTransaction(pool, (client) => withdrawWorldBusinessApplication(client, { worldId,
+      applicationId: withdrawable.id, agentId: customerId, actionId: 'v4-withdraw-action', worldTime: 1_011 }))).idempotent, true);
+    await assert.rejects(inTransaction(pool, (client) => withdrawWorldBusinessApplication(client, { worldId,
+      applicationId: withdrawable.id, agentId: founderId, actionId: 'v4-unauthorized-withdraw', worldTime: 1_012 })),
+    (error) => error.message === 'BUSINESS_APPLICATION_APPLICANT_REQUIRED');
 
     const employmentId = hired.id;
     const serviceId = found.serviceId;
@@ -149,6 +189,34 @@ test('V4 economy settles business, project, organization and place value without
     assert.equal(repeatedOrder.idempotent, true);
     assert.equal((await getEconomicAccount(pool, { worldId, accountType: 'resident', ownerId: customerId })).balance,
       customerBalanceAfterOrder);
+
+    const memoryEvent = (await pool.query(`INSERT INTO world_events(world_id,actor_id,event_type,data,action_id)
+      VALUES($1,$2,'v4.memory_source','{}','v4-memory-source') RETURNING id`, [worldId, customerId])).rows[0];
+    await pool.query(`INSERT INTO agent_memories(world_id,agent_id,memory_type,summary,importance,world_minutes,
+        source_event_id,long_term) VALUES($1,$2,'business','Per-action customer memory.',0.5,645,$3,false)`,
+    [worldId, customerId, memoryEvent.id]);
+    const consolidatedKey = `business:${businessId}:resident-economic-experience`;
+    await inTransaction(pool, (client) => recordConsolidatedMemory(client, { worldId, agentId: customerId,
+      memoryType: 'business', summary: 'Initial service experience.', importance: 0.74, worldMinutes: 640,
+      key: consolidatedKey, relatedAgentId: founderId,
+      metadata: { action: 'business_service', businessId, sourceEventId: memoryEvent.id, outcome: 1 } }));
+    await inTransaction(pool, (client) => recordConsolidatedMemory(client, { worldId, agentId: customerId,
+      memoryType: 'business', summary: 'Latest service experience.', importance: 0.74, worldMinutes: 650,
+      key: consolidatedKey, relatedAgentId: founderId,
+      metadata: { action: 'business_service', businessId, sourceEventId: memoryEvent.id, outcome: 1 } }));
+    const consolidated = await pool.query(`SELECT memory_type,summary,world_minutes,long_term,related_agent_id,
+        source_event_id,metadata->>'sourceEventId' AS source_event_reference
+      FROM agent_memories WHERE world_id=$1 AND agent_id=$2 AND consolidation_key=$3`,
+    [worldId, customerId, consolidatedKey]);
+    assert.equal(consolidated.rowCount, 1, 'a resident keeps only one latest experience per business');
+    assert.equal(consolidated.rows[0].memory_type, 'business');
+    assert.equal(consolidated.rows[0].summary, 'Latest service experience.');
+    assert.equal(consolidated.rows[0].world_minutes, '650');
+    assert.equal(consolidated.rows[0].long_term, true);
+    assert.equal(consolidated.rows[0].related_agent_id, founderId);
+    assert.equal(consolidated.rows[0].source_event_id, null,
+      'consolidated memory does not claim the event already linked to the per-action memory');
+    assert.equal(consolidated.rows[0].source_event_reference, memoryEvent.id);
 
     const transferSource = await getEconomicAccount(pool, { worldId, accountType: 'business', ownerId: businessId });
     const transferDestination = await getEconomicAccount(pool, { worldId, accountType: 'resident', ownerId: workerId });

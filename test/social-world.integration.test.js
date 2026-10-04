@@ -101,8 +101,7 @@ test('isolated 24-hour world keeps social state durable and records real simulat
     };
     engine = await start();
     assert.equal(engine.running, true);
-    const profileBeforeRestart = (await pool.query(`SELECT primary_goal,sociability,curiosity,discipline,ambition FROM world_social_profiles
-      WHERE world_id=$1 AND agent_id=$2`, [worldId, agentIds[0]])).rows[0];
+    let profileBeforeRestart;
     const clockBeforeDuplicate = Number((await pool.query('SELECT world_minutes FROM world_runtime_state WHERE world_id=$1',
       [worldId])).rows[0].world_minutes);
     const duplicateEngine = await startWorldEngine(pool, { worldId, schedule: false, nowProvider: () => simulatedNow });
@@ -115,6 +114,8 @@ test('isolated 24-hour world keeps social state durable and records real simulat
       await engine.tickOnce();
       if (minute % 15 === 14) await verifyNewExchangeTrades();
     }
+    profileBeforeRestart = (await pool.query(`SELECT primary_goal,sociability FROM world_social_profiles
+      WHERE world_id=$1 AND agent_id=$2`, [worldId, agentIds[0]])).rows[0];
     await engine.stop();
     await verifyNewExchangeTrades();
     engine = null;

@@ -1242,7 +1242,7 @@ CREATE TABLE IF NOT EXISTS world_business_applications (
   job_id uuid NOT NULL REFERENCES world_business_jobs(id) ON DELETE CASCADE,
   business_id uuid NOT NULL REFERENCES world_businesses(id) ON DELETE CASCADE,
   agent_id uuid NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
-  status text NOT NULL CHECK (status IN ('pending','accepted','rejected','withdrawn')),
+  status text NOT NULL CHECK (status IN ('pending','accepted','rejected','withdrawn','expired')),
   action_id text NOT NULL,
   created_world_time bigint NOT NULL CHECK (created_world_time >= 0),
   updated_world_time bigint NOT NULL CHECK (updated_world_time >= 0),
@@ -1314,7 +1314,19 @@ CREATE INDEX IF NOT EXISTS world_businesses_active_idx ON world_businesses(world
 CREATE INDEX IF NOT EXISTS world_business_services_market_idx ON world_business_services(world_id,service_type,active);
 CREATE INDEX IF NOT EXISTS world_business_jobs_open_idx ON world_business_jobs(world_id,status,created_world_time);
 CREATE INDEX IF NOT EXISTS world_business_applications_pending_idx ON world_business_applications(world_id,business_id,status);
+CREATE INDEX IF NOT EXISTS world_business_applications_pending_age_idx
+  ON world_business_applications(world_id,created_world_time) WHERE status='pending';
 CREATE INDEX IF NOT EXISTS world_business_orders_recent_idx ON world_business_orders(world_id,world_time DESC,id);
+
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_business_applications'::regclass
+      AND conname='world_business_applications_status_check' AND pg_get_constraintdef(oid) LIKE '%expired%') THEN
+    ALTER TABLE world_business_applications DROP CONSTRAINT IF EXISTS world_business_applications_status_check;
+    ALTER TABLE world_business_applications ADD CONSTRAINT world_business_applications_status_check
+      CHECK (status IN ('pending','accepted','rejected','withdrawn','expired'));
+  END IF;
+END $$;
 
 DO $$
 BEGIN
@@ -1344,6 +1356,7 @@ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_agent_states'::regclass
       AND conname='world_agent_states_planned_action_check'
       AND pg_get_constraintdef(oid) LIKE '%business_service%'
+      AND pg_get_constraintdef(oid) LIKE '%business_withdraw%'
       AND pg_get_constraintdef(oid) LIKE '%business_reject%'
       AND pg_get_constraintdef(oid) LIKE '%business_leave%'
       AND pg_get_constraintdef(oid) LIKE '%business_skill_practice%'
@@ -1357,7 +1370,7 @@ BEGIN
         'organization_found','organization_join','organization_leave','organization_invite','organization_reject','organization_contribute',
         'place_create','information_share','information_accept','information_ignore','information_doubt','goal_review',
         'project_invest','project_distribute',
-        'business_found','business_service','business_apply','business_leave','business_hire','business_work','business_invest',
+        'business_found','business_service','business_apply','business_withdraw','business_leave','business_hire','business_work','business_invest',
         'business_reject','business_price','business_distribute','business_close','business_skill_practice','business_seek_cofounder'));
   END IF;
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_emergence_events'::regclass

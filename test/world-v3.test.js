@@ -87,6 +87,7 @@ test('Fruitfly exposes twelve output families and learns from V3 and V4 action f
     assert.ok(fruitflyFamily('business_found') === 'business');
     assert.ok(fruitflyFamily('business_invest') === 'invest');
     assert.ok(fruitflyFamily('business_apply') === 'job');
+    assert.ok(fruitflyFamily('business_withdraw') === 'job');
     assert.ok(fruitflyFamily('business_skill_practice') === 'business_learn');
     assert.ok(fruitflyFamily('project_propose') === 'business');
     assert.ok(fruitflyFamily('information_share') === 'socialize');

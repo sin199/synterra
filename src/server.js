@@ -24,7 +24,8 @@ import { readEmergenceReport } from './world-emergence.js';
 import { closeWorldBusiness, distributeWorldBusinessProfit, distributeWorldProjectRevenue,
   economicDashboardSql, foundWorldBusiness, investInWorldBusiness, investInWorldProject, listWorldBusinesses,
   purchaseWorldBusinessService, reviewWorldBusinessPrice, completeWorldBusinessShift, applyToWorldBusinessJob,
-  decideWorldBusinessApplication, leaveWorldBusinessJob, practiceWorldBusinessCapability } from './world-businesses.js';
+  decideWorldBusinessApplication, leaveWorldBusinessJob, practiceWorldBusinessCapability,
+  withdrawWorldBusinessApplication } from './world-businesses.js';
 import { ensureEconomicAccount, getEconomicAccount } from './economic-ledger.js';
 
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -1516,12 +1517,13 @@ app.get('/v1/worlds/:worldId/businesses', async (request, reply) => {
 app.post('/v1/worlds/:worldId/economy/actions', async (request, reply) => {
   const { worldId } = request.params;
   const body = request.body || {};
-  const actions = new Set(['business_found','business_invest','business_service','business_apply','business_decide',
+  const actions = new Set(['business_found','business_invest','business_service','business_apply','business_withdraw','business_decide',
     'business_work','business_leave','business_price','business_distribute','business_close',
     'business_skill_practice','business_seek_cofounder','project_invest','project_distribute']);
   if (!validUuid(worldId) || !actions.has(body.action)) return fail(reply, 400, 'ECONOMIC_ACTION_INVALID');
   const actionId = requireActionId(body);
   const idFields = { business_invest: ['businessId'], business_service: ['serviceId'], business_apply: ['jobId'],
+    business_withdraw: ['applicationId'],
     business_decide: ['applicationId'], business_work: ['businessId','serviceId'], business_leave: ['employmentId'],
     business_price: ['businessId','serviceId'], business_distribute: ['businessId'], business_close: ['businessId'],
     project_invest: ['projectId'], project_distribute: ['projectId'] }[body.action] || [];
@@ -1588,6 +1590,8 @@ app.post('/v1/worlds/:worldId/economy/actions', async (request, reply) => {
       projectId: body.projectId, ownerAgentId: request.agentId, actionId, worldTime });
     if (body.action === 'business_apply') return applyToWorldBusinessJob(client, { worldId,
       jobId: body.jobId, agentId: request.agentId, actionId, worldTime });
+    if (body.action === 'business_withdraw') return withdrawWorldBusinessApplication(client, { worldId,
+      applicationId: body.applicationId, agentId: request.agentId, actionId, worldTime });
     if (body.action === 'business_decide') return decideWorldBusinessApplication(client, { worldId,
       applicationId: body.applicationId, founderAgentId: request.agentId, decision: body.decision, actionId, worldTime });
     if (body.action === 'business_work') return completeWorldBusinessShift(client, { worldId,

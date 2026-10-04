@@ -499,7 +499,7 @@ export function fruitflyFamily(candidateOrAction) {
   if (action === 'business_skill_practice') return 'business_learn';
   if (['opportunity', 'opportunity_reject'].includes(action)) return 'travel';
   if (['business_invest','project_invest','project_distribute'].includes(action)) return 'invest';
-  if (['business_apply','business_leave','business_hire','business_reject'].includes(action)) return 'job';
+  if (['business_apply','business_withdraw','business_leave','business_hire','business_reject'].includes(action)) return 'job';
   if (action === 'business_service') {
     const serviceType = candidate.serviceType || candidate.service_type;
     if (serviceType === 'food_service') return 'eat';

@@ -246,6 +246,19 @@ test('business hiring and service candidates require funded payroll and reflect 
   assert.ok(buildBusinessCandidates(resident, { ...context, jobs: [fundedJob] })
     .some((candidate) => candidate.action === 'business_apply'));
 
+  const pendingOwnApplication = { ...application, id: 'application-own', agent_id: resident.agentId,
+    businessName: 'Research Studio', created_world_time: 1_000 };
+  const applicantCandidates = buildBusinessCandidates(resident, { ...context, jobs: [],
+    applications: [pendingOwnApplication] });
+  assert.ok(applicantCandidates.some((candidate) => candidate.action === 'business_withdraw'
+    && candidate.applicationId === pendingOwnApplication.id),
+  'an applicant can choose to withdraw a long-pending application');
+  const recentApplication = buildBusinessCandidates(resident, { ...context, jobs: [], applications: [
+    { ...pendingOwnApplication, created_world_time: 1_281 }
+  ] });
+  assert.ok(!recentApplication.some((candidate) => candidate.action === 'business_withdraw'),
+    'withdrawal is not proposed immediately after applying');
+
   const service = { id: 'service-a', business_id: 'business-a', founderAgentId: 'founder-a',
     businessName: 'Research Studio', businessReputation: 4, service_type: 'research_service',
     stock_units: 1, base_price_usdc: '35', active: true };

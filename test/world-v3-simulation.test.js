@@ -58,7 +58,7 @@ test(`isolated Fruitfly world simulation runs 10 seeded scenarios for ${hours} w
     const stepSeconds = 30;
     const simulatedMinutes = hours * 60;
     const steps = simulatedMinutes / stepSeconds;
-    const baseMs = Date.UTC(2026, 9, 4) + seed * 60_000;
+    const baseMs = Date.now() + seed * 60_000;
     let nowMs = baseMs;
     let pool = new Pool({ connectionString: databaseUrl, max: 4 });
     let engine = null;

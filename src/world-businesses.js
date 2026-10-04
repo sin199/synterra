@@ -25,6 +25,7 @@ const MIN_FOUNDER_CASH = 250;
 const FOUNDER_CAPITAL = '250.00000000';
 const RESIDENT_FOUNDER_RESERVE = 1_000;
 const BUSINESS_RETRY_COOLDOWN_WORLD_MINUTES = 3 * 1_440;
+const BUSINESS_APPLICATION_TTL_WORLD_MINUTES = 2_880;
 const MIN_INVESTMENT = '10.00000000';
 const RUN_COST_PER_DAY = '5.00000000';
 const MAX_DISTRIBUTION_SHARE = 0.2;
@@ -833,6 +834,18 @@ export function buildBusinessCandidates(agent, context = {}) {
       });
     }
   }
+  for (const application of context.applications || []) {
+    if ((application.agent_id === agent.agentId || application.agentId === agent.agentId)
+        && application.status === 'pending' && application.businessStatus === 'active'
+        && application.jobStatus === 'open') {
+      const age = Math.max(0, worldMinutes - Number(application.created_world_time ?? application.createdWorldTime ?? worldMinutes));
+      if (age >= 720) options.push({ id: `business:withdraw:${application.id}`, action: 'business_withdraw',
+        targetLocation: agent.location,
+        goal: `Withdraw your pending application for ${application.role || 'the open role'} at ${application.businessName || 'the business'} if you no longer want it.`,
+        applicationId: application.id, businessId: application.business_id || application.businessId,
+        score: 16 + Math.min(8, (age - 720) / 270) });
+    }
+  }
   for (const application of context.applications || []) if (application.founderAgentId === agent.agentId
       && application.status === 'pending' && application.businessStatus === 'active' && application.jobStatus === 'open') {
     const relation = relationships.find((item) => item.otherAgentId === application.agent_id);
@@ -1168,6 +1181,62 @@ export async function applyToWorldBusinessJob(client, { worldId, jobId, agentId,
   return { ...inserted.rows[0], businessId: row.business_id, jobId };
 }
 
+export async function expirePendingWorldBusinessApplications(client, { worldId, worldTime }) {
+  const expired = await client.query(`WITH due AS MATERIALIZED (
+      SELECT application.id,application.agent_id,application.business_id,application.job_id,
+        CASE WHEN business.status<>'active' THEN 'business_unavailable'
+          WHEN job.status='filled' THEN 'job_filled'
+          WHEN job.status='closed' THEN 'job_closed'
+          ELSE 'application_ttl' END AS reason
+      FROM world_business_applications application
+      JOIN world_business_jobs job ON job.world_id=application.world_id AND job.id=application.job_id
+      JOIN world_businesses business ON business.world_id=application.world_id AND business.id=application.business_id
+      WHERE application.world_id=$1 AND application.status='pending'
+        AND (business.status<>'active' OR job.status IN ('filled','closed')
+          OR application.created_world_time<=$2::bigint-$3::bigint)
+      ORDER BY application.created_world_time,application.id
+      FOR UPDATE OF application SKIP LOCKED
+    ), updated AS (
+      UPDATE world_business_applications application SET status='expired',updated_world_time=$2
+      FROM due WHERE application.world_id=$1 AND application.id=due.id
+      RETURNING application.id,application.agent_id,application.business_id,application.job_id
+    )
+    SELECT updated.id,updated.agent_id AS "applicantId",updated.business_id AS "businessId",
+      updated.job_id AS "jobId",due.reason
+    FROM updated JOIN due ON due.id=updated.id ORDER BY updated.id`,
+  [worldId, worldTime, BUSINESS_APPLICATION_TTL_WORLD_MINUTES]);
+  for (const row of expired.rows) {
+    await client.query(`INSERT INTO world_events(world_id,actor_id,event_type,data,action_id)
+      VALUES($1,$2,'business.application_expired',$3,$4) ON CONFLICT(world_id,actor_id,action_id) DO NOTHING`,
+    [worldId, row.applicantId, { applicationId: row.id, businessId: row.businessId,
+      jobId: row.jobId, reason: row.reason, worldTime }, `business-application-expired:${row.id}`]);
+  }
+  return { expired: expired.rowCount, applications: expired.rows };
+}
+
+export async function withdrawWorldBusinessApplication(client, { worldId, applicationId, agentId, actionId, worldTime }) {
+  const application = await client.query(`SELECT application.id,application.agent_id,application.business_id,
+      application.job_id,application.status,application.action_id,business.name AS "businessName",job.role
+    FROM world_business_applications application
+    JOIN world_businesses business ON business.world_id=application.world_id AND business.id=application.business_id
+    JOIN world_business_jobs job ON job.world_id=application.world_id AND job.id=application.job_id
+    WHERE application.world_id=$1 AND application.id=$2 FOR UPDATE OF application`, [worldId, applicationId]);
+  if (!application.rowCount) throw error('BUSINESS_APPLICATION_NOT_FOUND', 404);
+  const row = application.rows[0];
+  if (row.agent_id !== agentId) throw error('BUSINESS_APPLICATION_APPLICANT_REQUIRED', 403);
+  if (row.status === 'withdrawn' && row.action_id === actionId) {
+    return { id: row.id, status: 'withdrawn', businessId: row.business_id, jobId: row.job_id, idempotent: true };
+  }
+  if (row.status !== 'pending') throw error('BUSINESS_APPLICATION_NOT_PENDING');
+  await client.query(`UPDATE world_business_applications SET status='withdrawn',action_id=$3,updated_world_time=$4
+    WHERE world_id=$1 AND id=$2`, [worldId, applicationId, actionId, worldTime]);
+  await client.query(`INSERT INTO world_events(world_id,actor_id,event_type,data,action_id)
+    VALUES($1,$2,'business.application_withdrawn',$3,$4) ON CONFLICT(world_id,actor_id,action_id) DO NOTHING`,
+  [worldId, agentId, { applicationId, businessId: row.business_id, jobId: row.job_id,
+    businessName: row.businessName, role: row.role, worldTime }, actionId]);
+  return { id: applicationId, status: 'withdrawn', businessId: row.business_id, jobId: row.job_id, idempotent: false };
+}
+
 export async function leaveWorldBusinessJob(client, { worldId, employmentId, agentId, actionId, worldTime }) {
   const eventKey = `business-employment-left:${actionId}`;
   const prior = await client.query(`SELECT entity_id AS "employmentId",metadata FROM world_history
@@ -1231,11 +1300,14 @@ export async function decideWorldBusinessApplication(client, { worldId, applicat
   await client.query(`UPDATE world_business_applications SET status='accepted',action_id=$3,updated_world_time=$4
     WHERE id=$1 AND world_id=$2`, [applicationId, worldId, actionId, worldTime]);
   await client.query(`UPDATE world_business_jobs SET status='filled' WHERE id=$1`, [row.jobId]);
+  const expiredApplications = await expirePendingWorldBusinessApplications(client, { worldId, worldTime });
   await recordHistory(client, { worldId, eventKey: `business-hire:${employment.rows[0].id}`, eventType: 'business_employment',
     actorAgentId: founderAgentId, entityType: 'job', entityId: row.jobId, worldTime, title: `${row.businessName} hired a worker`,
     detail: `A resident accepted the ${row.role} job at ${row.businessName} with a ${row.wage} simulated USDC shift wage.`,
-    metadata: { employmentId: employment.rows[0].id, employeeId: row.agent_id, wage: row.wage } });
-  return { id: employment.rows[0].id, applicationId, status: 'active', employeeId: row.agent_id, wage: row.wage };
+    metadata: { employmentId: employment.rows[0].id, employeeId: row.agent_id, wage: row.wage,
+      expiredApplications: expiredApplications.expired } });
+  return { id: employment.rows[0].id, applicationId, status: 'active', employeeId: row.agent_id, wage: row.wage,
+    expiredApplications: expiredApplications.expired };
 }
 
 export async function purchaseWorldBusinessService(client, { worldId, serviceId, customerAgentId, actionId, worldTime,
@@ -1316,7 +1388,7 @@ export async function purchaseWorldBusinessService(client, { worldId, serviceId,
     priceUsdc: quotedPrice, transactionId: transaction.transactionId,
     businessRevenueUsdc: businessRevenue, venueFeeUsdc: venueFee, venueTransactionIds: venueTransactions,
     benefit, serviceType: service.service_type, serviceName: service.name, businessName: service.businessName,
-    idempotent: false };
+    businessFounderAgentId: service.founderAgentId, idempotent: false };
 }
 
 export async function completeWorldBusinessShift(client, { worldId, businessId, serviceId, agentId, employmentId = null,
@@ -1351,7 +1423,8 @@ export async function completeWorldBusinessShift(client, { worldId, businessId, 
   const updated = await client.query(`UPDATE world_business_services SET stock_units=stock_units+1
     WHERE id=$1 RETURNING stock_units`, [serviceId]);
   return { businessId, serviceId, serviceType: service.rows[0].service_type,
-    stockUnits: updated.rows[0].stock_units, wageUsdc: wage, producerAgentId: agentId };
+    businessName: business.name, businessFounderAgentId: business.founder_agent_id,
+    stockUnits: updated.rows[0].stock_units, wageUsdc: wage, producerAgentId: agentId, employmentId };
 }
 
 export async function investInWorldBusiness(client, { worldId, businessId, investorAgentId, amount, actionId, worldTime,
@@ -1600,11 +1673,12 @@ export async function closeWorldBusiness(client, { worldId, businessId, founderA
   await client.query(`UPDATE world_business_jobs SET status='closed' WHERE world_id=$1 AND business_id=$2 AND status='open'`, [worldId, businessId]);
   await client.query(`UPDATE world_business_employment SET status='terminated',ended_world_time=$3
     WHERE world_id=$1 AND business_id=$2 AND status='active'`, [worldId, businessId, worldTime]);
+  const expiredApplications = await expirePendingWorldBusinessApplications(client, { worldId, worldTime });
   await recordHistory(client, { worldId, eventKey: `business-close:${businessId}:${actionId}`,
     eventType: 'business_closed', actorAgentId: founderAgentId, entityType: 'business', entityId: businessId,
     worldTime, title: business.name, detail: `${business.name} ${bankrupt ? 'became insolvent' : 'closed'}; its history and ownership records remain.`,
-    metadata: { status, cashBalance: business.cash_balance } });
-  return { id: businessId, name: business.name, status };
+    metadata: { status, cashBalance: business.cash_balance, expiredApplications: expiredApplications.expired } });
+  return { id: businessId, name: business.name, status, expiredApplications: expiredApplications.expired };
 }
 
 export async function settleWorldBusinessMaintenance(client, { worldId, worldTime }) {
@@ -1689,7 +1763,9 @@ export async function settleWorldBusinessMaintenance(client, { worldId, worldTim
         netOperatingResultUsdc: dailyNet.toFixed(8), consecutiveLossDays: lossDays, status }
     });
   }
-  return { day, charged, observed: businesses.rowCount, outcomes };
+  const expiredApplications = await expirePendingWorldBusinessApplications(client, { worldId, worldTime });
+  return { day, charged, observed: businesses.rowCount, outcomes,
+    expiredApplications: expiredApplications.expired };
 }
 
 export async function settleWorldPlaceMaintenance(client, { worldId, worldTime }) {

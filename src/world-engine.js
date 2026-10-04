@@ -25,9 +25,10 @@ import { shareWorldInformation, decideWorldInformationShare, expireInformationSh
 import { applyToWorldBusinessJob, buildBusinessCandidates, closeWorldBusiness,
   completeWorldBusinessShift, decideWorldBusinessApplication, distributeWorldBusinessProfit,
   distributeWorldProjectRevenue, foundWorldBusiness, investInWorldBusiness, investInWorldProject,
-  leaveWorldBusinessJob, loadWorldBusinessContext, purchaseWorldBusinessService,
+  expirePendingWorldBusinessApplications, leaveWorldBusinessJob, loadWorldBusinessContext, purchaseWorldBusinessService,
   observeResidentEconomicMarket,
   practiceWorldBusinessCapability, reviewWorldBusinessPrice, settleWorldBusinessMaintenance,
+  withdrawWorldBusinessApplication,
   settleWorldPlaceMaintenance, explainBusinessOpportunityGaps } from './world-businesses.js';
 
 export const WORLD_TICK_MS = 1_000;
@@ -40,6 +41,7 @@ const ACTION_SECONDS = Object.freeze({ work: 16, cooperate: 16, learn: 11, rest:
   information_accept: 8, information_ignore: 6, information_doubt: 8, goal_review: 10,
   project_invest: 12, project_distribute: 10,
   business_found: 18, business_service: 12, business_apply: 10, business_leave: 8, business_hire: 10,
+  business_withdraw: 6,
   business_work: 16, business_invest: 12, business_price: 10, business_distribute: 10, business_close: 10,
   business_skill_practice: 12, business_seek_cofounder: 14 });
 const GOALS = Object.freeze(['wealth','learn','community','wellbeing','balanced','wealth','learn','community','wellbeing','balanced']);
@@ -494,15 +496,19 @@ async function recordResidentMemory(client, { worldId, agentId, memoryType, summ
   return inserted.rows[0].id;
 }
 
-async function recordConsolidatedMemory(client, { worldId, agentId, summary, importance, worldMinutes, key, metadata }) {
+export async function recordConsolidatedMemory(client, { worldId, agentId, summary, importance, worldMinutes,
+  key, metadata, memoryType = 'summary', relatedAgentId = null, sourceEventId = null }) {
   if (!summary || !key) return null;
   const result = await client.query(`INSERT INTO agent_memories(world_id,agent_id,memory_type,summary,importance,
-      world_minutes,metadata,long_term,consolidation_key)
-    VALUES($1,$2,'summary',$3,$4,$5,$6,true,$7)
+      world_minutes,related_agent_id,metadata,source_event_id,long_term,consolidation_key)
+    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,true,$10)
     ON CONFLICT(world_id,agent_id,consolidation_key) WHERE consolidation_key IS NOT NULL
-    DO UPDATE SET summary=EXCLUDED.summary,importance=EXCLUDED.importance,world_minutes=EXCLUDED.world_minutes,
-      metadata=EXCLUDED.metadata,long_term=true,created_at=now()
-    RETURNING id`, [worldId, agentId, String(summary).slice(0, 240), clampPersonality(importance), worldMinutes, metadata, key]);
+    DO UPDATE SET memory_type=EXCLUDED.memory_type,summary=EXCLUDED.summary,importance=EXCLUDED.importance,
+      world_minutes=EXCLUDED.world_minutes,related_agent_id=EXCLUDED.related_agent_id,metadata=EXCLUDED.metadata,
+      source_event_id=COALESCE(EXCLUDED.source_event_id,agent_memories.source_event_id),
+      long_term=true,created_at=now()
+    RETURNING id`, [worldId, agentId, memoryType, String(summary).slice(0, 240), clampPersonality(importance),
+    worldMinutes, relatedAgentId, metadata, sourceEventId, key]);
   await pruneResidentMemories(client, worldId, agentId);
   return result.rows[0]?.id || null;
 }
@@ -929,6 +935,9 @@ async function completeWorldInitiativeActivity(client, worldId, agent, runtime, 
     } else if (activity === 'business_apply') {
       detail = await applyToWorldBusinessJob(client, { worldId, jobId: context.jobId,
         agentId: agent.agentId, actionId: key, worldTime: nowWorld });
+    } else if (activity === 'business_withdraw') {
+      detail = await withdrawWorldBusinessApplication(client, { worldId, applicationId: context.applicationId,
+        agentId: agent.agentId, actionId: key, worldTime: nowWorld });
     } else if (activity === 'business_leave') {
       detail = await leaveWorldBusinessJob(client, { worldId, employmentId: context.employmentId,
         agentId: agent.agentId, actionId: key, worldTime: nowWorld });
@@ -1012,6 +1021,7 @@ async function recordInitiativeOutcome(client, { worldId, agent, activity, resul
     organization_reject: 'rejected', information_share: 'shared',
     information_accept: 'accepted', information_ignore: 'ignored',
     business_found: 'founded', business_service: 'purchased', business_apply: 'applied',
+    business_withdraw: 'withdrawn',
     business_leave: 'left',
     business_hire: 'hired', business_reject: 'rejected', business_work: 'produced',
     business_invest: 'invested', business_price: 'price_changed', business_distribute: 'distributed',
@@ -1249,7 +1259,7 @@ async function completeActivity(client, worldId, agent, runtime, quotes, now, sc
     'project_invest','project_distribute',
     'organization_found','organization_join','organization_reject','organization_leave','organization_invite',
     'organization_contribute','information_share','information_accept','information_ignore','information_doubt',
-    'business_found','business_service','business_apply','business_leave','business_hire','business_reject','business_work',
+    'business_found','business_service','business_apply','business_withdraw','business_leave','business_hire','business_reject','business_work',
     'business_invest','business_price','business_distribute','business_close','business_skill_practice','business_seek_cofounder'].includes(activity)) {
     const initiative = await completeWorldInitiativeActivity(client, worldId, agent, runtime, activity);
     result.initiativeAction = activity;
@@ -1413,6 +1423,7 @@ async function completeActivity(client, worldId, agent, runtime, quotes, now, sc
       else if (initiativeAction === 'business_invest') summary = `Invested ${result.initiative?.amountUsdc || 'simulated USDC'} in ${businessName} for an ownership share.`;
       else if (initiativeAction === 'business_close') summary = `Closed ${businessName} after its finances no longer supported continuing.`;
       else if (initiativeAction === 'business_apply') summary = `Applied for a funded role at ${businessName}.`;
+      else if (initiativeAction === 'business_withdraw') summary = `Withdrew a pending application at ${businessName}.`;
       else if (initiativeAction === 'business_leave') summary = `Left the ${result.initiative?.role || 'role'} position at ${businessName}.`;
       else if (initiativeAction === 'business_hire') summary = `Accepted an application and created paid employment at ${businessName}.`;
       else if (initiativeAction === 'business_reject') summary = `Declined a job application at ${businessName}.`;
@@ -1442,6 +1453,23 @@ async function completeActivity(client, worldId, agent, runtime, quotes, now, sc
       relatedAgentId: result.initiative?.inviteAgentId || result.initiative?.partnerId || null,
       metadata: { action: initiativeAction, initiative: result.initiative || {}, outcome: result.opportunity?.status || 'success' },
       sourceEventId: completionEventId });
+    if (['business_work','business_service'].includes(initiativeAction) && result.initiative?.businessId) {
+      const businessId = result.initiative.businessId;
+      const work = initiativeAction === 'business_work';
+      const summary = work
+        ? `Worked for ${result.initiative.businessName || 'a business'}, produced ${result.initiative.serviceType || 'one service'} inventory, and received ${result.initiative.wageUsdc || 'no'} simulated USDC wage.`
+        : `Purchased ${result.initiative.serviceName || 'a service'} from ${result.initiative.businessName || 'a business'} for ${result.initiative.priceUsdc || 'simulated USDC'}; the service changed resident needs.`;
+      await recordConsolidatedMemory(client, { worldId, agentId: agent.agentId,
+        memoryType: 'business', summary, importance: 0.74, worldMinutes: runtime.world_minutes,
+        key: `business:${businessId}:resident-economic-experience`,
+        relatedAgentId: result.initiative.businessFounderAgentId || null,
+        metadata: { action: initiativeAction, businessId, serviceId: result.initiative.serviceId || null,
+          sourceEventId: completionEventId,
+          serviceType: result.initiative.serviceType || null, orderId: result.initiative.orderId || null,
+          employmentId: result.initiative.employmentId || null, wageUsdc: result.initiative.wageUsdc || null,
+          priceUsdc: result.initiative.priceUsdc || null, benefit: result.initiative.benefit || null,
+          outcome: 1 } });
+    }
     await refreshSocialProfile(client, worldId, agent.agentId, runtime.world_minutes, completionEventId);
   } else if (activity !== 'socialize' && !result.abandoned) {
     const meaningful = activity === 'work' && result.work || activity === 'learn' && result.learning || activity === 'trade' && result.trade;
@@ -1639,7 +1667,9 @@ async function runStrategicTypeSafe(pool, worldId, chooseWithTypeSafe, runtimeSt
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    // World ticks lock resident state before updating goals; use the same order to avoid deadlocks.
+    // Ticks lock runtime state before resident/profile/goal rows. Serialize this short
+    // apply step with ticks so a reflection cannot hold a profile while this holds state.
+    await client.query('SELECT tick_count FROM world_runtime_state WHERE world_id=$1 FOR UPDATE', [worldId]);
     await client.query(`UPDATE world_agent_states SET goal=$3,updated_at=now() WHERE world_id=$1 AND agent_id=$2`,
       [worldId, resident.agentId, goalCandidate.legacyGoal]);
     await client.query(`UPDATE world_agent_goals SET status='paused',updated_world_minutes=$3,updated_at=now()
@@ -1740,7 +1770,7 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
           const sign = result < -1e-8 ? 'lost' : result > 1e-8 ? 'earned' : 'broke even';
           await recordConsolidatedMemory(client, { worldId, agentId: outcome.founderAgentId,
             summary: `${outcome.name} ${sign} ${Math.abs(result).toFixed(2)} simulated USDC on world day ${businessSettlement.day}; status ${outcome.status}.`,
-            importance: outcome.status === 'bankrupt' ? 0.9 : result < 0 ? 0.58 : 0.48,
+            memoryType: 'business', importance: outcome.status === 'bankrupt' ? 0.9 : result < 0 ? 0.58 : 0.48,
             worldMinutes: newWorldDay * 1_440, key: `business:${outcome.id}:daily-outcome`,
             metadata: { businessId: outcome.id, worldDay: businessSettlement.day, status: outcome.status,
               dailyRevenueUsdc: outcome.dailyRevenueUsdc, dailyExpensesUsdc: outcome.dailyExpensesUsdc,
@@ -1832,6 +1862,7 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
           && new Date(member.next_decision_at).getTime() <= now.getTime());
         let initiativeState = null;
         if (newHour > oldHour) {
+          await expirePendingWorldBusinessApplications(client, { worldId, worldTime: worldMinutes });
           const expiredOpportunities = await expireWorldOpportunities(client, worldId, worldMinutes);
           for (const opportunity of expiredOpportunities) await recordEmergenceEvent(client, { worldId,
             worldMinutes, tickCount, system: 'opportunity', stage: 'expired',
