@@ -29,6 +29,8 @@ import { applyToWorldBusinessJob, buildBusinessCandidates, closeWorldBusiness,
   completeWorldBusinessShift, decideWorldBusinessApplication, distributeWorldBusinessProfit,
   distributeWorldProjectRevenue, foundWorldBusiness, investInWorldBusiness, investInWorldProject,
   expirePendingWorldBusinessApplications, leaveWorldBusinessJob, loadWorldBusinessContext, purchaseWorldBusinessService,
+  reopenWorldBusiness,
+  observeWorldBusinessMarket,
   observeResidentEconomicMarket,
   practiceWorldBusinessCapability, reviewWorldBusinessPrice, settleWorldBusinessMaintenance,
   withdrawWorldBusinessApplication,
@@ -47,12 +49,15 @@ const ACTION_SECONDS = Object.freeze({ work: 16, cooperate: 16, learn: 11, rest:
   business_found: 18, business_service: 12, business_apply: 10, business_leave: 8, business_hire: 10,
   business_withdraw: 6,
   business_work: 16, business_invest: 12, business_price: 10, business_distribute: 10, business_close: 10,
-  business_skill_practice: 12, business_seek_cofounder: 14,
+  business_skill_practice: 12, business_seek_cofounder: 14, business_market_observe: 12, business_reopen: 18,
   agreement_propose: 12, agreement_respond: 8, commitment_resolve: 8, organization_propose: 12, organization_vote: 8 });
 const GOALS = Object.freeze(['wealth','learn','community','wellbeing','balanced','wealth','learn','community','wellbeing','balanced']);
 const RISK_TOLERANCE = Object.freeze([0.78,0.28,0.52,0.22,0.68,0.35,0.82,0.47,0.70,0.40]);
 const ALLOWED_GOALS = new Set(['wealth','learn','community','wellbeing','balanced']);
 const FINITE_STAT_KEYS = ['energy','food','social','happiness','knowledge'];
+const ECONOMIC_RECOVERY_ACTIONS = new Set(['business_market_observe','business_found','business_reopen',
+  'business_seek_cofounder','business_skill_practice','business_apply','business_leave','business_work',
+  'business_invest','agreement_propose','project_propose','organization_found','organization_join']);
 
 function stableInt(input) {
   return createHash('sha256').update(String(input)).digest().readUInt32BE(0);
@@ -67,6 +72,17 @@ function initiativeSystem(action) {
   if (action.startsWith('information')) return 'information';
   if (action.startsWith('business')) return 'business';
   return 'place';
+}
+
+function recoveryBlocker(reasonCode) {
+  const value = String(reasonCode || '').toUpperCase();
+  if (value.includes('COOLDOWN')) return 'COOLDOWN';
+  if (value.includes('CAPITAL')) return 'NO_CAPITAL';
+  if (value.includes('CAPABILITY')) return 'NO_CAPABILITY';
+  if (value.includes('PARTNER') || value.includes('TEAM_CAPABILITY')) return 'NO_PARTNER';
+  if (value.includes('MARKET_NOT_OBSERVED') || value.includes('MARKET_KNOWLEDGE')) return 'NO_MARKET_KNOWLEDGE';
+  if (value.includes('RISK')) return 'RISK_TOO_HIGH';
+  return 'OTHER';
 }
 
 function finite(value, fallback = 0) {
@@ -443,6 +459,22 @@ async function loadWorldInitiatives(client, worldId, worldMinutes, residents, sc
       alreadySharedOrganization: data.organizationMemberships.some((organization) =>
         organization.memberIds.includes(partner.partnerId) && organization.status !== 'dissolved') }));
     data.organizationPartners = data.organizationPartners.filter((partner) => !partner.alreadySharedOrganization);
+    const networkAgentIds = new Set((resident.relationships || [])
+      .filter((relation) => Number(relation.trust) >= 2 && Number(relation.familiarity) >= 10)
+      .map((relation) => relation.otherAgentId).filter(Boolean));
+    for (const organization of data.organizationMemberships.filter((item) => item.status === 'active'
+      && item.memberStatus === 'active')) for (const memberId of organization.memberIds || []) {
+      if (memberId !== resident.agent_id) networkAgentIds.add(memberId);
+    }
+    const activeProjectIds = new Set(data.projectMemberships.filter((membership) => membership.status === 'active')
+      .map((membership) => membership.projectId));
+    for (const membership of projectMembers.rows) if (membership.status === 'active'
+        && activeProjectIds.has(membership.projectId) && membership.agentId !== resident.agent_id) {
+      networkAgentIds.add(membership.agentId);
+    }
+    data.marketKnowledgeSources = [...networkAgentIds].flatMap((agentId) =>
+      (beliefsByAgent.get(agentId) || []).filter((belief) => belief.subjectType === 'market'
+        && belief.beliefKey === 'unmet_demand').map((belief) => ({ ...belief, agentId })));
     data.residentNames = residentById;
   }
   const economy = await loadWorldBusinessContext(client, worldId, worldMinutes, residents);
@@ -461,6 +493,8 @@ async function loadWorldInitiatives(client, worldId, worldMinutes, residents, sc
     data.employment = economy.employment;
     data.ownership = economy.ownership;
     data.demand = economy.demand;
+    data.failedContractDemand = economy.failedContractDemand;
+    data.contractDemand = economy.contractDemand;
     data.organizations = economy.organizations;
     data.economicProjects = economy.projects;
     data.places = economy.places;
@@ -924,6 +958,12 @@ async function completeWorldInitiativeActivity(client, worldId, agent, runtime, 
       const proposal = safeJson(context.businessProposal);
       detail = await foundWorldBusiness(client, { worldId, agentId: agent.agentId,
         actionId: key, proposal, worldTime: nowWorld });
+    } else if (activity === 'business_market_observe') {
+      detail = await observeWorldBusinessMarket(client, { worldId, agentId: agent.agentId,
+        serviceType: context.marketObservationServiceType, actionId: key, worldTime: nowWorld, location: agent.location });
+    } else if (activity === 'business_reopen') {
+      detail = await reopenWorldBusiness(client, { worldId, agentId: agent.agentId,
+        actionId: key, proposal: safeJson(context.reopenProposal), worldTime: nowWorld });
     } else if (activity === 'business_skill_practice') {
       detail = await practiceWorldBusinessCapability(client, { worldId, agentId: agent.agentId,
         skill: context.preparationSkill, serviceType: context.preparationServiceType,
@@ -1049,6 +1089,7 @@ async function recordInitiativeOutcome(client, { worldId, agent, activity, resul
     organization_reject: 'rejected', information_share: 'shared',
     information_accept: 'accepted', information_ignore: 'ignored',
     business_found: 'founded', business_service: 'purchased', business_apply: 'applied',
+    business_market_observe: 'market_observed', business_reopen: 'reopened',
     business_withdraw: 'withdrawn',
     business_leave: 'left',
     business_hire: 'hired', business_reject: 'rejected', business_work: 'produced',
@@ -1064,12 +1105,38 @@ async function recordInitiativeOutcome(client, { worldId, agent, activity, resul
   const reasonCode = result.abandoned ? String(result.abandoned).toUpperCase().replace(/[^A-Z0-9_]/g, '_').slice(0, 64)
     : action === 'business_found' ? 'BUSINESS_STARTED'
       : action === 'business_seek_cofounder' ? 'COFOUNDER_INVITED'
-        : action === 'business_skill_practice' ? 'CAPABILITY_PRACTICED' : 'NONE';
+        : action === 'business_skill_practice' ? 'CAPABILITY_PRACTICED'
+          : action === 'business_market_observe' ? (Number(details.unmetCount) > 0 || Number(details.replacementUnits) > 0
+            ? 'SHORTAGE_OBSERVED' : 'MARKET_OBSERVED_NO_SHORTAGE')
+            : action === 'business_reopen' ? 'BUSINESS_REOPENED' : 'NONE';
   const entityId = details.id || details.businessId || details.orderId || details.project?.id || details.opportunity?.id || null;
   await recordEmergenceEvent(client, { worldId, agentId: agent.agentId, worldMinutes, tickCount, system, stage,
     reasonCode, eventKey: `initiative-outcome:${agent.agentId}:${tickCount}:${action}:${stage}`,
     candidateId: String(entityId || agent.planned_context?.projectId || agent.planned_context?.opportunityId || action),
     action, details: { ...details, abandoned: result.abandoned || null } });
+
+  if (ECONOMIC_RECOVERY_ACTIONS.has(action) && !result.abandoned) {
+    await recordEmergenceEvent(client, { worldId, agentId: agent.agentId, worldMinutes, tickCount,
+      system: 'business', stage: 'recovery_action', reasonCode: action.toUpperCase(),
+      eventKey: `recovery-action:${agent.agentId}:${tickCount}:${action}`,
+      candidateId: String(entityId || agent.planned_context?.businessId || action), action,
+      details: { serviceType: details.serviceType || agent.planned_context?.businessProposal?.serviceType
+          || agent.planned_context?.preparationServiceType
+          || agent.planned_context?.marketObservationServiceType || agent.planned_context?.reopenProposal?.serviceType || null,
+        counterpartyAgentId: details.counterpartyAgentId || details.partnerId || null,
+        outcomeStage: stage, recoveryAction: true } });
+  }
+
+  if (action === 'business_market_observe' && !result.abandoned
+      && (Number(details.unmetCount) > 0 || Number(details.replacementUnits) > 0)) {
+    await recordEmergenceEvent(client, { worldId, agentId: agent.agentId, worldMinutes, tickCount,
+      system: 'business', stage: 'shortage_observed', reasonCode: Number(details.replacementUnits) > 0
+        ? 'SUPPLIER_FAILED' : 'UNMET_DEMAND',
+      eventKey: `shortage-observed:${agent.agentId}:${tickCount}:${details.serviceType}`,
+      candidateId: String(details.serviceType), action, details: { serviceType: details.serviceType,
+        unmetCount: details.unmetCount, replacementUnits: details.replacementUnits || 0,
+        failedContractCount: details.failedContractCount || 0, worldMinutes: details.observedWorldMinutes } });
+  }
 
   if (action === 'project_join' && details.projectStatus === 'active') {
     await recordEmergenceEvent(client, { worldId, agentId: agent.agentId, worldMinutes, tickCount,
@@ -1292,6 +1359,7 @@ async function completeActivity(client, worldId, agent, runtime, quotes, now, sc
     'organization_contribute','information_share','information_accept','information_ignore','information_doubt',
     'business_found','business_service','business_apply','business_withdraw','business_leave','business_hire','business_reject','business_work',
     'business_invest','business_price','business_distribute','business_close','business_skill_practice','business_seek_cofounder',
+    'business_market_observe','business_reopen',
     'agreement_propose','agreement_respond','commitment_resolve','organization_propose','organization_vote'].includes(activity)) {
     const initiative = await completeWorldInitiativeActivity(client, worldId, agent, runtime, activity);
     result.initiativeAction = activity;
@@ -1367,6 +1435,7 @@ async function completeActivity(client, worldId, agent, runtime, quotes, now, sc
     await refreshSocialProfile(client, worldId, result.cooperation.partnerId, runtime.world_minutes, completionEventId);
   } else if (result.initiativeAction && !result.abandoned) {
     const initiativeAction = result.initiativeAction;
+    let business = null;
     let skillAction = null;
     let memoryType = 'initiative';
     let importance = 0.42;
@@ -1444,7 +1513,7 @@ async function completeActivity(client, worldId, agent, runtime, quotes, now, sc
       importance = result.initiative?.created ? 0.7 : 0.4;
       summary = `${initiativeAction.replaceAll('_', ' ')} updated a resident organization.`;
     } else if (initiativeAction.startsWith('business_')) {
-      const business = (agent.businesses || []).find((item) => item.id === result.initiative?.businessId
+      business = (agent.businesses || []).find((item) => item.id === result.initiative?.businessId
         || item.id === result.initiative?.id || item.id === result.initiative?.businessId);
       const businessName = result.initiative?.name || result.initiative?.businessName || business?.name || 'a resident business';
       memoryType = 'business';
@@ -1456,6 +1525,8 @@ async function completeActivity(client, worldId, agent, runtime, quotes, now, sc
           : initiativeAction === 'business_seek_cofounder' ? 'socialize'
           : initiativeAction === 'business_found' ? 'work' : null;
       if (initiativeAction === 'business_found') summary = `Committed ${result.initiative?.capitalUsdc || 'simulated USDC'} to start ${businessName} around observed demand.`;
+      else if (initiativeAction === 'business_market_observe') summary = `Checked ${result.initiative?.serviceType || 'a service'} demand at Exchange: ${result.initiative?.unmetCount || 0} unmet requests out of ${result.initiative?.demandCount || 0}.`;
+      else if (initiativeAction === 'business_reopen') summary = `Reopened ${businessName} with fresh working capital after reviewing current ${result.initiative?.serviceType || 'service'} demand.`;
       else if (initiativeAction === 'business_skill_practice') {
         memoryType = 'learning';
         summary = `Practiced ${result.initiative?.skill || 'a skill'} after noticing demand for ${result.initiative?.serviceType || 'a service'}, gaining ${result.initiative?.skillGain || 0} capability.`;
@@ -1494,7 +1565,11 @@ async function completeActivity(client, worldId, agent, runtime, quotes, now, sc
     await recordResidentMemory(client, { worldId, agentId: agent.agentId, memoryType, summary, importance,
       worldMinutes: runtime.world_minutes, location: place,
       relatedAgentId: relatedAgentId || result.initiative?.inviteAgentId || result.initiative?.partnerId || null,
-      metadata: { action: initiativeAction, initiative: result.initiative || {}, outcome: result.opportunity?.status || 'success' },
+      metadata: { action: initiativeAction,
+        serviceType: result.initiative?.serviceType || agent.planned_context?.preparationServiceType
+          || agent.planned_context?.marketObservationServiceType || agent.planned_context?.reopenProposal?.serviceType
+          || business?.metadata?.serviceType || null,
+        initiative: result.initiative || {}, outcome: result.opportunity?.status || 'success' },
       sourceEventId: completionEventId });
     if (['business_work','business_service'].includes(initiativeAction) && result.initiative?.businessId) {
       const businessId = result.initiative.businessId;
@@ -1807,7 +1882,8 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
             worldMinutes: newWorldDay * 1_440, evidence: { action: 'business_daily_settlement',
               dailyRevenueUsdc: outcome.dailyRevenueUsdc, dailyExpensesUsdc: outcome.dailyExpensesUsdc,
               dailyOperatingResultUsdc: outcome.dailyNetOperatingResultUsdc,
-              consecutiveLossDays: outcome.consecutiveLossDays, missedMaintenanceDays: outcome.missedMaintenanceDays,
+              serviceType: outcome.serviceType, consecutiveLossDays: outcome.consecutiveLossDays,
+              missedMaintenanceDays: outcome.missedMaintenanceDays,
               bankruptcyReason: outcome.bankruptcyReason } });
           const result = Number(outcome.dailyNetOperatingResultUsdc) || 0;
           const sign = result < -1e-8 ? 'lost' : result > 1e-8 ? 'earned' : 'broke even';
@@ -1815,7 +1891,8 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
             summary: `${outcome.name} ${sign} ${Math.abs(result).toFixed(2)} simulated USDC on world day ${businessSettlement.day}; status ${outcome.status}.`,
             memoryType: 'business', importance: outcome.status === 'bankrupt' ? 0.9 : result < 0 ? 0.58 : 0.48,
             worldMinutes: newWorldDay * 1_440, key: `business:${outcome.id}:daily-outcome`,
-            metadata: { businessId: outcome.id, worldDay: businessSettlement.day, status: outcome.status,
+            metadata: { businessId: outcome.id, serviceType: outcome.serviceType,
+              worldDay: businessSettlement.day, status: outcome.status,
               dailyRevenueUsdc: outcome.dailyRevenueUsdc, dailyExpensesUsdc: outcome.dailyExpensesUsdc,
               dailyNetOperatingResultUsdc: outcome.dailyNetOperatingResultUsdc,
               consecutiveLossDays: outcome.consecutiveLossDays, missedMaintenanceDays: outcome.missedMaintenanceDays,
@@ -2091,27 +2168,44 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
               qualifiedStrategicCandidates = qualifyLayeredStrategicCandidates(permittedInitiatives);
               for (const gap of explainBusinessOpportunityGaps(agent, businessContext, businessCandidates)) {
                 const reasonCodes = [gap.reasonCode, ...(gap.additionalReasonCodes || [])];
-                for (const reasonCode of new Set(reasonCodes)) await recordEmergenceEvent(client, {
-                  worldId, agentId: agent.agentId, worldMinutes, tickCount, system: 'business',
-                  stage: reasonCode === 'CANDIDATE_CREATED' ? 'candidate_created' : 'blocked', reasonCode,
-                  eventKey: `business-opportunity:${agent.agentId}:${tickCount}:${gap.serviceType}:${reasonCode}`,
-                  candidateId: `${gap.serviceType}:${gap.action || 'none'}`, action: gap.action || 'business_found',
-                  utilityScore: businessCandidates.find((item) => item.businessProposal?.serviceType === gap.serviceType
-                    || item.preparationServiceType === gap.serviceType || item.cofounderProposal?.serviceType === gap.serviceType)?.score,
-                  details: { demandCount: gap.demandCount, supplyCount: gap.supplyCount, unmetCount: gap.unmetCount,
-                    capabilityFit: gap.capabilityFit, ownCapabilityFit: gap.ownCapabilityFit,
-                    teamCapabilityFit: gap.teamCapabilityFit, requiredSkill: gap.requiredSkill,
-                    capitalAvailable: gap.capitalAvailable, learningAvailable: gap.learningAvailable,
-                    partnerAvailable: gap.partnerAvailable, awareness: gap.awareness,
-                    marketKnown: gap.known, decisionLayer: 'economic' }
-                });
+                for (const originalReason of new Set(reasonCodes)) {
+                  const hasCandidate = ['CANDIDATE_CREATED','RECOVERY_OBSERVATION_AVAILABLE'].includes(originalReason);
+                  const reasonCode = hasCandidate ? 'CANDIDATE_GENERATED' : recoveryBlocker(originalReason);
+                  const stage = hasCandidate ? 'recovery_candidate' : 'blocked';
+                  const candidate = businessCandidates.find((item) => item.businessProposal?.serviceType === gap.serviceType
+                    || item.preparationServiceType === gap.serviceType || item.cofounderProposal?.serviceType === gap.serviceType
+                    || item.marketObservationServiceType === gap.serviceType || item.reopenProposal?.serviceType === gap.serviceType);
+                  await recordEmergenceEvent(client, { worldId, agentId: agent.agentId, worldMinutes, tickCount,
+                    system: 'business', stage, reasonCode,
+                    eventKey: `business-opportunity:${agent.agentId}:${tickCount}:${gap.serviceType}:${originalReason}`,
+                    candidateId: `${gap.serviceType}:${gap.action || 'none'}`, action: gap.action || 'business_found',
+                    utilityScore: candidate?.score,
+                    details: { originalReasonCode: originalReason, demandCount: gap.demandCount,
+                      supplyCount: gap.supplyCount, unmetCount: gap.unmetCount,
+                      capabilityFit: gap.capabilityFit, ownCapabilityFit: gap.ownCapabilityFit,
+                      teamCapabilityFit: gap.teamCapabilityFit, requiredSkill: gap.requiredSkill,
+                      capitalAvailable: gap.capitalAvailable, learningAvailable: gap.learningAvailable,
+                      partnerAvailable: gap.partnerAvailable, awareness: gap.awareness,
+                      marketKnown: gap.known, decisionLayer: 'economic' } });
+                }
               }
               for (const candidate of initiativeCandidates) {
                 const eligible = qualifiedStrategicCandidates.some((item) => item.id === candidate.id);
                 const reasonCode = needsBlocked ? (agent.energy < minimumEnergy ? 'ENERGY_LOW' : 'FOOD_LOW')
                   : eligible ? 'NONE' : candidate.action === 'project_contribute'
                     && (agent.energy < 20 || agent.food < 10) ? 'NEEDS_HARD_GATE'
-                    : candidate.action.startsWith('business_') ? 'CANDIDATE_FILTERED' : 'UTILITY_BELOW_THRESHOLD';
+                    : candidate.action.startsWith('business_')
+                      ? (qualifiedStrategicCandidates.length >= 8 ? 'NO_STRATEGIC_SLOT' : 'OTHER')
+                      : 'UTILITY_BELOW_THRESHOLD';
+                if (ECONOMIC_RECOVERY_ACTIONS.has(candidate.action)) await recordEmergenceEvent(client, {
+                  worldId, agentId: agent.agentId, worldMinutes, tickCount, system: 'business',
+                  stage: 'recovery_candidate', reasonCode: 'CANDIDATE_GENERATED',
+                  eventKey: `recovery-candidate:${agent.agentId}:${tickCount}:${candidate.id}`,
+                  candidateId: candidate.id, action: candidate.action, utilityScore: candidate.score,
+                  details: { serviceType: candidate.businessProposal?.serviceType || candidate.preparationServiceType
+                      || candidate.cofounderProposal?.serviceType || candidate.marketObservationServiceType
+                      || candidate.reopenProposal?.serviceType || null,
+                    recoveryEligible: eligible } });
                 await recordEmergenceEvent(client, { worldId, agentId: agent.agentId, worldMinutes, tickCount,
                   system: initiativeSystem(candidate.action),
                   stage: eligible ? 'eligible' : 'blocked', reasonCode,
@@ -2120,7 +2214,7 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
                   details: { goalStagnant: Boolean(agent.goalStagnation?.stagnant),
                     worldNeedCount: initiativeContext.worldNeeds?.length || 0,
                     proposalReasons: candidate.projectProposal?.metadata?.proposalReasons || [],
-                    filterReason: !eligible && candidate.action.startsWith('business_') ? 'UTILITY_BELOW_THRESHOLD' : null } });
+                    filterReason: !eligible && candidate.action.startsWith('business_') ? reasonCode : null } });
                 await recordEmergenceEvent(client, { worldId, agentId: agent.agentId, worldMinutes, tickCount,
                   system: initiativeSystem(candidate.action),
                   stage: 'considered', eventKey: `strategic-considered:${agent.agentId}:${tickCount}:${candidate.id}`,
@@ -2258,15 +2352,21 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
                 if (candidate.id === activity.id || candidate.id === institutionalPlan?.id) continue;
                 await recordEmergenceEvent(client, { worldId, agentId: agent.agentId, worldMinutes, tickCount,
                   system: initiativeSystem(candidate.action),
-                  stage: 'not_selected', reasonCode: candidate.action.startsWith('business_') ? 'NOT_SELECTED' : 'FRUITFLY_NOT_SELECTED',
+                  stage: 'not_selected', reasonCode: 'FRUITFLY_NOT_SELECTED',
                   eventKey: `fruitfly-not-selected:${agent.agentId}:${tickCount}:${candidate.id}`,
                   candidateId: candidate.id, action: candidate.action, utilityScore: candidate.score,
-                  details: candidate.action.startsWith('business_') ? { filterReason: 'Fruitfly selected another qualified candidate.' } : {} });
+                  details: { filterReason: 'Fruitfly selected another qualified candidate.' } });
               }
               const chosenSystem = initiativeSystem(activity.action);
               await recordEmergenceEvent(client, { worldId, agentId: agent.agentId, worldMinutes, tickCount,
                 system: chosenSystem, stage: 'fruitfly_selected',
                 eventKey: `fruitfly-selected:${agent.agentId}:${tickCount}`,
+                candidateId: activity.id, action: activity.action, utilityScore: activity.score,
+                details: { decisionLayer, candidateCount: candidates.length } });
+              if (ECONOMIC_RECOVERY_ACTIONS.has(activity.action)) await recordEmergenceEvent(client, {
+                worldId, agentId: agent.agentId, worldMinutes, tickCount, system: 'business',
+                stage: 'recovery_selected', reasonCode: 'FRUITFLY_SELECTED',
+                eventKey: `recovery-selected:${agent.agentId}:${tickCount}:${activity.id}`,
                 candidateId: activity.id, action: activity.action, utilityScore: activity.score,
                 details: { decisionLayer, candidateCount: candidates.length } });
             }
@@ -2304,6 +2404,7 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
             const plannedContext = Object.fromEntries(['opportunityId','opportunityProposal','projectId','decision','projectProposal','goalReviewProposal',
               'organizationId','organizationProposal','inviteeAgentId','shareId','informationProposal','contributionType',
               'businessProposal','cofounderProposal','preparationSkill','preparationServiceType',
+              'marketObservationServiceType','reopenProposal',
               'businessId','serviceId','jobId','applicationId','maxPriceUsdc','amountUsdc','fundingSource',
               'direction','contributionAmountUsdc','employmentId','pricingContext','counterpartyAgentId','agreementType',
               'contractAgreementId',

@@ -496,10 +496,11 @@ export function fruitflyFamily(candidateOrAction) {
   const action = String(candidate.action || candidateOrAction || '');
   if (action === 'trade' || action === 'trade_meme') return 'trade_crypto';
   if (action === 'learn') return 'travel';
-  if (action === 'business_skill_practice') return 'business_learn';
+  if (['business_skill_practice', 'business_market_observe'].includes(action)) return 'business_learn';
   if (['opportunity', 'opportunity_reject'].includes(action)) return 'travel';
   if (['business_invest','project_invest','project_distribute'].includes(action)) return 'invest';
   if (['business_apply','business_withdraw','business_leave','business_hire','business_reject'].includes(action)) return 'job';
+  if (['agreement_propose','agreement_respond','commitment_resolve'].includes(action)) return 'business';
   if (action === 'business_service') {
     const serviceType = candidate.serviceType || candidate.service_type;
     if (serviceType === 'food_service') return 'eat';
@@ -511,10 +512,12 @@ export function fruitflyFamily(candidateOrAction) {
   }
   if (['opportunity_propose', 'project_propose', 'project_join', 'project_reject', 'project_contribute',
     'project_leave', 'project_invest', 'project_distribute', 'place_create', 'goal_review',
-    'business_found','business_price','business_distribute','business_close','business_seek_cofounder'].includes(action)) return 'business';
+    'business_found','business_price','business_distribute','business_close','business_seek_cofounder',
+    'business_reopen'].includes(action)) return 'business';
   if (action === 'business_work') return 'work';
   if (['organization_found', 'organization_join', 'organization_reject', 'organization_leave',
-    'organization_invite', 'organization_contribute', 'information_share', 'information_accept',
+    'organization_invite', 'organization_contribute', 'organization_propose', 'organization_vote',
+    'information_share', 'information_accept',
     'information_ignore', 'information_doubt'].includes(action)) return 'socialize';
   return action;
 }

@@ -137,11 +137,126 @@ test('business candidates require observed unmet demand, working capital, and vi
   assert.ok(underqualified.some((item) => item.action === 'business_skill_practice'),
     'unmet demand and a skill gap should create a preparation action');
   const recentFailure = { ...baseContext, businesses: [{ founder_agent_id: resident.agentId, status: 'bankrupt',
-    founded_world_time: '100', metadata: { closedWorldTime: 400 } }] };
+    business_type: 'research', founded_world_time: '100', metadata: { serviceType: 'research_service', closedWorldTime: 400 } }] };
   assert.ok(!buildBusinessCandidates(resident, recentFailure).some((item) => item.action === 'business_found'),
     'a failed business has a three day restart cooldown');
   assert.ok(buildBusinessCandidates(resident, { ...recentFailure, worldMinutes: 4_720 })
     .some((item) => item.action === 'business_found'), 'business creation can resume after the cooldown');
+});
+
+test('retry cooldown is sector scoped and excludes passive minority investors and ordinary employees', () => {
+  const passive = { agentId: 'passive-investor', name: 'Ada', usdc: '10000', energy: 80, food: 70,
+    skills: { social: 60, research: 80 }, primaryGoal: 'WEALTH', ambition: 0.7 };
+  const failed = { id: 'failed-food', founder_agent_id: 'someone-else', status: 'closed',
+    metadata: { serviceType: 'food_service', closedWorldTime: 1_400, closedReason: 'owner_closed' } };
+  const sharedOwners = Array.from({ length: 10 }, (_, index) => ({ assetType: 'business', assetId: failed.id,
+    ownerType: 'resident', ownerId: index === 0 ? passive.agentId : `resident-${index}`, share: '0.1' }));
+  const context = { worldMinutes: 1_500,
+    demand: [{ serviceType: 'food_service', demandCount: 4, supplyCount: 0, unmetCount: 4 },
+      { serviceType: 'research_service', demandCount: 2, supplyCount: 0, unmetCount: 2 }],
+    businesses: [failed], ownership: sharedOwners, employment: [], operatorHistory: [],
+    services: [], jobs: [], organizationMemberships: [], economicProjects: [], scenes: [] };
+  const passiveCandidates = buildBusinessCandidates(passive, context);
+  assert.ok(passiveCandidates.some((item) => item.action === 'business_found'
+    && item.businessProposal.serviceType === 'food_service'),
+  'a 10% passive share must not inherit the founder cooldown');
+  const controller = { ...passive, agentId: 'resident-9' };
+  const controlled = buildBusinessCandidates(controller, { ...context, ownership: sharedOwners.map((owner) => ({
+    ...owner, share: owner.ownerId === controller.agentId ? '0.6' : '0.04444444'
+  })) });
+  assert.ok(!controlled.some((item) => item.action === 'business_found'
+    && item.businessProposal.serviceType === 'food_service'), 'a majority controller observes the failed-sector cooldown');
+  assert.ok(controlled.some((item) => item.action === 'business_found'
+    && item.businessProposal.serviceType === 'research_service'), 'a food failure does not freeze other sectors');
+
+  const worker = { ...passive, agentId: 'ordinary-worker' };
+  const employeeContext = { ...context, ownership: [], operatorHistory: [{ agentId: worker.agentId,
+    businessId: failed.id, role: 'Food Associate', startedWorldTime: 1_000, endedWorldTime: 1_450 }] };
+  assert.ok(buildBusinessCandidates(worker, employeeContext).some((item) => item.action === 'business_found'
+    && item.businessProposal.serviceType === 'food_service'), 'ordinary employee history is not operator exposure');
+});
+
+test('persistent unmet demand is observable without any provider, and some residents receive a bounded ambient signal', () => {
+  const scenes = [{ id: 'library', name: 'Library', sceneType: 'library', status: 'active' },
+    { id: 'exchange', name: 'Exchange', sceneType: 'commons', status: 'active' }];
+  const demand = [{ serviceType: 'food_service', demandCount: 4, supplyCount: 0, unmetCount: 4 }];
+  const atExchange = perceiveResidentEconomicMarket({ agentId: 'exchange-observer', name: 'Ada', location: 'Exchange',
+    food: 90, social: 90, knowledge: 90, skills: {}, relationships: [], recentMemories: [], beliefs: [] },
+  { worldMinutes: 1_440, scenes, demand, businesses: [], services: [] });
+  const observed = atExchange.demand.find((item) => item.serviceType === 'food_service');
+  assert.equal(observed.known, true);
+  assert.equal(observed.unmetCount, 4);
+  assert.equal(observed.awareness, 'exchange');
+
+  const ambientResidents = Array.from({ length: 200 }, (_, index) => ({ agentId: `ambient-${index}`,
+    name: `Resident ${index}`, location: 'Library', curiosity: 0.6, food: 90, social: 90, knowledge: 90,
+    skills: { research: 40, engineering: 30, trading: 30, social: 30 }, primaryGoal: 'BALANCED_LIFE',
+    relationships: [], recentMemories: [], beliefs: [], organizationMemberships: [], activeProjects: [],
+    projectMemberships: [], organizationPartners: [] }));
+  const signal = ambientResidents.map((resident) => perceiveResidentEconomicMarket(resident,
+    { worldMinutes: 1_440, scenes, demand, businesses: [], services: [] })).find((view) => view.marketSignals.length > 0);
+  assert.ok(signal, 'stable resident-specific sampling lets the empty market be discovered outside Exchange');
+});
+
+test('failure memories alter recovery strategy scores instead of freezing the agent', () => {
+  const resident = { agentId: 'recovering-resident', name: 'Ada', usdc: '10000', energy: 80, food: 70,
+    skills: { social: 60, research: 45, engineering: 25, trading: 25 }, primaryGoal: 'WEALTH', ambition: 0.7,
+    curiosity: 0.7, location: 'Exchange', relationships: [], recentMemories: [] };
+  const context = { worldMinutes: 1_500, marketSignals: [{ serviceType: 'food_service', signalUnmetCount: 4 }],
+    demand: [{ serviceType: 'food_service', known: true, awareness: 'exchange', demandCount: 4,
+      supplyCount: 0, unmetCount: 4, otherDemandCount: 3 }],
+    businesses: [], services: [], allBusinessServices: [], jobs: [], employment: [], applications: [],
+    ownership: [], operatorHistory: [], organizationMemberships: [], economicProjects: [], activeProjects: [],
+    residentSkills: {}, scenes: [{ id: 'exchange', name: 'Exchange', sceneType: 'commons', status: 'active' }] };
+  const before = buildBusinessCandidates(resident, context);
+  const after = buildBusinessCandidates({ ...resident, recentMemories: [{ memoryType: 'business', worldMinutes: 1_400,
+    summary: 'The previous food business closed after repeated operating losses.',
+    metadata: { action: 'business_close', serviceType: 'food_service', outcome: 'closed' } }] }, context);
+  const find = (items, action) => items.find((item) => item.action === action
+    && (item.marketObservationServiceType === 'food_service' || item.businessProposal?.serviceType === 'food_service'
+      || item.preparationServiceType === 'food_service'));
+  assert.ok(find(after, 'business_found').score < find(before, 'business_found').score,
+    'failure memory lowers immediate same-sector restart utility');
+  assert.ok(find(after, 'business_market_observe').score > find(before, 'business_market_observe').score,
+    'the same failure raises the value of gathering market evidence');
+  assert.ok(find(after, 'business_skill_practice').score > find(before, 'business_skill_practice').score,
+    'the same failure also raises the value of preparation');
+});
+
+test('market observation and reopening stay inside existing Fruitfly output families', () => {
+  assert.equal(fruitflyFamily({ action: 'business_market_observe' }), 'business_learn');
+  assert.equal(fruitflyFamily({ action: 'business_reopen' }), 'business');
+});
+
+test('failed supplier agreements add replacement units to an agent market observation idempotently', async () => {
+  const calls = [];
+  let savedEvent = null;
+  const client = { query: async (sql, params) => {
+    calls.push({ sql, params });
+    if (/SELECT data FROM world_events/.test(sql)) return savedEvent
+      ? { rowCount: 1, rows: [{ data: savedEvent }] } : { rowCount: 0, rows: [] };
+    if (/SELECT evidence,estimate::text AS estimate/.test(sql)) return { rowCount: 0, rows: [] };
+    if (/FROM world_economic_demand/.test(sql)) return { rowCount: 1, rows: [{ demandCount: 4,
+      supplyCount: 0, unmetCount: 4, worldDay: 2 }] };
+    if (/AS "replacementUnits"/.test(sql)) return { rowCount: 1, rows: [{ failedContractCount: 1, replacementUnits: 2 }] };
+    if (/INSERT INTO world_events/.test(sql)) savedEvent = JSON.parse(params[2]);
+    return { rowCount: 1, rows: [] };
+  } };
+  const { observeWorldBusinessMarket } = await import('../src/world-businesses.js');
+  const result = await observeWorldBusinessMarket(client, { worldId: 'world-a', agentId: 'resident-a',
+    serviceType: 'food_service', actionId: 'observe-once', worldTime: 2_900, location: 'Exchange' });
+  assert.equal(result.demandCount, 6);
+  assert.equal(result.unmetCount, 6);
+  assert.equal(result.replacementUnits, 2);
+  assert.equal(result.failedContractCount, 1);
+  assert.match(calls.find((call) => /AS "replacementUnits"/.test(call.sql)).sql, /commitment\.status='fulfilled'/);
+
+  calls.length = 0;
+  const retry = await observeWorldBusinessMarket(client, { worldId: 'world-a', agentId: 'resident-a',
+    serviceType: 'food_service', actionId: 'observe-once', worldTime: 2_900 });
+  assert.equal(retry.idempotent, true);
+  assert.equal(calls.filter((call) => /FROM world_economic_demand/.test(call.sql)).length, 0,
+    'a retry returns its stored observation without reading demand or incrementing the belief');
 });
 
 test('transferable skill fit qualifies a non-dominant trading capability', () => {
@@ -219,8 +334,9 @@ test('business funnel diagnostics distinguish demand, capability, capital, needs
   assert.equal(reason(capable, { context: { demand: [{ serviceType: 'trading_service', demandCount: 2,
     supplyCount: 2, unmetCount: 0 }] } }).reasonCode, 'STRONG_COMPETITION');
   assert.equal(reason(capable, { context: { demand: [] } }).reasonCode, 'NO_UNMET_DEMAND');
-  assert.equal(reason(capable, { context: { businesses: [{ founder_agent_id: 'resident', status: 'bankrupt',
-    metadata: { closedWorldTime: 490 } }] } }).reasonCode, 'BUSINESS_RETRY_COOLDOWN');
+  assert.equal(reason(capable, { context: { businesses: [{ founder_agent_id: 'resident', business_type: 'market_research',
+    status: 'bankrupt', metadata: { serviceType: 'trading_service', closedWorldTime: 490 } }] } }).reasonCode,
+  'BUSINESS_RETRY_COOLDOWN');
 });
 
 test('business hiring and service candidates require funded payroll and reflect buyer intent', () => {
@@ -395,6 +511,14 @@ test('new economic actions map into existing Fruitfly output families', () => {
   assert.equal(fruitflyFamily('business_found'), 'business');
   assert.equal(fruitflyFamily('business_apply'), 'job');
   assert.equal(fruitflyFamily('business_skill_practice'), 'business_learn');
+  assert.equal(fruitflyFamily('business_market_observe'), 'business_learn');
+  assert.equal(fruitflyFamily('business_reopen'), 'business');
+  assert.equal(fruitflyFamily('agreement_propose'), 'business');
+  assert.equal(fruitflyFamily('agreement_respond'), 'business');
+  assert.equal(fruitflyFamily('commitment_resolve'), 'business');
+  assert.equal(fruitflyFamily('organization_propose'), 'socialize');
+  assert.equal(fruitflyFamily('organization_vote'), 'socialize');
+  assert.equal(fruitflyFamily('opportunity_propose'), 'business');
   assert.equal(fruitflyFamily('business_work'), 'work');
   assert.equal(fruitflyFamily('business_service'), 'business');
 });

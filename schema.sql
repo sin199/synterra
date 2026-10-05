@@ -1567,10 +1567,11 @@ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_economic_transactions'::regclass
       AND conname='world_economic_transactions_transaction_type_check'
       AND pg_get_constraintdef(oid) LIKE '%ownership_transfer%'
-      AND pg_get_constraintdef(oid) LIKE '%business_revenue_share%') THEN
+      AND pg_get_constraintdef(oid) LIKE '%business_revenue_share%'
+      AND pg_get_constraintdef(oid) LIKE '%business_reopen%') THEN
     ALTER TABLE world_economic_transactions DROP CONSTRAINT IF EXISTS world_economic_transactions_transaction_type_check;
     ALTER TABLE world_economic_transactions ADD CONSTRAINT world_economic_transactions_transaction_type_check
-      CHECK (transaction_type IN ('opening_balance','simulation_seed','business_found','business_investment','business_revenue',
+      CHECK (transaction_type IN ('opening_balance','simulation_seed','business_found','business_investment','business_reopen','business_revenue',
         'business_expense','business_wage','profit_distribution','project_investment','organization_contribution','place_revenue',
         'consumption','exchange_trade','maintenance','world_reward','refund','ownership_transfer','business_revenue_share','resource_transfer'));
   END IF;
@@ -1868,6 +1869,7 @@ BEGIN
       AND conname='world_history_event_type_check' AND pg_get_constraintdef(oid) LIKE '%agreement_proposed%'
       AND pg_get_constraintdef(oid) LIKE '%agreement_rejected%' AND pg_get_constraintdef(oid) LIKE '%norm_formed%'
       AND pg_get_constraintdef(oid) LIKE '%ownership_transferred%'
+      AND pg_get_constraintdef(oid) LIKE '%business_reopened%'
       AND pg_get_constraintdef(oid) LIKE '%[a-z_]+$%') THEN
     ALTER TABLE world_history DROP CONSTRAINT IF EXISTS world_history_event_type_check;
     ALTER TABLE world_history ADD CONSTRAINT world_history_event_type_check CHECK (event_type IN (
@@ -1875,7 +1877,7 @@ BEGIN
       'organization_founded','organization_joined','organization_left','organization_invited','place_created',
       'place_maintenance','place_closed','information_shared','information_accepted','information_doubted','information_ignored',
       'cooperation_completed','milestone','project_invested','project_revenue','business_founded','business_invested',
-      'business_first_customer','business_revenue','business_profit','business_loss','business_closed','business_employment',
+      'business_reopened','business_first_customer','business_revenue','business_profit','business_loss','business_closed','business_employment',
       'business_price_changed','business_partnership','business_capability_practiced','economic_purchase',
       'agreement_proposed','agreement_countered','agreement_accepted','agreement_rejected','agreement_completed','agreement_breached',
       'organization_rule_changed','organization_proposal','organization_leadership_changed','norm_formed','ownership_transferred')
@@ -1890,7 +1892,9 @@ BEGIN
   END IF;
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_agent_states'::regclass
       AND conname='world_agent_states_planned_action_check' AND pg_get_constraintdef(oid) LIKE '%agreement_propose%'
-      AND pg_get_constraintdef(oid) LIKE '%organization_vote%') THEN
+      AND pg_get_constraintdef(oid) LIKE '%organization_vote%'
+      AND pg_get_constraintdef(oid) LIKE '%business_market_observe%'
+      AND pg_get_constraintdef(oid) LIKE '%business_reopen%') THEN
     ALTER TABLE world_agent_states DROP CONSTRAINT IF EXISTS world_agent_states_planned_action_check;
     ALTER TABLE world_agent_states ADD CONSTRAINT world_agent_states_planned_action_check CHECK (planned_action IS NULL OR planned_action IN (
       'work','learn','rest','eat','socialize','trade','cooperate','opportunity','opportunity_reject','opportunity_propose',
@@ -1899,6 +1903,7 @@ BEGIN
       'information_accept','information_ignore','information_doubt','goal_review','project_invest','project_distribute',
       'business_found','business_service','business_apply','business_withdraw','business_leave','business_hire','business_work',
       'business_invest','business_reject','business_price','business_distribute','business_close','business_skill_practice',
-      'business_seek_cofounder','agreement_propose','agreement_respond','commitment_resolve','organization_propose','organization_vote'));
+      'business_seek_cofounder','business_market_observe','business_reopen','agreement_propose','agreement_respond',
+      'commitment_resolve','organization_propose','organization_vote'));
   END IF;
 END $$;

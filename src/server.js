@@ -25,6 +25,7 @@ import { createWorldCommitment, listWorldAgreements, listWorldInstitutionSummary
   proposeWorldAgreement, resolveWorldCommitment, respondToWorldAgreement, voteOrganizationProposal } from './world-institutions.js';
 import { closeWorldBusiness, distributeWorldBusinessProfit, distributeWorldProjectRevenue,
   economicDashboardSql, foundWorldBusiness, investInWorldBusiness, investInWorldProject, listWorldBusinesses,
+  loadWorldBusinessContext, observeWorldBusinessMarket, readEconomicRecoveryMetrics, reopenWorldBusiness,
   purchaseWorldBusinessService, reviewWorldBusinessPrice, completeWorldBusinessShift, applyToWorldBusinessJob,
   decideWorldBusinessApplication, leaveWorldBusinessJob, practiceWorldBusinessCapability,
   withdrawWorldBusinessApplication } from './world-businesses.js';
@@ -335,6 +336,7 @@ app.get('/local/map-data', async (_request, reply) => {
     .sort((left, right) => new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime()).slice(0, 50);
   const worldMinutes = Number(clock?.worldMinutes) || 0;
   const emergence = await readEmergenceReport(pool, { worldId, worldMinutes });
+  const recoveryMetrics = await readEconomicRecoveryMetrics(pool, { worldId, worldMinutes });
   const [economyDashboard, businesses, economicDemand, economyHistory] = await Promise.all([
     pool.query(economicDashboardSql(), [worldId]),
     listWorldBusinesses(pool, { worldId, limit: 12 }),
@@ -384,7 +386,7 @@ app.get('/local/map-data', async (_request, reply) => {
         totalInternalUnits: internalUnits.rows[0].units }, opportunities: opportunities.rows, projects,
     organizations, institutions, history: history.rows };
   worldEvolution.economy = { dashboard: economyDashboard.rows[0] || {}, businesses,
-    demand: economicDemand.rows, history: economyHistory.rows,
+    demand: economicDemand.rows, history: economyHistory.rows, recovery: recoveryMetrics,
     settlement: 'simulated_internal_ledger', chainSettlementEnabled: false };
   worldEvolution.emergence = emergence;
   return { world: { ...world.rows[0], engine: clock || { running: false } }, scenes: scenes.rows, residents: residents.rows, events: events.rows,
@@ -1538,9 +1540,10 @@ app.get('/v1/worlds/:worldId/economy', async (request, reply) => {
         OR (destination.account_type='resident' AND destination.owner_id=$2))
       ORDER BY tx.world_time DESC,tx.created_at DESC LIMIT 30`, [worldId, request.agentId])
   ]);
+  const recovery = await readEconomicRecoveryMetrics(pool, { worldId, worldMinutes });
   return { worldId, worldMinutes, settlement: 'simulated_internal_ledger', chainSettlementEnabled: false,
     dashboard: dashboard.rows[0], demand: demand.rows, businesses, balances: balances.rows,
-    employment: employment.rows, investments: investments.rows, directOwnership: ownership.rows,
+    employment: employment.rows, investments: investments.rows, directOwnership: ownership.rows, recovery,
     recentTransactions: recentTransactions.rows };
 });
 
@@ -1557,7 +1560,8 @@ app.post('/v1/worlds/:worldId/economy/actions', async (request, reply) => {
   const body = request.body || {};
   const actions = new Set(['business_found','business_invest','business_service','business_apply','business_withdraw','business_decide',
     'business_work','business_leave','business_price','business_distribute','business_close',
-    'business_skill_practice','business_seek_cofounder','project_invest','project_distribute']);
+    'business_skill_practice','business_seek_cofounder','business_market_observe','business_reopen',
+    'project_invest','project_distribute']);
   if (!validUuid(worldId) || !actions.has(body.action)) return fail(reply, 400, 'ECONOMIC_ACTION_INVALID');
   const actionId = requireActionId(body);
   const idFields = { business_invest: ['businessId'], business_service: ['serviceId'], business_apply: ['jobId'],
@@ -1590,6 +1594,25 @@ app.post('/v1/worlds/:worldId/economy/actions', async (request, reply) => {
       || !['research_service','engineering_service','social_service','food_service','trading_service'].includes(body.preparationServiceType))) {
     return fail(reply, 400, 'BUSINESS_PREPARATION_INVALID');
   }
+  if (body.action === 'business_market_observe'
+      && !['research_service','engineering_service','social_service','food_service','trading_service'].includes(body.serviceType)) {
+    return fail(reply, 400, 'BUSINESS_MARKET_SERVICE_INVALID');
+  }
+  if (body.action === 'business_reopen') {
+    const proposal = body.proposal || {};
+    if (!validUuid(proposal.businessId)
+        || !['research_service','engineering_service','social_service','food_service','trading_service'].includes(proposal.serviceType)) {
+      return fail(reply, 400, 'BUSINESS_REOPEN_PROPOSAL_INVALID');
+    }
+    if (proposal.capitalSource !== undefined && (!proposal.capitalSource
+        || !['resident','organization','project'].includes(proposal.capitalSource.type)
+        || (proposal.capitalSource.type !== 'resident' && !validUuid(proposal.capitalSource.ownerId)))) {
+      return fail(reply, 400, 'BUSINESS_CAPITAL_SOURCE_INVALID');
+    }
+    if (proposal.capitalUsdc !== undefined) {
+      try { parsePositiveUnits(String(proposal.capitalUsdc)); } catch { return fail(reply, 400, 'ECONOMIC_AMOUNT_INVALID'); }
+    }
+  }
   if (body.action === 'business_seek_cofounder') {
     const proposal = body.cofounderProposal || {};
     const organization = proposal.organizationProposal || {};
@@ -1608,6 +1631,22 @@ app.post('/v1/worlds/:worldId/economy/actions', async (request, reply) => {
     if (body.action === 'business_skill_practice') return practiceWorldBusinessCapability(client, { worldId,
       agentId: request.agentId, skill: body.preparationSkill, serviceType: body.preparationServiceType,
       actionId, worldTime });
+    if (body.action === 'business_market_observe') {
+      const residents = await client.query(`SELECT member.agent_id,member.food,member.social,state.knowledge,
+          profile.primary_goal,COALESCE((SELECT jsonb_object_agg(skill.skill_name,skill.skill_value)
+            FROM world_agent_skills skill WHERE skill.world_id=member.world_id AND skill.agent_id=member.agent_id),'{}'::jsonb) AS skills
+        FROM world_members member JOIN world_agent_states state
+          ON state.world_id=member.world_id AND state.agent_id=member.agent_id
+        LEFT JOIN world_social_profiles profile ON profile.world_id=member.world_id AND profile.agent_id=member.agent_id
+        WHERE member.world_id=$1 ORDER BY member.agent_id`, [worldId]);
+      await loadWorldBusinessContext(client, worldId, worldTime, residents.rows);
+      const resident = await client.query(`SELECT location FROM world_members WHERE world_id=$1 AND agent_id=$2`,
+        [worldId, request.agentId]);
+      return observeWorldBusinessMarket(client, { worldId, agentId: request.agentId, serviceType: body.serviceType,
+        actionId, worldTime, location: resident.rows[0]?.location || null });
+    }
+    if (body.action === 'business_reopen') return reopenWorldBusiness(client, { worldId, agentId: request.agentId,
+      actionId, proposal: body.proposal, worldTime });
     if (body.action === 'business_seek_cofounder') {
       const proposal = body.cofounderProposal;
       const organization = proposal.organizationProposal;

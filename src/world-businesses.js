@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { formatUnits, parsePositiveUnits } from './crypto-market.js';
 import { ensureEconomicAccount, getEconomicAccount, postEconomicTransfer, transferBetweenAccounts } from './economic-ledger.js';
 import { activeServicePriceAgreement, createSystemEmploymentAgreement, recordAgreementExecutionStage,
@@ -34,6 +34,119 @@ const RUN_COST_PER_DAY = '5.00000000';
 const MAX_DISTRIBUTION_SHARE = 0.2;
 const error = (code, statusCode = 409) => Object.assign(new Error(code), { statusCode });
 const clamp = (value, low, high) => Math.max(low, Math.min(high, Number(value) || 0));
+
+const BUSINESS_TYPE_SERVICE = Object.freeze({ food: 'food_service', social: 'social_service', research: 'research_service',
+  engineering: 'engineering_service', market_research: 'trading_service' });
+
+function businessServiceType(business, context = {}) {
+  return business?.metadata?.serviceType || business?.serviceType
+    || (context.services || []).find((service) => (service.business_id || service.businessId) === business?.id)?.service_type
+    || BUSINESS_TYPE_SERVICE[business?.business_type || business?.businessType] || null;
+}
+
+function businessFailureWorldTime(business) {
+  return Number(business?.metadata?.closedWorldTime ?? business?.metadata?.lastLossWorldTime
+    ?? business?.founded_world_time ?? business?.foundedWorldTime);
+}
+
+function businessFailureType(business) {
+  const reason = String(business?.metadata?.closedReason || business?.metadata?.bankruptcyReason
+    || business?.metadata?.failureType || '').toLowerCase();
+  if (/contract|supplier|commitment|delivery|breach/.test(reason)) return 'contract_failure';
+  if (/owner_closed|voluntary|strategic/.test(reason)) return 'voluntary_exit';
+  if (/maintenance|liquidity|capital|insolven|bankrupt/.test(reason)) return 'capital_failure';
+  return 'operating_failure';
+}
+
+function retryCooldownMinutes(failureType) {
+  if (failureType === 'contract_failure' || failureType === 'voluntary_exit') return 1_440;
+  return BUSINESS_RETRY_COOLDOWN_WORLD_MINUTES;
+}
+
+function isBusinessOperator(agentId, business, context = {}) {
+  if (!agentId || !business) return false;
+  if ((business.founder_agent_id || business.founderAgentId) === agentId) return true;
+  const metadata = business.metadata || {};
+  if ([...(metadata.controllerAgentIds || []), ...(metadata.operatorAgentIds || [])].includes(agentId)) return true;
+  // A majority owner can control a business. Minority ownership alone is a
+  // passive investment exposure and must not inherit the founder's retry gate.
+  if (businessBeneficialShare(agentId, business, context.ownership || []) >= 0.5) return true;
+  const closedAt = businessFailureWorldTime(business);
+  return (context.operatorHistory || []).some((item) => item.agentId === agentId
+    && item.businessId === business.id && /manager|operator|controller|director/i.test(String(item.role || ''))
+    && Number(item.startedWorldTime) <= closedAt
+    && (item.endedWorldTime === null || item.endedWorldTime === undefined
+      || Number(item.endedWorldTime) >= closedAt - 1_440));
+}
+
+function businessRetryState(agent, serviceType, context = {}) {
+  const worldMinutes = Math.max(0, Math.trunc(Number(context.worldMinutes) || 0));
+  const failures = (context.businesses || []).filter((business) => ['inactive', 'closed', 'bankrupt'].includes(business.status)
+    && businessServiceType(business, context) === serviceType && isBusinessOperator(agent.agentId, business, context))
+    .map((business) => ({ business, worldTime: businessFailureWorldTime(business), failureType: businessFailureType(business) }))
+    .filter((item) => Number.isFinite(item.worldTime))
+    .sort((left, right) => right.worldTime - left.worldTime);
+  const latest = failures[0] || null;
+  const retryAt = latest ? latest.worldTime + retryCooldownMinutes(latest.failureType) : Number.NEGATIVE_INFINITY;
+  return { ready: worldMinutes >= retryAt, retryAt: Number.isFinite(retryAt) ? retryAt : null,
+    failureType: latest?.failureType || null, businessId: latest?.business.id || null,
+    exposure: latest ? 'founder_or_controller' : null };
+}
+
+function failureMemoryProfile(agent, serviceType, worldMinutes) {
+  const failures = (Array.isArray(agent.recentMemories) ? agent.recentMemories : []).filter((memory) => {
+    const metadata = memory.metadata || {};
+    const initiative = metadata.initiative || {};
+    const memoryService = metadata.serviceType || initiative.serviceType;
+    const age = worldMinutes - Number(memory.worldMinutes ?? memory.world_minutes ?? 0);
+    const outcome = String(metadata.outcome || initiative.status || initiative.outcome || '').toLowerCase();
+    const signaledFailure = Number(metadata.dailyNetOperatingResultUsdc ?? initiative.dailyNetOperatingResultUsdc) < 0
+      || ['breached', 'bankrupt', 'closed', 'failed', 'unable', 'unable_to_fulfill', 'business_closed']
+        .some((failure) => outcome.includes(failure))
+      || /failed|loss|closed|bankrupt|breach|unable to fulfill/i.test(String(memory.summary || ''));
+    return signaledFailure && (memoryService === serviceType || !memoryService)
+      && age >= 0 && age <= 30 * 1_440;
+  });
+  return { count: failures.length, mostRecentWorldMinute: failures.reduce((latest, memory) =>
+    Math.max(latest, Number(memory.worldMinutes ?? memory.world_minutes) || 0), 0) };
+}
+
+function serviceLocationBoost(agent, serviceType, context = {}) {
+  const scene = (context.scenes || []).find((item) => item.name === agent.location && item.status === 'active');
+  const relevant = { food_service: ['cafe','commons'], social_service: ['cafe','commons','garden'],
+    research_service: ['library','observatory'], engineering_service: ['workshop','data_center'],
+    trading_service: ['exchange','data_center','commons'] }[serviceType] || [];
+  return relevant.includes(scene?.sceneType) ? 0.16 : 0;
+}
+
+function shortageSignalProbability(agent, serviceType, context = {}) {
+  const service = SERVICE_INFO[serviceType];
+  const skills = agent.skills || {};
+  const serviceMemory = (agent.recentMemories || []).filter((memory) => memory.metadata?.serviceType === serviceType
+    || memory.metadata?.initiative?.serviceType === serviceType).length;
+  const sector = service?.skill;
+  const skillEvidence = Math.min(0.2, (Number(skills[sector]) || 0) / 500);
+  const goal = String(agent.primaryGoal || agent.goal || '').toUpperCase();
+  const goalEvidence = /WEALTH|BUSINESS|MARKET|TRAD|COMMUNITY|RELATION|BUILD|RESEARCH|LEARN|ENGINEER/.test(goal) ? 0.08 : 0;
+  const curiosity = Math.max(0, Math.min(1, Number(agent.curiosity) || 0));
+  const groupText = [...(agent.organizationMemberships || []), ...(agent.activeProjects || [])]
+    .map((item) => `${item.name || ''} ${item.title || ''} ${item.purpose || ''} ${item.goal || ''}`.toLowerCase()).join(' ');
+  const labels = { food_service: /food|meal|cafe/, social_service: /social|community|relation/,
+    research_service: /research|learn|science/, engineering_service: /engineer|build|workshop/,
+    trading_service: /trade|market|wealth/ };
+  const groupEvidence = labels[serviceType]?.test(groupText) ? 0.08 : 0;
+  const memoryEvidence = Math.min(0.2, serviceMemory * 0.04);
+  return Math.min(0.82, 0.16 + curiosity * 0.18 + skillEvidence + goalEvidence + groupEvidence
+    + memoryEvidence + serviceLocationBoost(agent, serviceType, context));
+}
+
+function receivesAmbientShortageSignal(agent, serviceType, context = {}) {
+  const worldDay = Math.floor(Math.max(0, Number(context.worldMinutes) || 0) / 1_440);
+  const agentId = agent.agentId || agent.agent_id || '';
+  const bucket = createHash('sha256').update(`${agentId}:${serviceType}:${worldDay}:market-signal`)
+    .digest().readUInt32BE(0) % 10_000;
+  return bucket < Math.round(shortageSignalProbability(agent, serviceType, context) * 10_000);
+}
 
 function validText(value, min, max) {
   return typeof value === 'string' && value.trim().length >= min && value.trim().length <= max;
@@ -196,27 +309,26 @@ function serviceDistancePenalty(agent, service, scenes = []) {
 
 export function explainBusinessOpportunityGaps(agent, context = {}, candidates = []) {
   const serviceCandidates = new Map(candidates.map((item) => [item.businessProposal?.serviceType
-    || item.preparationServiceType || item.cofounderProposal?.serviceType, item]).filter(([serviceType]) => serviceType));
+    || item.preparationServiceType || item.cofounderProposal?.serviceType || item.marketObservationServiceType
+    || item.reopenProposal?.serviceType, item]).filter(([serviceType]) => serviceType));
   const unmet = new Map((context.demand || []).map((row) => [row.serviceType, Number(row.unmetCount) || 0]));
   const rows = [];
   for (const [serviceType, info] of Object.entries(SERVICE_INFO)) {
     const demand = (context.demand || []).find((item) => item.serviceType === serviceType) || {};
     const { capitalSource, capability: fit } = chooseBusinessSourceAndCapability(agent, serviceType, context);
     const candidate = serviceCandidates.get(serviceType);
-    const ownedBusinesses = (context.businesses || []).filter((business) => business.founder_agent_id === agent.agentId
-      || isBusinessBeneficiary(agent.agentId, business, context.ownership || []));
-    const activeBusiness = ownedBusinesses.some((business) => business.status === 'active');
-    const failureWorldTime = Math.max(...ownedBusinesses.filter((business) => ['inactive','closed','bankrupt'].includes(business.status))
-      .map((business) => Number(business.metadata?.closedWorldTime || business.metadata?.lastLossWorldTime
-        || business.founded_world_time || business.foundedWorldTime)).filter(Number.isFinite), Number.NEGATIVE_INFINITY);
-    const retryReady = Number(context.worldMinutes || 0) - failureWorldTime >= BUSINESS_RETRY_COOLDOWN_WORLD_MINUTES;
+    const retry = businessRetryState(agent, serviceType, context);
+    const activeBusiness = (context.businesses || []).some((business) => business.status === 'active'
+      && businessServiceType(business, context) === serviceType && isBusinessOperator(agent.agentId, business, context));
+    const observationCandidate = candidates.find((item) => item.action === 'business_market_observe'
+      && item.marketObservationServiceType === serviceType);
     let reasonCode = 'CANDIDATE_CREATED';
     if (candidate) reasonCode = 'CANDIDATE_CREATED';
-    else if (demand.known === false) reasonCode = 'MARKET_NOT_OBSERVED';
+    else if (demand.known === false) reasonCode = observationCandidate ? 'RECOVERY_OBSERVATION_AVAILABLE' : 'MARKET_NOT_OBSERVED';
     else if ((unmet.get(serviceType) || 0) <= 0) reasonCode = Number(demand.demandCount) > 0
       && Number(demand.supplyCount) >= Number(demand.demandCount) ? 'STRONG_COMPETITION' : 'NO_UNMET_DEMAND';
     else if (activeBusiness) reasonCode = 'BUSINESS_ALREADY_ACTIVE';
-    else if (!retryReady) reasonCode = 'BUSINESS_RETRY_COOLDOWN';
+    else if (!retry.ready) reasonCode = 'BUSINESS_RETRY_COOLDOWN';
     else if (!capitalSource) reasonCode = 'INSUFFICIENT_CAPITAL';
     else if (Number(agent.energy) < 20 || Number(agent.food) < 15) reasonCode = 'ENERGY_TOO_LOW';
     else if (serviceType === 'trading_service' && Number(agent.riskTolerance) < 0.2) reasonCode = 'RISK_TOO_HIGH';
@@ -227,6 +339,7 @@ export function explainBusinessOpportunityGaps(agent, context = {}, candidates =
     const partner = bestTrustedCofounder(agent, serviceType, context);
     rows.push({ serviceType, reasonCode, action: candidate?.action || null,
       additionalReasonCodes: [
+        ...(!demand.known && observationCandidate ? ['RECOVERY_CANDIDATE_AVAILABLE'] : []),
         ...(fit.ownScore < 28 && fit.teamScore < 28 ? ['CAPABILITY_TOO_LOW'] : []),
         ...(fit.ownScore < 28 && !partner ? ['NO_PARTNER'] : []),
         ...(fit.ownScore < fit.score && !partner ? ['TEAM_CAPABILITY_UNAVAILABLE'] : []),
@@ -240,7 +353,9 @@ export function explainBusinessOpportunityGaps(agent, context = {}, candidates =
       known: demand.known !== false, awareness: demand.awareness || 'local',
       capabilityFit: fit.score, ownCapabilityFit: fit.ownScore, teamCapabilityFit: fit.teamScore,
       requiredSkill: info.skill, capitalAvailable: Boolean(capitalSource),
-      learningAvailable: fit.ownScore < 70, partnerAvailable: Boolean(partner) });
+      learningAvailable: fit.ownScore < 70, partnerAvailable: Boolean(partner),
+      retryAtWorldMinutes: retry.retryAt, failureType: retry.failureType,
+      failureExposure: retry.exposure });
   }
   return rows;
 }
@@ -517,6 +632,18 @@ export function perceiveResidentEconomicMarket(agent, context = {}) {
   for (const service of visibleServices) visibleStock.set(service.service_type,
     (visibleStock.get(service.service_type) || 0) + Math.max(0, Number(service.stock_units) || 0));
   const globalDemand = new Map((context.demand || []).map((row) => [row.serviceType, row]));
+  const marketKnowledgeSources = context.marketKnowledgeSources || agent.marketKnowledgeSources || [];
+  const networkAgentIds = new Set([
+    ...relationships.filter((item) => Number(item.trust) >= 2 && Number(item.familiarity) >= 10)
+      .map((item) => item.otherAgentId || item.other_agent_id),
+    ...(agent.organizationMemberships || []).filter((item) => item.status === 'active' && item.memberStatus === 'active')
+      .flatMap((item) => item.memberIds || []),
+    ...(agent.activeProjects || []).flatMap((project) => project.memberIds || []),
+    ...(agent.organizationPartners || []).map((item) => item.partnerId)
+  ].filter((id) => id && id !== agentId));
+  const allFailedContracts = context.failedContractDemand || [];
+  const visibleFailedContracts = allFailedContracts.filter((item) => atExchange
+    || item.customerAgentId === agentId || networkAgentIds.has(item.customerAgentId));
   const demand = Object.keys(SERVICE_INFO).map((serviceType) => {
     const remembered = marketBeliefs.get(serviceType);
     const rememberedEvidence = remembered?.evidence && typeof remembered.evidence === 'object' ? remembered.evidence : {};
@@ -524,32 +651,77 @@ export function perceiveResidentEconomicMarket(agent, context = {}) {
       ?? remembered?.updatedWorldMinutes ?? remembered?.updated_world_minutes ?? 0);
     const memoryAge = remembered ? Math.max(0, worldMinutes - observedAt) : 10_080;
     const memoryDecay = remembered ? Math.max(0, 1 - memoryAge / 10_080) : 0;
+    const socialSource = marketKnowledgeSources.filter((belief) => networkAgentIds.has(belief.agentId || belief.agent_id)
+      && (belief.subjectType || belief.subject_type) === 'market'
+      && (belief.subjectKey || belief.subject_key) === serviceType
+      && (belief.beliefKey || belief.belief_key) === 'unmet_demand'
+      && worldMinutes - Number(belief.updatedWorldMinutes ?? belief.updated_world_minutes ?? 0) >= 0
+      && worldMinutes - Number(belief.updatedWorldMinutes ?? belief.updated_world_minutes ?? 0) <= 10_080)
+      .sort((left, right) => Number(right.updatedWorldMinutes ?? right.updated_world_minutes ?? 0)
+        - Number(left.updatedWorldMinutes ?? left.updated_world_minutes ?? 0))[0] || null;
+    const socialEvidence = socialSource?.evidence && typeof socialSource.evidence === 'object' ? socialSource.evidence : {};
+    const socialAge = socialSource ? Math.max(0, worldMinutes
+      - Number(socialEvidence.observedWorldMinutes ?? socialSource.updatedWorldMinutes ?? socialSource.updated_world_minutes ?? 0)) : 10_080;
+    const socialDecay = socialSource ? Math.max(0, 1 - socialAge / 10_080) : 0;
     const personalNeed = (residentDemandTypes(agent).has(serviceType) ? 1 : 0);
     const nearbyNeed = localOtherNeeds.get(serviceType) || 0;
+    const relevantFailedContracts = visibleFailedContracts.filter((item) => item.serviceType === serviceType);
+    const failedContractUnits = relevantFailedContracts.reduce((sum, item) => sum + Math.max(0, Number(item.remainingUnits) || 0), 0);
+    const directlyAffectedByFailure = relevantFailedContracts.some((item) => item.customerAgentId === agentId);
     const hasPriorKnowledge = Boolean(remembered) || recentBusinessEvidence.some((memory) =>
       memory.metadata?.serviceType === serviceType || memory.metadata?.initiative?.serviceType === serviceType);
-    const directlyObserved = atExchange || personalNeed > 0 || nearbyNeed > 0;
-    const known = directlyObserved || hasPriorKnowledge;
+    const directlyObserved = atExchange || personalNeed > 0 || nearbyNeed > 0 || directlyAffectedByFailure;
+    const hasSocialKnowledge = Boolean((socialSource && socialDecay > 0)
+      || relevantFailedContracts.some((item) => item.customerAgentId !== agentId));
+    const known = directlyObserved || hasPriorKnowledge || hasSocialKnowledge;
     const globalRow = globalDemand.get(serviceType) || {};
-    const visibleDemand = atExchange ? Number(globalRow.demandCount) || 0 : localNeeds.get(serviceType) || 0;
+    const publicFailedContractUnits = atExchange ? allFailedContracts.filter((item) => item.serviceType === serviceType)
+      .reduce((sum, item) => sum + Math.max(0, Number(item.remainingUnits) || 0), 0) : 0;
+    const visibleDemand = (atExchange ? Number(globalRow.demandCount) || 0 : localNeeds.get(serviceType) || 0)
+      + (directlyAffectedByFailure || hasSocialKnowledge ? failedContractUnits : publicFailedContractUnits);
     const visibleSupply = atExchange ? Number(globalRow.supplyCount) || 0 : visibleStock.get(serviceType) || 0;
-    const rememberedDemand = Math.max(0, Number(rememberedEvidence.demandCount) || 0) * memoryDecay;
-    const rememberedSupply = Math.max(0, Number(rememberedEvidence.supplyCount) || 0) * memoryDecay;
-    const rememberedOtherDemand = Math.max(0, Number(rememberedEvidence.otherDemandCount) || 0) * memoryDecay;
-    const demandCount = directlyObserved ? visibleDemand : rememberedDemand;
+    const priorEvidence = remembered ? rememberedEvidence : socialEvidence;
+    const priorDecay = remembered ? memoryDecay : socialDecay;
+    const rememberedDemand = Math.max(0, Number(priorEvidence.demandCount) || 0) * priorDecay;
+    const rememberedSupply = Math.max(0, Number(priorEvidence.supplyCount) || 0) * priorDecay;
+    const rememberedOtherDemand = Math.max(0, Number(priorEvidence.otherDemandCount) || 0) * priorDecay;
+    const demandCount = directlyObserved || (hasSocialKnowledge && failedContractUnits > 0)
+      ? visibleDemand : rememberedDemand;
     const supplyCount = directlyObserved ? visibleSupply : rememberedSupply;
     const otherDemandCount = atExchange ? Math.max(0, (Number(globalRow.demandCount) || 0) - personalNeed)
-      : nearbyNeed > 0 ? nearbyNeed : rememberedOtherDemand;
-    const confidence = atExchange ? 0.95 : nearbyNeed > 0 ? 0.72 : personalNeed > 0 ? 0.58
-      : remembered ? Math.max(0, Number(remembered.confidence) * memoryDecay) : 0;
+        + publicFailedContractUnits
+      : nearbyNeed > 0 ? nearbyNeed + failedContractUnits : failedContractUnits > 0 ? failedContractUnits : rememberedOtherDemand;
+    const confidence = atExchange ? 0.95 : directlyAffectedByFailure ? 0.82 : nearbyNeed > 0 ? 0.72
+      : relevantFailedContracts.length > 0 ? 0.56 : personalNeed > 0 ? 0.58
+      : remembered ? Math.max(0, Number(remembered.confidence) * memoryDecay)
+        : socialSource ? Math.min(0.68, Number(socialSource.confidence || 0) * socialDecay * 0.8) : 0;
+    const cityUnmet = Math.max(0, Number(globalRow.unmetCount)
+      || Number(globalRow.demandCount || 0) - Number(globalRow.supplyCount || 0));
+    const incompleteView = !atExchange && (demandCount < Number(globalRow.demandCount || 0)
+      || supplyCount < Number(globalRow.supplyCount || 0));
+    const failedContractSignal = allFailedContracts.filter((item) => item.serviceType === serviceType)
+      .reduce((sum, item) => sum + Math.max(0, Number(item.remainingUnits) || 0), 0);
+    const signalUnmet = cityUnmet + failedContractSignal;
+    const signalEligible = ((incompleteView && cityUnmet > 0) || failedContractSignal > 0)
+      && receivesAmbientShortageSignal(agent, serviceType, { ...context, worldMinutes });
     return { serviceType, known, awareness: atExchange ? 'exchange' : nearbyNeed ? 'local_residents'
-      : personalNeed ? 'personal_need' : hasPriorKnowledge ? 'memory' : 'unknown',
+      : directlyAffectedByFailure ? 'failed_supplier_contract' : personalNeed ? 'personal_need'
+        : hasPriorKnowledge ? 'memory' : hasSocialKnowledge ? 'trusted_network' : 'unknown',
       directlyObserved, awarenessConfidence: confidence, demandCount, otherDemandCount,
       supplyCount, unmetCount: Math.max(0, demandCount - supplyCount),
       personalNeed: personalNeed > 0, nearbyDemandCount: nearbyNeed,
-      rememberedEstimate: remembered ? (Number(remembered.estimate) || 0) * memoryDecay : null };
+      failedContractUnits, failedContractIds: relevantFailedContracts.map((item) => item.agreementId),
+      rememberedEstimate: remembered ? (Number(remembered.estimate) || 0) * memoryDecay
+        : socialSource ? (Number(socialSource.estimate) || 0) * socialDecay : null,
+      socialSource: hasSocialKnowledge ? { agentId: socialSource.agentId || socialSource.agent_id,
+        updatedWorldMinutes: Number(socialSource.updatedWorldMinutes ?? socialSource.updated_world_minutes) || 0 } : null,
+      signalEligible, signalDemandCount: signalEligible ? (known
+        ? (Number(globalRow.demandCount) || 0) + failedContractUnits : 1) : 0,
+      signalSupplyCount: signalEligible ? (known ? Number(globalRow.supplyCount) || 0 : 0) : 0,
+      signalUnmetCount: signalEligible ? (known ? cityUnmet + failedContractUnits : 1) : 0 };
   });
-  return { demand, services: visibleServices, businesses, jobs, applications, employment, ownership,
+  return { demand, marketSignals: demand.filter((item) => item.signalEligible),
+    services: visibleServices, businesses, jobs, applications, employment, ownership,
     organizations, economicProjects, residentSkills,
     discoveredFrom: atExchange ? 'public_exchange' : 'personal_and_local_observation' };
 }
@@ -558,7 +730,7 @@ export async function observeResidentEconomicMarket(client, { worldId, agent, co
   if (!Array.isArray(agent.beliefs)) agent.beliefs = [];
   const perception = perceiveResidentEconomicMarket(agent, { ...context, worldMinutes });
   for (const item of perception.demand) {
-    if (!item.directlyObserved) {
+    if (!item.directlyObserved && !item.socialSource) {
       const existing = agent.beliefs.find((belief) => (belief.subjectType || belief.subject_type) === 'market'
         && (belief.subjectKey || belief.subject_key) === item.serviceType
         && (belief.beliefKey || belief.belief_key) === 'unmet_demand');
@@ -569,11 +741,19 @@ export async function observeResidentEconomicMarket(client, { worldId, agent, co
       }
       continue;
     }
+    const existingBelief = agent.beliefs.find((belief) => (belief.subjectType || belief.subject_type) === 'market'
+      && (belief.subjectKey || belief.subject_key) === item.serviceType
+      && (belief.beliefKey || belief.belief_key) === 'unmet_demand');
+    if (!item.directlyObserved && item.socialSource
+        && Number(item.socialSource.updatedWorldMinutes) <= Number(existingBelief?.updatedWorldMinutes
+          ?? existingBelief?.updated_world_minutes ?? -1)) continue;
     const estimate = item.demandCount > 0 ? item.unmetCount / item.demandCount : 0;
     const evidence = { awareness: item.awareness, demandCount: item.demandCount,
       otherDemandCount: item.otherDemandCount, supplyCount: item.supplyCount,
       unmetCount: item.unmetCount, confidence: item.awarenessConfidence, location: agent.location,
-      observedWorldMinutes: worldMinutes };
+      observedWorldMinutes: item.directlyObserved ? worldMinutes : item.socialSource.updatedWorldMinutes,
+      receivedWorldMinutes: item.directlyObserved ? null : worldMinutes,
+      sourceAgentId: item.socialSource?.agentId || null };
     await client.query(`INSERT INTO world_agent_beliefs(world_id,agent_id,subject_type,subject_key,belief_key,
         estimate,confidence,sample_count,updated_world_minutes,evidence)
       VALUES($1,$2,'market',$3,'unmet_demand',$4,$5,1,$6,$7::jsonb)
@@ -584,9 +764,7 @@ export async function observeResidentEconomicMarket(client, { worldId, agent, co
         sample_count=world_agent_beliefs.sample_count+1,updated_world_minutes=EXCLUDED.updated_world_minutes,
         evidence=EXCLUDED.evidence`, [worldId, agent.agentId, item.serviceType, estimate,
       item.awarenessConfidence, worldMinutes, JSON.stringify(evidence)]);
-    const existing = agent.beliefs.find((belief) => (belief.subjectType || belief.subject_type) === 'market'
-      && (belief.subjectKey || belief.subject_key) === item.serviceType
-      && (belief.beliefKey || belief.belief_key) === 'unmet_demand');
+    const existing = existingBelief;
     const belief = { subjectType: 'market', subjectKey: item.serviceType, beliefKey: 'unmet_demand',
       estimate, confidence: item.awarenessConfidence, sampleCount: Number(existing?.sampleCount || 0) + 1,
       updatedWorldMinutes: worldMinutes, evidence };
@@ -597,9 +775,14 @@ export async function observeResidentEconomicMarket(client, { worldId, agent, co
 }
 
 export async function loadWorldBusinessContext(client, worldId, worldMinutes = 0, residents = []) {
+  let queryTail = Promise.resolve();
+  const query = (...args) => {
+    queryTail = queryTail.then(() => client.query(...args));
+    return queryTail;
+  };
   const [businesses, services, jobs, applications, employment, ownership, organizations, projects, places,
-    contractDemand] = await Promise.all([
-    client.query(`SELECT business.*,account.balance::text AS cash_balance,
+    contractDemand, allBusinessServices, operatorHistory, failedContractDemand] = await Promise.all([
+    query(`SELECT business.*,account.balance::text AS cash_balance,
         COALESCE((business.metadata->>'lastDistributionWorldTime')::bigint,0) AS last_distribution_world_time,
         COALESCE((SELECT jsonb_agg(jsonb_build_object('ownerType',owner.owner_type,'ownerId',owner.owner_id,
           'share',owner.share::text,'investedUsdc',owner.invested_usdc::text))
@@ -615,7 +798,7 @@ export async function loadWorldBusinessContext(client, worldId, worldMinutes = 0
       FROM world_businesses business LEFT JOIN world_economic_accounts account
         ON account.world_id=business.world_id AND account.account_key='business:'||business.id::text AND account.asset_symbol='USDC'
       WHERE business.world_id=$1 ORDER BY business.founded_world_time,business.id`, [worldId]),
-    client.query(`SELECT service.*,business.name AS "businessName",business.founder_agent_id AS "founderAgentId",
+    query(`SELECT service.*,business.name AS "businessName",business.founder_agent_id AS "founderAgentId",
         business.status AS "businessStatus",business.reputation AS "businessReputation",
         business.place_id AS "placeId",place.name AS "placeName",account.balance::text AS "businessCash"
       FROM world_business_services service JOIN world_businesses business ON business.id=service.business_id
@@ -625,7 +808,7 @@ export async function loadWorldBusinessContext(client, worldId, worldMinutes = 0
       WHERE service.world_id=$1 AND service.active=true AND business.status='active'
         AND (place.id IS NULL OR place.status='active')
       ORDER BY service.created_world_time,service.id`, [worldId]),
-    client.query(`SELECT job.*,business.founder_agent_id AS "founderAgentId",business.name AS "businessName",
+    query(`SELECT job.*,business.founder_agent_id AS "founderAgentId",business.name AS "businessName",
         business.status AS "businessStatus",account.balance::text AS "businessCash",
         COALESCE((SELECT count(*)::int FROM world_business_applications application
           WHERE application.job_id=job.id AND application.status='pending'),0) AS "pendingCount"
@@ -634,7 +817,7 @@ export async function loadWorldBusinessContext(client, worldId, worldMinutes = 0
         AND account.account_key='business:'||business.id::text AND account.asset_symbol='USDC'
       WHERE job.world_id=$1 AND job.status IN ('open','filled') AND business.status='active'
       ORDER BY job.created_world_time,job.id`, [worldId]),
-    client.query(`SELECT application.*,business.founder_agent_id AS "founderAgentId",business.name AS "businessName",
+    query(`SELECT application.*,business.founder_agent_id AS "founderAgentId",business.name AS "businessName",
         business.status AS "businessStatus",job.status AS "jobStatus",
         business_cash.balance::text AS "businessCash",applicant.name AS agent_name,
         job.role,job.required_skill AS "requiredSkill",job.wage_usdc::text AS wage
@@ -644,7 +827,7 @@ export async function loadWorldBusinessContext(client, worldId, worldMinutes = 0
       LEFT JOIN world_economic_accounts business_cash ON business_cash.world_id=application.world_id
         AND business_cash.account_key='business:'||business.id::text AND business_cash.asset_symbol='USDC'
       WHERE application.world_id=$1 ORDER BY application.created_world_time,application.id`, [worldId]),
-    client.query(`SELECT employment.*,business.name AS "businessName",business.status AS "businessStatus",business.place_id AS "placeId",
+    query(`SELECT employment.*,business.name AS "businessName",business.status AS "businessStatus",business.place_id AS "placeId",
         business_cash.balance::text AS "businessCash",
         place.name AS "placeName",job.required_skill AS "requiredSkill",job.role,
         service.id AS "serviceId",service.service_type AS "serviceType"
@@ -656,15 +839,15 @@ export async function loadWorldBusinessContext(client, worldId, worldMinutes = 0
       LEFT JOIN LATERAL (SELECT id,service_type FROM world_business_services
         WHERE business_id=business.id AND active=true ORDER BY created_world_time,id LIMIT 1) service ON true
       WHERE employment.world_id=$1 AND employment.status='active'`, [worldId]),
-    client.query(`SELECT asset_type AS "assetType",asset_id AS "assetId",owner_type AS "ownerType",owner_id AS "ownerId",
+    query(`SELECT asset_type AS "assetType",asset_id AS "assetId",owner_type AS "ownerType",owner_id AS "ownerId",
         share::text AS share,invested_usdc::text AS "investedUsdc"
       FROM world_economic_ownership WHERE world_id=$1`, [worldId]),
-    client.query(`SELECT organization.id,organization.name,organization.status,account.balance::text AS cash_balance
+    query(`SELECT organization.id,organization.name,organization.status,account.balance::text AS cash_balance
       FROM world_organizations organization LEFT JOIN world_economic_accounts account
         ON account.world_id=organization.world_id AND account.account_key='organization:'||organization.id::text
           AND account.asset_symbol='USDC'
       WHERE organization.world_id=$1`, [worldId]),
-    client.query(`SELECT project.id,project.creator_agent_id,project.organization_id,project.status,project.title,
+    query(`SELECT project.id,project.creator_agent_id,project.organization_id,project.status,project.title,
         project.created_world_time,account.balance::text AS cash_balance,
         COALESCE((project.metadata->>'lastDistributionWorldTime')::bigint,0) AS last_distribution_world_time,
         COALESCE((SELECT sum(posting.amount) FROM world_economic_postings posting
@@ -679,14 +862,14 @@ export async function loadWorldBusinessContext(client, worldId, worldMinutes = 0
       LEFT JOIN world_economic_ownership owner ON owner.world_id=project.world_id
         AND owner.asset_type='project' AND owner.asset_id=project.id
       WHERE project.world_id=$1 GROUP BY project.id,account.id,account.balance`, [worldId]),
-    client.query(`SELECT scene.id,scene.name,scene.status,scene.operating_cost_usdc::text AS operating_cost_usdc,
+    query(`SELECT scene.id,scene.name,scene.status,scene.operating_cost_usdc::text AS operating_cost_usdc,
         scene.revenue_enabled,scene.revenue_share_bps,scene.created_by,scene.created_by_organization_id,
         COALESCE(jsonb_agg(jsonb_build_object('ownerType',owner.owner_type,'ownerId',owner.owner_id,
           'share',owner.share::text)) FILTER (WHERE owner.owner_id IS NOT NULL),'[]'::jsonb) AS owners
       FROM world_scenes scene LEFT JOIN world_economic_ownership owner ON owner.world_id=scene.world_id
         AND owner.asset_type='place' AND owner.asset_id=scene.id
       WHERE scene.world_id=$1 GROUP BY scene.id`, [worldId]),
-    client.query(`SELECT agreement.id AS agreement_id,business.id AS business_id,business.founder_agent_id,
+    query(`SELECT agreement.id AS agreement_id,business.id AS business_id,business.founder_agent_id,
         service.id AS service_id,service.stock_units,service.service_type,
         COALESCE((agreement.terms->>'maxUnits')::integer,(agreement.terms->>'units')::integer,1) AS agreed_units,
         COALESCE(delivered.units,0)::int AS delivered_units,
@@ -708,15 +891,52 @@ export async function loadWorldBusinessContext(client, worldId, worldMinutes = 0
         AND business_cash.account_key='business:'||business.id::text AND business_cash.asset_symbol='USDC'
       WHERE agreement.world_id=$1 AND agreement.status='active'
         AND agreement.agreement_type IN ('service','supplier_relationship')
-      ORDER BY agreement.created_world_time,agreement.id`, [worldId])
+      ORDER BY agreement.created_world_time,agreement.id`, [worldId]),
+    query(`SELECT service.id,service.business_id,service.service_type,service.active,service.stock_units,
+        business.status AS "businessStatus",service.base_price_usdc,service.name,service.description
+      FROM world_business_services service JOIN world_businesses business
+        ON business.world_id=service.world_id AND business.id=service.business_id
+      WHERE service.world_id=$1 ORDER BY service.created_world_time,service.id`, [worldId]),
+    query(`SELECT employment.agent_id AS "agentId",employment.business_id AS "businessId",job.role,
+        employment.started_world_time AS "startedWorldTime",employment.ended_world_time AS "endedWorldTime"
+      FROM world_business_employment employment JOIN world_business_jobs job
+        ON job.world_id=employment.world_id AND job.id=employment.job_id
+      WHERE employment.world_id=$1 AND job.role ~* '(manager|operator|controller|director)'`, [worldId]),
+    query(`SELECT agreement.id AS "agreementId",agreement.agreement_type AS "agreementType",
+        agreement.status,agreement.updated_world_time AS "failedWorldTime",
+        agreement.terms->>'businessId' AS "businessId",agreement.terms->>'serviceId' AS "serviceId",
+        agreement.terms->>'customerAgentId' AS "customerAgentId",
+        COALESCE(service.service_type,business.metadata->>'serviceType') AS "serviceType",
+        COALESCE((agreement.terms->>'maxUnits')::integer,(agreement.terms->>'units')::integer,1) AS "agreedUnits",
+        COALESCE(delivered.units,0)::int AS "deliveredUnits",
+        greatest(0,COALESCE((agreement.terms->>'maxUnits')::integer,(agreement.terms->>'units')::integer,1)
+          - COALESCE(delivered.units,0))::int AS "remainingUnits",
+        agreement.metadata->'resolution' AS resolution
+      FROM world_agreements agreement
+      LEFT JOIN world_businesses business ON business.world_id=agreement.world_id
+        AND business.id::text=agreement.terms->>'businessId'
+      LEFT JOIN world_business_services service ON service.world_id=agreement.world_id
+        AND service.business_id=business.id AND service.id::text=agreement.terms->>'serviceId'
+      LEFT JOIN LATERAL (SELECT count(*)::int AS units FROM world_commitments commitment
+        WHERE commitment.world_id=agreement.world_id AND commitment.agreement_id=agreement.id
+          AND commitment.commitment_type='service' AND commitment.status='fulfilled') delivered ON true
+      WHERE agreement.world_id=$1 AND agreement.status='breached'
+        AND agreement.agreement_type IN ('service','supplier_relationship')
+        AND agreement.terms->>'customerAgentId' IS NOT NULL
+        AND agreement.updated_world_time >= $2-30*1440
+        AND COALESCE((agreement.terms->>'maxUnits')::integer,(agreement.terms->>'units')::integer,1)
+          > COALESCE(delivered.units,0)
+      ORDER BY agreement.updated_world_time DESC,agreement.id`, [worldId, worldMinutes])
   ]);
   const demand = deriveWorldEconomicDemand(residents, services.rows, worldMinutes);
   await persistWorldEconomicDemand(client, worldId, worldMinutes, demand);
   const residentSkills = Object.fromEntries(residents.map((resident) => [resident.agent_id || resident.agentId,
     resident.skills || {}]));
-  return { businesses: businesses.rows, services: services.rows, jobs: jobs.rows,
+  return { businesses: businesses.rows, services: services.rows, allBusinessServices: allBusinessServices.rows,
+    operatorHistory: operatorHistory.rows, jobs: jobs.rows,
     applications: applications.rows, employment: employment.rows, ownership: ownership.rows, demand,
     organizations: organizations.rows, projects: projects.rows, places: places.rows,
+    failedContractDemand: failedContractDemand.rows,
     contractDemand: contractDemand.rows, residentSkills, worldMinutes };
 }
 
@@ -728,6 +948,74 @@ async function persistWorldEconomicDemand(client, worldId, worldMinutes, rows) {
     ON CONFLICT(world_id,service_type,world_day) DO UPDATE SET demand_count=EXCLUDED.demand_count,
       supply_count=EXCLUDED.supply_count,unmet_count=EXCLUDED.unmet_count,evidence=EXCLUDED.evidence,updated_at=now()`,
   [worldId, row.serviceType, worldDay, row.demandCount, row.supplyCount, row.unmetCount, JSON.stringify({ residents: row.evidence })]);
+}
+
+export async function observeWorldBusinessMarket(client, { worldId, agentId, serviceType, actionId, worldTime, location = null }) {
+  if (!Object.hasOwn(SERVICE_INFO, serviceType)) throw error('BUSINESS_MARKET_SERVICE_INVALID', 400);
+  if (typeof actionId !== 'string' || !actionId.length || actionId.length > 180) {
+    throw error('BUSINESS_MARKET_ACTION_ID_REQUIRED', 400);
+  }
+  await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))',
+    [`business-market-observation:${worldId}:${agentId}:${actionId}`]);
+  const eventActionId = `business-market-observation:${actionId}`;
+  const priorEvent = await client.query(`SELECT data FROM world_events
+    WHERE world_id=$1 AND actor_id=$2 AND action_id=$3`, [worldId, agentId, eventActionId]);
+  if (priorEvent.rowCount) return { ...priorEvent.rows[0].data, idempotent: true };
+  const prior = await client.query(`SELECT evidence,estimate::text AS estimate,confidence::text AS confidence,
+      sample_count AS "sampleCount",updated_world_minutes AS "updatedWorldMinutes"
+    FROM world_agent_beliefs WHERE world_id=$1 AND agent_id=$2 AND subject_type='market'
+      AND subject_key=$3 AND belief_key='unmet_demand' FOR UPDATE`, [worldId, agentId, serviceType]);
+  if (prior.rows[0]?.evidence?.lastActionId === actionId) {
+    return { serviceType, ...prior.rows[0].evidence, estimate: Number(prior.rows[0].estimate),
+      confidence: Number(prior.rows[0].confidence), sampleCount: Number(prior.rows[0].sampleCount), idempotent: true };
+  }
+  const day = Math.floor(Math.max(0, Number(worldTime) || 0) / 1_440);
+  const market = await client.query(`SELECT demand_count AS "demandCount",supply_count AS "supplyCount",
+      unmet_count AS "unmetCount",world_day AS "worldDay"
+    FROM world_economic_demand WHERE world_id=$1 AND service_type=$2 AND world_day<=$3 AND world_day >= $3-2
+    ORDER BY world_day DESC LIMIT 1`, [worldId, serviceType, day]);
+  if (!market.rowCount) throw error('MARKET_OBSERVATION_UNAVAILABLE');
+  const failedContracts = await client.query(`SELECT count(*)::int AS "failedContractCount",
+      COALESCE(sum(greatest(0,COALESCE((agreement.terms->>'maxUnits')::integer,
+        (agreement.terms->>'units')::integer,1)-COALESCE(delivered.units,0))),0)::int AS "replacementUnits"
+    FROM world_agreements agreement
+    LEFT JOIN LATERAL (SELECT count(*)::int AS units FROM world_commitments commitment
+      WHERE commitment.world_id=agreement.world_id AND commitment.agreement_id=agreement.id
+        AND commitment.commitment_type='service' AND commitment.status='fulfilled') delivered ON true
+    WHERE agreement.world_id=$1 AND agreement.status='breached'
+      AND agreement.agreement_type IN ('service','supplier_relationship')
+      AND agreement.updated_world_time >= $2-30*1440
+      AND COALESCE((agreement.terms->>'maxUnits')::integer,(agreement.terms->>'units')::integer,1)
+        > COALESCE(delivered.units,0)
+      AND EXISTS (SELECT 1 FROM world_business_services service
+        WHERE service.world_id=agreement.world_id AND service.id::text=agreement.terms->>'serviceId'
+          AND service.service_type=$3)`, [worldId, worldTime, serviceType]);
+  const row = market.rows[0];
+  const failure = failedContracts.rows[0] || { failedContractCount: 0, replacementUnits: 0 };
+  const demandCount = Number(row.demandCount) + Number(failure.replacementUnits || 0);
+  const unmetCount = Number(row.unmetCount) + Number(failure.replacementUnits || 0);
+  const estimate = demandCount > 0 ? unmetCount / demandCount : 0;
+  const sampleCount = Number(prior.rows[0]?.sampleCount || 0);
+  const priorEstimate = Number(prior.rows[0]?.estimate || 0);
+  const nextEstimate = (priorEstimate * sampleCount + estimate) / (sampleCount + 1);
+  const evidence = { awareness: 'exchange_market_research', demandCount, supplyCount: Number(row.supplyCount),
+    unmetCount, failedContractCount: Number(failure.failedContractCount || 0),
+    replacementUnits: Number(failure.replacementUnits || 0), observedWorldMinutes: Number(worldTime),
+    sourceWorldDay: Number(row.worldDay), location: location || null, lastActionId: actionId };
+  await client.query(`INSERT INTO world_agent_beliefs(world_id,agent_id,subject_type,subject_key,belief_key,
+      estimate,confidence,sample_count,updated_world_minutes,evidence)
+    VALUES($1,$2,'market',$3,'unmet_demand',$4,0.86,1,$5,$6::jsonb)
+    ON CONFLICT(world_id,agent_id,subject_type,subject_key,belief_key) DO UPDATE SET
+      estimate=(world_agent_beliefs.estimate*world_agent_beliefs.sample_count+EXCLUDED.estimate)
+        /(world_agent_beliefs.sample_count+1),confidence=GREATEST(world_agent_beliefs.confidence,EXCLUDED.confidence),
+      sample_count=world_agent_beliefs.sample_count+1,updated_world_minutes=EXCLUDED.updated_world_minutes,
+      evidence=EXCLUDED.evidence`, [worldId, agentId, serviceType, estimate, worldTime, JSON.stringify(evidence)]);
+  const result = { serviceType, ...evidence, estimate: nextEstimate, confidence: 0.86,
+    sampleCount: sampleCount + 1, idempotent: false };
+  await client.query(`INSERT INTO world_events(world_id,actor_id,event_type,data,action_id)
+    VALUES($1,$2,'business.market_observed',$3::jsonb,$4)
+    ON CONFLICT(world_id,actor_id,action_id) DO NOTHING`, [worldId, agentId, JSON.stringify(result), eventActionId]);
+  return result;
 }
 
 export function buildBusinessCandidates(agent, context = {}) {
@@ -746,33 +1034,56 @@ export function buildBusinessCandidates(agent, context = {}) {
   const owned = businesses.filter((business) => business.founder_agent_id === agent.agentId
     || isBusinessBeneficiary(agent.agentId, business, context.ownership || []));
   const activeOwned = owned.filter((business) => business.status === 'active');
-  const employed = employment.find((item) => item.agent_id === agent.agentId || item.agentId === agent.agentId);
+  const employed = employment.find((item) => (item.agent_id === agent.agentId || item.agentId === agent.agentId)
+    && item.status === 'active');
   const unmet = (context.demand || []).filter((item) => item.known !== false && Number(item.unmetCount) > 0)
     .sort((left, right) => right.unmetCount - left.unmetCount || left.serviceType.localeCompare(right.serviceType));
   const worldMinutes = Math.max(0, Math.trunc(Number(context.worldMinutes) || 0));
-  const recentFailureTimes = owned.filter((business) => ['inactive','closed','bankrupt'].includes(business.status))
-    .map((business) => Number(business.metadata?.closedWorldTime || business.metadata?.lastLossWorldTime
-      || business.founded_world_time || business.foundedWorldTime))
-    .filter(Number.isFinite);
-  const lastFailureWorldTime = Math.max(...recentFailureTimes, Number.NEGATIVE_INFINITY);
-  const businessRetryReady = worldMinutes - lastFailureWorldTime >= BUSINESS_RETRY_COOLDOWN_WORLD_MINUTES;
   const goal = String(agent.primaryGoal || agent.goal || '').toUpperCase();
-  if (!activeOwned.length && businessRetryReady) for (const demand of unmet) {
+  for (const signal of context.marketSignals || []) {
+    const serviceType = signal.serviceType;
+    if (!SERVICE_INFO[serviceType]) continue;
+    const alreadyInvestigating = memories.some((memory) => memory.metadata?.action === 'business_market_observe'
+      && memory.metadata?.serviceType === serviceType
+      && worldMinutes - Number(memory.worldMinutes || memory.world_minutes || 0) < 720);
+    const exchange = (context.scenes || []).find((scene) => scene.status === 'active'
+      && (scene.sceneType === 'exchange' || scene.name === 'Exchange'));
+    if (!alreadyInvestigating && exchange && energy >= 15 && food >= 8) {
+      const failure = failureMemoryProfile(agent, serviceType, worldMinutes);
+      const sectorNeed = residentDemandTypes(agent).has(serviceType) ? 6 : 0;
+      options.push({ id: `business:market-observe:${serviceType}:${Math.floor(worldMinutes / 1_440)}`,
+        action: 'business_market_observe', targetLocation: exchange.name,
+        goal: `Investigate an uncertain ${SERVICE_INFO[serviceType].type} market signal at Exchange before choosing a recovery path.`,
+        marketObservationServiceType: serviceType,
+        score: 35 + Math.min(18, Number(signal.signalUnmetCount || 0) * 4) + sectorNeed
+          + Math.max(0, Number(agent.curiosity) || 0) * 10 + Math.min(10, failure.count * 4)
+          + serviceLocationBoost(agent, serviceType, context) * 12 });
+    }
+  }
+
+  for (const demand of unmet) {
     const spec = SERVICE_INFO[demand.serviceType];
     if (!spec) continue;
+    const retry = businessRetryState(agent, demand.serviceType, { ...context, worldMinutes });
+    const activeService = businesses.some((business) => business.status === 'active'
+      && businessServiceType(business, context) === demand.serviceType && isBusinessOperator(agent.agentId, business, context));
     const { capitalSource: serviceCapitalSource, capability } = chooseBusinessSourceAndCapability(agent,
       demand.serviceType, { ...context, activeProjects: context.activeProjects || agent.activeProjects,
         economicProjects: context.economicProjects || agent.economicProjects });
     const relationToService = relationships.find((item) => item.memoryType === 'business'
       && item.serviceType === demand.serviceType);
     const businessBeliefs = (agent.beliefs || []).filter((belief) => belief.subjectType === 'business'
-      && belief.beliefKey === 'business_outcome');
+      && belief.beliefKey === 'business_outcome'
+      && (belief.evidence?.serviceType === demand.serviceType
+        || context.businesses?.some((business) => business.id === belief.subjectKey
+          && businessServiceType(business, context) === demand.serviceType)));
     const beliefEstimate = businessBeliefs.length
       ? businessBeliefs.reduce((sum, belief) => sum + Number(belief.estimate || 0) * Number(belief.confidence || 0), 0)
         / businessBeliefs.length : 0;
     const partner = bestTrustedCofounder(agent, demand.serviceType, context);
     const outsideDemand = Number(demand.otherDemandCount ?? demand.demandCount) || 0;
-    if (outsideDemand > 0 && serviceCapitalSource && energy >= 20 && food >= 15) {
+    const failure = failureMemoryProfile(agent, demand.serviceType, worldMinutes);
+    if (!activeService && retry.ready && outsideDemand > 0 && serviceCapitalSource && energy >= 20 && food >= 15) {
       const businessNameBase = `${String(agent.name || 'Resident').slice(0, 42)} ${spec.label} Studio`.slice(0, 68);
       const existingNames = businesses.map((business) => String(business.name || ''));
       let businessName = businessNameBase;
@@ -796,13 +1107,15 @@ export function buildBusinessCandidates(agent, context = {}) {
         capabilityGap: Math.max(0, 50 - capability.score),
         capabilityFit: capability.score, capabilityTeamAgentIds: organization?.memberIds || [agent.agentId],
         founderSkillProfile: { ...skills } };
-      const memoryOutcome = memories.filter((memory) => memory.memoryType === 'business'
-        || memory.metadata?.serviceType === demand.serviceType).length;
+      const successfulExperience = memories.filter((memory) => ['business_found','business_work','business_service','business_reopen']
+        .includes(memory.metadata?.action) && (memory.metadata?.serviceType === demand.serviceType
+          || memory.metadata?.initiative?.serviceType === demand.serviceType)
+        && !/failed|loss|closed|bankrupt|breach/i.test(String(memory.summary || ''))).length;
       const goalFit = /WEALTH|BUSINESS|MARKET|TRAD|COMMUNITY|RELATION|BUILD|RESEARCH|LEARN|ENGINEER/i.test(goal) ? 8 : 0;
       const riskFit = 6 - Math.abs(clamp(Number(agent.riskTolerance) || 0.5, 0, 1) - 0.55) * 12;
       const motive = goalFit + clamp(Number(agent.ambition || 0.5), 0, 1) * 10
         + riskFit * (demand.serviceType === 'trading_service' ? 1 : 0.25)
-        + Math.max(-8, Math.min(8, beliefEstimate * 8)) + memoryOutcome * 2
+        + Math.max(-8, Math.min(8, beliefEstimate * 8)) + Math.min(10, successfulExperience * 2)
         + Math.max(-4, Math.min(4, Number(relationToService?.trust || 0) * 0.2))
         - Math.min(18, Number(demand.supplyCount) * 3);
       options.push({ id: `business:found:${demand.serviceType}`, action: 'business_found',
@@ -810,7 +1123,27 @@ export function buildBusinessCandidates(agent, context = {}) {
         goal: `Evaluate committing ${FOUNDER_CAPITAL} simulated USDC to meet ${serviceGoal}; estimated capability fit ${capability.score.toFixed(1)}.`,
         businessProposal: proposal, score: 28 + Math.min(30, Number(demand.unmetCount) * 6)
           + capability.score * 0.22 + motive - Math.max(0, 45 - capability.score) * 0.28
-          - (demand.awarenessConfidence ? (1 - Number(demand.awarenessConfidence)) * 6 : 0) });
+          - (demand.awarenessConfidence ? (1 - Number(demand.awarenessConfidence)) * 6 : 0)
+          - Math.min(12, failure.count * 4) });
+    }
+    if (!activeService && retry.ready && outsideDemand > 0 && serviceCapitalSource && energy >= 20 && food >= 15) {
+      for (const business of businesses.filter((item) => ['inactive','closed','bankrupt'].includes(item.status)
+        && businessServiceType(item, context) === demand.serviceType
+        && isBusinessOperator(agent.agentId, item, context))) {
+        const service = (context.allBusinessServices || []).find((item) => (item.business_id || item.businessId) === business.id
+          && (item.service_type || item.serviceType) === demand.serviceType);
+        if (!service) continue;
+        const place = (context.scenes || []).find((scene) => scene.id === business.place_id && scene.status === 'active');
+        options.push({ id: `business:reopen:${business.id}:${Math.floor(worldMinutes / 1_440)}`,
+          action: 'business_reopen', targetLocation: place?.name || agent.location,
+          goal: `Consider reopening ${business.name} with fresh working capital after reviewing the current ${spec.type} demand.`,
+          businessId: business.id,
+          reopenProposal: { businessId: business.id, serviceType: demand.serviceType,
+            serviceName: spec.label, serviceDescription: `${spec.label} restarted after a new review of resident demand.`,
+            basePriceUsdc: spec.base, capitalUsdc: FOUNDER_CAPITAL, capitalSource: serviceCapitalSource },
+          score: 32 + Math.min(24, Number(demand.unmetCount) * 5) + capability.score * 0.2
+            - Math.min(12, failure.count * 3) - Math.min(10, Number(demand.supplyCount) * 3) });
+      }
     }
     if (partner && energy >= 20 && food >= 15 && partner.teamScore > capability.ownScore) {
       const goalService = spec.label.toLowerCase();
@@ -824,7 +1157,8 @@ export function buildBusinessCandidates(agent, context = {}) {
             purpose: `Combine resident capabilities to respond to observed ${goalService} demand.`,
             projectId: partner.projectId, inviteAgentId: partner.partnerId } },
         score: 31 + Math.min(24, Number(demand.unmetCount) * 5) + partner.teamScore * 0.25
-          + clamp(Number(partner.trust) || 0, 0, 100) * 0.08 + clamp(Number(agent.ambition) || 0, 0, 1) * 8 });
+          + clamp(Number(partner.trust) || 0, 0, 100) * 0.08 + clamp(Number(agent.ambition) || 0, 0, 1) * 8
+          + Math.min(8, failure.count * 3) });
     }
     if (capability.ownScore < 70 && energy >= 15 && food >= 8) {
       const targetSkill = spec.skill;
@@ -840,7 +1174,7 @@ export function buildBusinessCandidates(agent, context = {}) {
         preparationSkill: targetSkill, preparationServiceType: demand.serviceType,
         score: 27 + Math.min(20, Number(demand.unmetCount) * 4)
           + Math.min(24, (70 - capability.ownScore) * 0.34)
-          + (goal.includes(targetSkill.toUpperCase()) ? 8 : 0) });
+          + (goal.includes(targetSkill.toUpperCase()) ? 8 : 0) + Math.min(8, failure.count * 3) });
     }
   }
 
@@ -1119,6 +1453,132 @@ async function readBusiness(client, worldId, businessId, forUpdate = false) {
   [worldId, businessId]);
   if (!result.rowCount) throw error('BUSINESS_NOT_FOUND', 404);
   return result.rows[0];
+}
+
+export async function reopenWorldBusiness(client, { worldId, agentId, actionId, proposal, worldTime }) {
+  const businessId = proposal?.businessId;
+  const serviceType = proposal?.serviceType;
+  if (!businessId || !Object.hasOwn(SERVICE_INFO, serviceType)) throw error('BUSINESS_REOPEN_PROPOSAL_INVALID', 400);
+  if (proposal.capitalSource !== undefined) {
+    const source = proposal.capitalSource;
+    if (!source || !['resident','organization','project'].includes(source.type)
+        || (source.type === 'resident' && source.ownerId && source.ownerId !== agentId)
+        || (source.type !== 'resident' && !source.ownerId)) throw error('BUSINESS_CAPITAL_SOURCE_INVALID', 400);
+  }
+  const transferActionId = `business-reopen:${businessId}:${actionId}`;
+  const priorTransfer = await client.query(`SELECT id,amount::text AS amount FROM world_economic_transactions
+    WHERE world_id=$1 AND action_id=$2`, [worldId, transferActionId]);
+  if (priorTransfer.rowCount) {
+    const priorBusiness = await readBusiness(client, worldId, businessId);
+    return { id: businessId, businessId, name: priorBusiness.name, status: priorBusiness.status,
+      serviceType, capitalUsdc: priorTransfer.rows[0].amount, transactionId: priorTransfer.rows[0].id,
+      reopened: true, idempotent: true };
+  }
+
+  const business = await readBusiness(client, worldId, businessId, true);
+  if (!['closed','bankrupt','inactive'].includes(business.status)) throw error('BUSINESS_REOPEN_STATUS_INVALID');
+  if (businessServiceType(business) !== serviceType) throw error('BUSINESS_REOPEN_SERVICE_MISMATCH');
+  const closedAt = businessFailureWorldTime(business);
+  const manager = await client.query(`SELECT EXISTS (
+      SELECT 1 FROM world_business_employment employment JOIN world_business_jobs job
+        ON job.world_id=employment.world_id AND job.id=employment.job_id
+      WHERE employment.world_id=$1 AND employment.business_id=$2 AND employment.agent_id=$3
+        AND job.role ~* '(manager|operator|controller|director)' AND employment.started_world_time<=$4
+        AND (employment.ended_world_time IS NULL OR employment.ended_world_time>=$4-1440)
+    ) AS operator_history`, [worldId, businessId, agentId, Number.isFinite(closedAt) ? closedAt : worldTime]);
+  const metadata = business.metadata || {};
+  const explicitController = [...(metadata.controllerAgentIds || []), ...(metadata.operatorAgentIds || [])].includes(agentId);
+  const majorityOwner = await readBusinessBeneficialShare(client, worldId, businessId, agentId) >= 0.5;
+  if (business.founder_agent_id !== agentId && !explicitController && !majorityOwner
+      && !manager.rows[0]?.operator_history) throw error('BUSINESS_REOPEN_CONTROL_REQUIRED', 403);
+
+  const service = await client.query(`SELECT id FROM world_business_services
+    WHERE world_id=$1 AND business_id=$2 AND service_type=$3 ORDER BY created_world_time,id LIMIT 1 FOR UPDATE`,
+  [worldId, businessId, serviceType]);
+  if (!service.rowCount) throw error('BUSINESS_REOPEN_SERVICE_NOT_FOUND', 404);
+  const day = Math.floor(Number(worldTime) / 1_440);
+  const demand = await client.query(`SELECT demand_count AS "demandCount",supply_count AS "supplyCount",
+      unmet_count AS "unmetCount",world_day AS "worldDay"
+    FROM world_economic_demand WHERE world_id=$1 AND service_type=$2 AND world_day<=$3
+      AND world_day >= $3-1 AND unmet_count>0 ORDER BY world_day DESC LIMIT 1`, [worldId, serviceType, day]);
+  if (!demand.rowCount) throw error('BUSINESS_REOPEN_DEMAND_NOT_OBSERVED');
+
+  const funding = proposal.capitalSource?.type === 'organization'
+    ? { accountType: 'organization', ownerId: proposal.capitalSource.ownerId }
+    : proposal.capitalSource?.type === 'project'
+      ? { accountType: 'project', ownerId: proposal.capitalSource.ownerId }
+      : { accountType: 'resident', ownerId: agentId };
+  if (funding.accountType === 'organization') await assertOrganizationContributor(client, worldId, funding.ownerId, agentId);
+  if (funding.accountType === 'project') {
+    const member = await client.query(`SELECT 1 FROM world_project_members member
+      JOIN world_projects project ON project.world_id=member.world_id AND project.id=member.project_id
+      WHERE member.world_id=$1 AND member.project_id=$2 AND member.agent_id=$3
+        AND member.status='active' AND project.status='active' FOR UPDATE OF member,project`,
+    [worldId, funding.ownerId, agentId]);
+    if (!member.rowCount) throw error('ACTIVE_PROJECT_MEMBERSHIP_REQUIRED', 403);
+  }
+  const capital = formatUnits(parsePositiveUnits(String(proposal.capitalUsdc || FOUNDER_CAPITAL)));
+  if (parsePositiveUnits(capital) < parsePositiveUnits(FOUNDER_CAPITAL)) throw error('BUSINESS_REOPEN_CAPITAL_TOO_SMALL');
+  const sourceAccount = await getEconomicAccount(client, { worldId, ...funding, asset: 'USDC', forUpdate: true });
+  if (!sourceAccount || parsePositiveUnits(sourceAccount.balance, { allowZero: true }) < parsePositiveUnits(capital)) {
+    throw error('INSUFFICIENT_FOUNDER_CAPITAL');
+  }
+  const businessAccount = await ensureEconomicAccount(client, { worldId, accountType: 'business', ownerId: businessId,
+    key: `business:${businessId}` });
+  const transfer = await transferBetweenAccounts(client, { worldId, source: funding,
+    destination: { accountType: 'business', ownerId: businessId, key: `business:${businessId}` },
+    amount: capital, transactionType: 'business_reopen', reason: `Working capital committed to reopen ${business.name}.`,
+    worldTime, actionId: transferActionId, referenceId: businessId,
+    metadata: { businessId, serviceId: service.rows[0].id, serviceType, actorAgentId: agentId } });
+
+  const existingOwner = await client.query(`SELECT share::text AS share FROM world_economic_ownership
+    WHERE world_id=$1 AND asset_type='business' AND asset_id=$2 AND owner_type=$3 AND owner_id=$4 FOR UPDATE`,
+  [worldId, businessId, funding.accountType, funding.ownerId]);
+  if (existingOwner.rowCount) {
+    await client.query(`UPDATE world_economic_ownership SET invested_usdc=invested_usdc+$5::numeric,updated_at=now()
+      WHERE world_id=$1 AND asset_type='business' AND asset_id=$2 AND owner_type=$3 AND owner_id=$4`,
+    [worldId, businessId, funding.accountType, funding.ownerId, capital]);
+  } else {
+    const owners = await client.query(`SELECT owner_type,owner_id,share::text AS share FROM world_economic_ownership
+      WHERE world_id=$1 AND asset_type='business' AND asset_id=$2 ORDER BY owner_type,owner_id FOR UPDATE`,
+    [worldId, businessId]);
+    const totalShare = owners.rows.reduce((sum, owner) => sum + Number(owner.share), 0);
+    if (!owners.rowCount || Math.abs(totalShare - 1) > 0.000001) throw error('BUSINESS_OWNERSHIP_INVALID');
+    const valuation = Math.max(Number(business.valuation_usdc) || 0, 100);
+    const newShare = clamp(Number(capital) / (valuation + Number(capital)), 0.01, 0.35);
+    await client.query(`UPDATE world_economic_ownership SET share=share*(1-$3::numeric),updated_at=now()
+      WHERE world_id=$1 AND asset_type='business' AND asset_id=$2`, [worldId, businessId, newShare]);
+    await client.query(`INSERT INTO world_economic_ownership(world_id,asset_type,asset_id,owner_type,owner_id,share,invested_usdc,acquired_world_time)
+      VALUES($1,'business',$2,$3,$4,$5,$6,$7)`,
+    [worldId, businessId, funding.accountType, funding.ownerId, newShare, capital, worldTime]);
+  }
+  const place = business.place_id ? await client.query(`SELECT 1 FROM world_scenes
+    WHERE world_id=$1 AND id=$2 AND status='active' FOR UPDATE`, [worldId, business.place_id]) : { rowCount: 1 };
+  if (!place.rowCount) throw error('BUSINESS_PLACE_UNAVAILABLE');
+  const name = validText(proposal.serviceName, 3, 96) ? proposal.serviceName.trim() : SERVICE_INFO[serviceType].label;
+  const description = validText(proposal.serviceDescription, 12, 400)
+    ? proposal.serviceDescription.trim() : `${name} offered after reviewing current resident demand.`;
+  const price = formatUnits(parsePositiveUnits(String(proposal.basePriceUsdc || SERVICE_INFO[serviceType].base)));
+  await client.query(`UPDATE world_businesses SET status='active',valuation_usdc=valuation_usdc+$3::numeric,
+      consecutive_loss_days=0,metadata=metadata||jsonb_build_object('lastReopenedWorldTime',$4::bigint,
+        'lastReopenedActionId',$5::text,'reopenCount',COALESCE((metadata->>'reopenCount')::int,0)+1),updated_at=now()
+    WHERE world_id=$1 AND id=$2`, [worldId, businessId, capital, worldTime, actionId]);
+  await client.query(`UPDATE world_business_services SET active=true,name=$4,description=$5,base_price_usdc=$6
+    WHERE world_id=$1 AND business_id=$2 AND id=$3`, [worldId, businessId, service.rows[0].id, name, description, price]);
+  const job = await client.query(`INSERT INTO world_business_jobs(world_id,business_id,role,required_skill,wage_usdc,status,
+      created_world_time,action_id)
+    VALUES($1,$2,$3,$4,'15.00000000','open',$5,$6)
+    ON CONFLICT(world_id,business_id,action_id) DO NOTHING RETURNING id`,
+  [worldId, businessId, `${SERVICE_INFO[serviceType].skill[0].toUpperCase()}${SERVICE_INFO[serviceType].skill.slice(1)} Associate`,
+    SERVICE_INFO[serviceType].skill, worldTime, `${actionId}:opening`]);
+  await recordHistory(client, { worldId, eventKey: `business-reopened:${businessId}:${actionId}`,
+    eventType: 'business_reopened', actorAgentId: agentId, entityType: 'business', entityId: businessId,
+    worldTime, title: business.name, detail: `${business.name} reopened with ${capital} simulated USDC of new working capital.`,
+    metadata: { businessId, serviceId: service.rows[0].id, serviceType, capital, transactionId: transfer.transactionId,
+      jobId: job.rows[0]?.id || null, observedDemand: demand.rows[0] } });
+  return { id: businessId, businessId, name: business.name, status: 'active', serviceId: service.rows[0].id,
+    serviceType, capitalUsdc: capital, transactionId: transfer.transactionId, reopened: true,
+    idempotent: false, demand: demand.rows[0], accountId: businessAccount.id };
 }
 
 export async function foundWorldBusiness(client, { worldId, agentId, actionId, proposal, worldTime }) {
@@ -1794,6 +2254,10 @@ export async function settleWorldBusinessMaintenance(client, { worldId, worldTim
   const day = Math.floor(Number(worldTime) / 1_440);
   await ensureEconomicAccount(client, { worldId, accountType: 'system', key: 'system:maintenance-sink' });
   const businesses = await client.query(`SELECT business.id,business.name,business.founder_agent_id AS "founderAgentId",
+      COALESCE(business.metadata->>'serviceType',CASE business.business_type
+        WHEN 'food' THEN 'food_service' WHEN 'social' THEN 'social_service'
+        WHEN 'research' THEN 'research_service' WHEN 'engineering' THEN 'engineering_service'
+        WHEN 'market_research' THEN 'trading_service' END) AS "serviceType",
       business.consecutive_loss_days AS "lossDays",business.metadata,account.balance::text AS cash
     FROM world_businesses business LEFT JOIN world_economic_accounts account
       ON account.world_id=business.world_id AND account.account_key='business:'||business.id::text AND account.asset_symbol='USDC'
@@ -1857,7 +2321,8 @@ export async function settleWorldBusinessMaintenance(client, { worldId, worldTim
     }
     const status = (await client.query(`SELECT status FROM world_businesses WHERE world_id=$1 AND id=$2`,
       [worldId, business.id])).rows[0]?.status || 'unknown';
-    const outcome = { id: business.id, name: business.name, founderAgentId: business.founderAgentId, status,
+    const outcome = { id: business.id, name: business.name, founderAgentId: business.founderAgentId,
+      serviceType: business.serviceType, status,
       dailyRevenueUsdc: dailyRevenue.toFixed(8), dailyExpensesUsdc: dailyExpenses.toFixed(8),
       dailyNetOperatingResultUsdc: dailyNet.toFixed(8), consecutiveLossDays: lossDays,
       missedMaintenanceDays: status === 'active' ? 0 : missedMaintenanceDays + 1,
@@ -2047,7 +2512,7 @@ export function economicDashboardSql(worldIdPlaceholder = '$1') {
           WHERE tx.world_id=${world} AND account.account_type='business' AND account.asset_symbol='USDC'
             AND posting.amount<0 AND tx.transaction_type IN ('business_expense','business_wage','maintenance')))::text AS business_profit_loss,
       (SELECT COALESCE(sum(tx.amount),0)::text FROM world_economic_transactions tx WHERE tx.world_id=${world}
-        AND tx.transaction_type IN ('business_investment','project_investment')) AS investment_volume,
+        AND tx.transaction_type IN ('business_investment','business_reopen','project_investment')) AS investment_volume,
       (SELECT COALESCE(sum(balance),0)::text FROM world_economic_accounts WHERE world_id=${world}
         AND account_type<>'system' AND asset_symbol='USDC') AS usdc_circulation,
       ((SELECT COALESCE(sum(account.balance*COALESCE(quote.price_usd,0)),0)
@@ -2055,4 +2520,61 @@ export function economicDashboardSql(worldIdPlaceholder = '$1') {
         WHERE account.world_id=${world} AND account.account_type='resident')
         +(SELECT COALESCE(sum(resident_assets.share*entity_values.value_usd),0)
           FROM resident_assets JOIN entity_values USING(asset_type,asset_id)))::text AS total_resident_net_worth_usd`;
+}
+
+export async function readEconomicRecoveryMetrics(client, { worldId, worldMinutes, windowMinutes = 10_080 }) {
+  const minute = Math.max(0, Math.trunc(Number(worldMinutes) || 0));
+  const fromWorldMinutes = Math.max(0, minute - Math.max(60, Math.trunc(Number(windowMinutes) || 10_080)));
+  const worldDay = Math.floor(minute / 1_440);
+  const [supply, unmet, recovery, births, employment, replacements] = await Promise.all([
+    client.query(`SELECT COALESCE(sum(service.stock_units),0)::int AS "activeSupply"
+      FROM world_business_services service JOIN world_businesses business
+        ON business.world_id=service.world_id AND business.id=service.business_id
+      LEFT JOIN world_scenes scene ON scene.world_id=business.world_id AND scene.id=business.place_id
+      WHERE service.world_id=$1 AND service.active=true AND business.status='active'
+        AND (scene.id IS NULL OR scene.status='active')`, [worldId]),
+    client.query(`WITH recent AS (SELECT service_type,world_day,unmet_count,
+          row_number() OVER (PARTITION BY service_type ORDER BY world_day DESC) AS recency
+        FROM world_economic_demand WHERE world_id=$1 AND world_day BETWEEN $2-2 AND $2),
+      latest AS (SELECT * FROM recent WHERE recency=1), persistent AS (
+        SELECT service_type FROM recent WHERE unmet_count>0 GROUP BY service_type HAVING count(*)>=2)
+      SELECT COALESCE(sum(latest.unmet_count),0)::int AS "persistentUnmetDemand",
+        count(*)::int AS "persistentUnmetSectors"
+      FROM latest JOIN persistent USING(service_type)`, [worldId, worldDay]),
+    client.query(`SELECT
+        count(DISTINCT (agent_id,COALESCE(details->>'serviceType',candidate_id)))
+          FILTER (WHERE stage='recovery_candidate' AND reason_code='CANDIDATE_GENERATED')::int AS candidates,
+        count(DISTINCT event_key) FILTER (WHERE stage='recovery_action')::int AS actions,
+        count(DISTINCT (agent_id,details->>'serviceType')) FILTER (WHERE stage='shortage_observed')::int AS observations,
+        count(DISTINCT (agent_id,candidate_id)) FILTER (WHERE stage='eligible' AND action LIKE 'business_%')::int AS eligible,
+        count(DISTINCT (agent_id,candidate_id)) FILTER (WHERE stage='recovery_selected')::int AS selected
+      FROM world_emergence_events WHERE world_id=$1 AND system='business' AND world_minutes >= $2`,
+    [worldId, fromWorldMinutes]),
+    client.query(`SELECT count(*) FILTER (WHERE event_type='business_founded')::int AS births,
+        count(*) FILTER (WHERE event_type='business_reopened')::int AS reopens
+      FROM world_history WHERE world_id=$1 AND world_time >= $2`, [worldId, fromWorldMinutes]),
+    client.query(`SELECT count(*)::int AS entries FROM world_business_employment
+      WHERE world_id=$1 AND started_world_time >= $2`, [worldId, fromWorldMinutes]),
+    client.query(`SELECT count(*)::int AS replacements FROM world_agreements replacement
+      JOIN world_agreements failed ON failed.world_id=replacement.world_id
+        AND failed.id=replacement.parent_agreement_id
+      WHERE replacement.world_id=$1 AND failed.status='breached'
+        AND replacement.status IN ('accepted','active','completed') AND replacement.created_world_time >= $2`,
+    [worldId, fromWorldMinutes])
+  ]);
+  const recoveryRow = recovery.rows[0] || {};
+  const candidateCount = Number(recoveryRow.candidates) || 0;
+  const actionCount = Number(recoveryRow.actions) || 0;
+  const selectedCount = Number(recoveryRow.selected) || 0;
+  return { window: { fromWorldMinutes, toWorldMinutes: minute }, activeSupply: Number(supply.rows[0]?.activeSupply) || 0,
+    persistentUnmetDemand: Number(unmet.rows[0]?.persistentUnmetDemand) || 0,
+    persistentUnmetSectors: Number(unmet.rows[0]?.persistentUnmetSectors) || 0,
+    economicResponseRate: candidateCount ? selectedCount / candidateCount : 0,
+    recoveryCandidates: candidateCount, recoveryEligible: Number(recoveryRow.eligible) || 0,
+    recoverySelected: Number(recoveryRow.selected) || 0, recoveryActions: actionCount,
+    shortageObservations: Number(recoveryRow.observations) || 0,
+    businessBirths: Number(births.rows[0]?.births) || 0,
+    businessReopens: Number(births.rows[0]?.reopens) || 0,
+    employmentEntries: Number(employment.rows[0]?.entries) || 0,
+    failedContractReplacements: Number(replacements.rows[0]?.replacements) || 0 };
 }

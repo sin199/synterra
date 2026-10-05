@@ -615,6 +615,7 @@ function renderWorldEvolution() {
   const evolution = latestMapData?.worldEvolution;
   if (!evolution) return;
   const dashboard = evolution.dashboard || {};
+  const recovery = evolution.economy?.recovery || {};
   evolutionStats?.replaceChildren();
   for (const [label, value] of [
     ['居民', displayCount(dashboard.residents)], ['地点', displayCount(dashboard.places)],
@@ -628,7 +629,19 @@ function renderWorldEvolution() {
     ['就业关系', displayCount(evolution.economy?.dashboard?.employment_count)],
     ['企业累计收入', `${Number(evolution.economy?.dashboard?.business_revenue || 0).toLocaleString('en-US', { maximumFractionDigits: 2 })} USDC`],
     ['企业盈亏', `${Number(evolution.economy?.dashboard?.business_profit_loss || 0).toLocaleString('en-US', { maximumFractionDigits: 2 })} USDC`],
-    ['模拟投资额', `${Number(evolution.economy?.dashboard?.investment_volume || 0).toLocaleString('en-US', { maximumFractionDigits: 2 })} USDC`]
+    ['模拟投资额', `${Number(evolution.economy?.dashboard?.investment_volume || 0).toLocaleString('en-US', { maximumFractionDigits: 2 })} USDC`],
+    ['在营供给（库存单位）', displayCount(recovery.activeSupply)],
+    ['持续未满足需求', displayCount(recovery.persistentUnmetDemand)],
+    ['恢复候选（7日）', displayCount(recovery.recoveryCandidates)],
+    ['符合资格（7日）', displayCount(recovery.recoveryEligible)],
+    ['Fruitfly 入选（7日）', displayCount(recovery.recoverySelected)],
+    ['候选入选率（7日）', `${Math.round((Number(recovery.economicResponseRate) || 0) * 100)}%`],
+    ['恢复行动（7日）', displayCount(recovery.recoveryActions)],
+    ['缺货观察（7日）', displayCount(recovery.shortageObservations)],
+    ['新生企业（7日）', displayCount(recovery.businessBirths)],
+    ['重开企业（7日）', displayCount(recovery.businessReopens)],
+    ['新增就业（7日）', displayCount(recovery.employmentEntries)],
+    ['违约供应替代（7日）', displayCount(recovery.failedContractReplacements)]
   ]) {
     const item = document.createElement('div');
     item.className = 'world-evolution-stat';
@@ -692,7 +705,8 @@ function renderWorldEvolution() {
     `需求 ${item.demandCount} · 供给 ${item.supplyCount} · 未满足 ${item.unmetCount}`);
   renderEvolutionList(historyList, evolution.history, '世界还没有留下重要历史。', (item) =>
     `${item.detail || item.eventType || ''} · 第 ${Math.max(1, Math.floor(Number(item.worldTime || 0) / 1_440) + 1)} 天`);
-  const systemLabels = { opportunity: '机会', project: '项目', organization: '组织', information: '信息分享', place: '新地点', goal: '目标' };
+  const systemLabels = { opportunity: '机会', project: '项目', organization: '组织', information: '信息分享',
+    place: '新地点', goal: '目标', business: '经济恢复' };
   const stageLabels = { considered: '已考虑', eligible: '符合资格', blocked: '被阻塞', not_selected: 'Fruitfly 未选',
     fruitfly_selected: 'Fruitfly 已选', created: '已创建', accepted: '已接受', expired: '已过期', proposed: '已提案',
     joined: '已加入', rejected: '已拒绝', active: '进行中', completed: '已完成', failed: '失败', abandoned: '已放弃',
@@ -701,12 +715,16 @@ function renderWorldEvolution() {
   const actionLabels = { opportunity_propose: '发起机会', opportunity: '参与机会', project_propose: '发起项目',
     project_join: '加入项目', project_contribute: '项目投入', organization_found: '发起组织',
     organization_join: '加入组织', information_share: '分享信息', information_accept: '采纳信息',
-    goal_review: '目标复盘' };
+    goal_review: '目标复盘', business_market_observe: '观察市场缺口', business_found: '创办企业',
+    business_reopen: '重开企业', business_seek_cofounder: '寻找合伙人', business_skill_practice: '练习经营技能',
+    business_apply: '申请工作', business_work: '企业生产', business_invest: '投资企业', agreement_propose: '提出供应协议' };
   const reasonLabels = { NONE: '无阻塞', UTILITY_BELOW_THRESHOLD: 'Utility 低于门槛', FRUITFLY_NOT_SELECTED: 'Fruitfly 选择了其他候选',
     NO_COMPATIBLE_GOAL: '没有兼容目标', INSUFFICIENT_TRUST: '信任不足', INSUFFICIENT_SHARED_WORK: '共同工作不足',
     NO_PARTNER: '没有合适伙伴', NO_INFORMATION_ASYMMETRY: '没有信息差', NO_SCARCITY: '没有真实短缺',
     SCENE_CONGESTION: '场景拥挤', GOAL_STAGNANT: '目标长期停滞', GOAL_PROGRESSING: '目标仍在推进',
     ENERGY_LOW: '精力不足', FOOD_LOW: '食物不足', CAPACITY: '容量已满', COOLDOWN: '冷却中',
+    NO_CAPABILITY: '能力不足', NO_CAPITAL: '资本不足', NO_MARKET_KNOWLEDGE: '尚未观察市场',
+    RISK_TOO_HIGH: '风险过高', NO_STRATEGIC_SLOT: '战略候选位已占满', OTHER: '其他阻塞',
     NEEDS_HARD_GATE: '需求硬约束阻止', INCOMPATIBLE_GOALS: '目标不兼容', DEADLINE_PASSED: '项目逾期' };
   const emergence = evolution.emergence || {};
   const counts = (emergence.counts || []).map((item) => ({ ...item,
