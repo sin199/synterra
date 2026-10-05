@@ -774,9 +774,13 @@ CREATE TABLE IF NOT EXISTS world_decision_traces (
   utility_scores jsonb NOT NULL CHECK (jsonb_typeof(utility_scores) = 'object'),
   goal_snapshot jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(goal_snapshot) = 'object'),
   rationale jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(rationale) = 'object'),
+  source_key text,
   created_at timestamptz NOT NULL DEFAULT now(),
   FOREIGN KEY (world_id,agent_id) REFERENCES world_members(world_id,agent_id) ON DELETE CASCADE
 );
+ALTER TABLE world_decision_traces ADD COLUMN IF NOT EXISTS source_key text;
+CREATE UNIQUE INDEX IF NOT EXISTS world_decision_traces_source_key_idx
+  ON world_decision_traces(world_id,source_key) WHERE source_key IS NOT NULL;
 CREATE INDEX IF NOT EXISTS world_decision_traces_recent_idx
   ON world_decision_traces(world_id,agent_id,tick_count DESC,id DESC);
 
@@ -1539,6 +1543,326 @@ ALTER TABLE world_business_production ADD COLUMN IF NOT EXISTS agreement_id uuid
 ALTER TABLE world_business_orders ADD COLUMN IF NOT EXISTS agreement_id uuid REFERENCES world_agreements(id) ON DELETE SET NULL;
 ALTER TABLE world_agent_states ADD COLUMN IF NOT EXISTS next_institutional_review_world_minutes bigint;
 
+-- V6 gives residents a persistent, versioned capability layer. Capabilities
+-- are declarative compositions interpreted by an allowlisted runtime; they
+-- never contain executable source code.
+ALTER TABLE world_agent_states ADD COLUMN IF NOT EXISTS next_civilization_review_world_minutes bigint;
+
+CREATE TABLE IF NOT EXISTS world_epochs (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  world_id uuid NOT NULL REFERENCES worlds(id) ON DELETE CASCADE,
+  epoch_code text NOT NULL CHECK (epoch_code ~ '^V[0-9]+(\.[0-9]+)?$'),
+  name text NOT NULL CHECK (char_length(name) BETWEEN 3 AND 120),
+  status text NOT NULL DEFAULT 'active' CHECK (status IN ('active','historic')),
+  started_world_minute bigint NOT NULL CHECK (started_world_minute >= 0),
+  started_at timestamptz NOT NULL DEFAULT now(),
+  description text NOT NULL CHECK (char_length(description) BETWEEN 1 AND 600),
+  metadata jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(metadata)='object'),
+  UNIQUE (world_id,epoch_code),
+  UNIQUE (world_id,id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS world_epochs_active_idx ON world_epochs(world_id) WHERE status='active';
+
+CREATE TABLE IF NOT EXISTS world_capability_gaps (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  world_id uuid NOT NULL REFERENCES worlds(id) ON DELETE CASCADE,
+  gap_key text NOT NULL CHECK (char_length(gap_key) BETWEEN 3 AND 160),
+  category text NOT NULL CHECK (category ~ '^[a-z][a-z0-9_.-]{1,79}$'),
+  problem_statement text NOT NULL CHECK (char_length(problem_statement) BETWEEN 8 AND 600),
+  status text NOT NULL DEFAULT 'open' CHECK (status IN ('open','addressed','resolved','stale')),
+  observation_count integer NOT NULL DEFAULT 1 CHECK (observation_count > 0),
+  first_observed_world_minute bigint NOT NULL CHECK (first_observed_world_minute >= 0),
+  last_observed_world_minute bigint NOT NULL CHECK (last_observed_world_minute >= 0),
+  evidence jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(evidence)='object'),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (world_id,gap_key),
+  UNIQUE (world_id,id)
+);
+CREATE INDEX IF NOT EXISTS world_capability_gaps_open_idx
+  ON world_capability_gaps(world_id,status,last_observed_world_minute DESC);
+
+CREATE TABLE IF NOT EXISTS world_capability_observations (
+  id bigserial PRIMARY KEY,
+  world_id uuid NOT NULL REFERENCES worlds(id) ON DELETE CASCADE,
+  gap_id uuid NOT NULL,
+  agent_id uuid NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+  observed_world_day bigint NOT NULL CHECK (observed_world_day >= 0),
+  observed_world_minute bigint NOT NULL CHECK (observed_world_minute >= 0),
+  observation_path text NOT NULL CHECK (observation_path ~ '^[a-z][a-z0-9_.-]{1,79}$'),
+  evidence jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(evidence)='object'),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (world_id,gap_id,agent_id,observed_world_day),
+  FOREIGN KEY (world_id,gap_id) REFERENCES world_capability_gaps(world_id,id) ON DELETE CASCADE,
+  FOREIGN KEY (world_id,agent_id) REFERENCES world_members(world_id,agent_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS world_capability_observations_agent_idx
+  ON world_capability_observations(world_id,agent_id,observed_world_minute DESC);
+
+CREATE TABLE IF NOT EXISTS world_capabilities (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  world_id uuid NOT NULL REFERENCES worlds(id) ON DELETE CASCADE,
+  capability_key text NOT NULL CHECK (char_length(capability_key) BETWEEN 2 AND 120),
+  category text NOT NULL CHECK (category ~ '^[a-z][a-z0-9_.-]{1,79}$'),
+  name text NOT NULL CHECK (char_length(name) BETWEEN 3 AND 120),
+  description text NOT NULL CHECK (char_length(description) BETWEEN 8 AND 600),
+  status text NOT NULL DEFAULT 'experimental' CHECK (status IN ('proposed','experimental','active','deprecated','rejected')),
+  version integer NOT NULL DEFAULT 1 CHECK (version > 0),
+  parent_capability_id uuid,
+  creator_type text NOT NULL DEFAULT 'system' CHECK (creator_type IN ('system','resident','organization')),
+  creator_agent_id uuid REFERENCES agents(id) ON DELETE SET NULL,
+  creator_organization_id uuid REFERENCES world_organizations(id) ON DELETE SET NULL,
+  specification jsonb NOT NULL CHECK (jsonb_typeof(specification)='object'),
+  experiment_scope jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(experiment_scope)='object'),
+  created_world_minute bigint NOT NULL CHECK (created_world_minute >= 0),
+  adopted_world_minute bigint,
+  usage_count bigint NOT NULL DEFAULT 0 CHECK (usage_count >= 0),
+  success_count bigint NOT NULL DEFAULT 0 CHECK (success_count >= 0),
+  failure_count bigint NOT NULL DEFAULT 0 CHECK (failure_count >= 0),
+  metadata jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(metadata)='object'),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (world_id,capability_key,version),
+  UNIQUE (world_id,id),
+  FOREIGN KEY (world_id,parent_capability_id) REFERENCES world_capabilities(world_id,id) ON DELETE SET NULL (parent_capability_id)
+);
+CREATE INDEX IF NOT EXISTS world_capabilities_status_idx
+  ON world_capabilities(world_id,status,category,name);
+CREATE INDEX IF NOT EXISTS world_capabilities_parent_idx
+  ON world_capabilities(world_id,parent_capability_id,version);
+
+CREATE TABLE IF NOT EXISTS world_capability_proposals (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  world_id uuid NOT NULL REFERENCES worlds(id) ON DELETE CASCADE,
+  gap_id uuid NOT NULL,
+  creator_type text NOT NULL CHECK (creator_type IN ('resident','organization')),
+  creator_agent_id uuid REFERENCES agents(id) ON DELETE SET NULL,
+  creator_organization_id uuid REFERENCES world_organizations(id) ON DELETE SET NULL,
+  action_id text NOT NULL CHECK (char_length(action_id) BETWEEN 8 AND 180),
+  category text NOT NULL CHECK (category ~ '^[a-z][a-z0-9_.-]{1,79}$'),
+  name text NOT NULL CHECK (char_length(name) BETWEEN 3 AND 120),
+  problem_statement text NOT NULL CHECK (char_length(problem_statement) BETWEEN 8 AND 600),
+  proposed_capability jsonb NOT NULL CHECK (jsonb_typeof(proposed_capability)='object'),
+  expected_benefit text NOT NULL CHECK (char_length(expected_benefit) BETWEEN 3 AND 600),
+  expected_cost jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(expected_cost)='object'),
+  required_resources jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(required_resources)='object'),
+  affected_systems jsonb NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(affected_systems)='array'),
+  status text NOT NULL DEFAULT 'proposed' CHECK (status IN ('proposed','reviewed','revised','experimental','evaluated','adopted','rejected','abandoned')),
+  revision integer NOT NULL DEFAULT 1 CHECK (revision > 0),
+  revision_of_proposal_id uuid,
+  capability_id uuid,
+  support_count integer NOT NULL DEFAULT 0 CHECK (support_count >= 0),
+  opposition_count integer NOT NULL DEFAULT 0 CHECK (opposition_count >= 0),
+  created_world_minute bigint NOT NULL CHECK (created_world_minute >= 0),
+  updated_world_minute bigint NOT NULL CHECK (updated_world_minute >= 0),
+  expires_world_minute bigint,
+  metadata jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(metadata)='object'),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (world_id,action_id),
+  UNIQUE (world_id,id),
+  FOREIGN KEY (world_id,gap_id) REFERENCES world_capability_gaps(world_id,id) ON DELETE RESTRICT,
+  FOREIGN KEY (world_id,revision_of_proposal_id) REFERENCES world_capability_proposals(world_id,id) ON DELETE RESTRICT,
+  FOREIGN KEY (world_id,capability_id) REFERENCES world_capabilities(world_id,id) ON DELETE SET NULL (capability_id)
+);
+ALTER TABLE world_capability_proposals ADD COLUMN IF NOT EXISTS expires_world_minute bigint;
+CREATE INDEX IF NOT EXISTS world_capability_proposals_status_idx
+  ON world_capability_proposals(world_id,status,updated_world_minute DESC);
+CREATE INDEX IF NOT EXISTS world_capability_proposals_creator_idx
+  ON world_capability_proposals(world_id,creator_agent_id,created_world_minute DESC);
+
+CREATE TABLE IF NOT EXISTS world_capability_experiments (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  world_id uuid NOT NULL REFERENCES worlds(id) ON DELETE CASCADE,
+  proposal_id uuid NOT NULL,
+  capability_id uuid NOT NULL,
+  scope_type text NOT NULL CHECK (scope_type IN ('resident_set','organization','project','place')),
+  scope_id uuid,
+  participant_agent_ids jsonb NOT NULL CHECK (jsonb_typeof(participant_agent_ids)='array'),
+  status text NOT NULL DEFAULT 'running' CHECK (status IN ('running','evaluated','adopted','revised','rejected','abandoned')),
+  started_world_minute bigint NOT NULL CHECK (started_world_minute >= 0),
+  ends_world_minute bigint NOT NULL CHECK (ends_world_minute > started_world_minute),
+  evaluated_world_minute bigint,
+  evidence jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(evidence)='object'),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (world_id,id),
+  FOREIGN KEY (world_id,proposal_id) REFERENCES world_capability_proposals(world_id,id) ON DELETE RESTRICT,
+  FOREIGN KEY (world_id,capability_id) REFERENCES world_capabilities(world_id,id) ON DELETE RESTRICT
+);
+CREATE INDEX IF NOT EXISTS world_capability_experiments_status_idx
+  ON world_capability_experiments(world_id,status,ends_world_minute);
+
+CREATE TABLE IF NOT EXISTS world_capability_reviews (
+  id bigserial PRIMARY KEY,
+  world_id uuid NOT NULL REFERENCES worlds(id) ON DELETE CASCADE,
+  proposal_id uuid NOT NULL,
+  experiment_id uuid,
+  reviewer_agent_id uuid REFERENCES agents(id) ON DELETE SET NULL,
+  reviewer_organization_id uuid REFERENCES world_organizations(id) ON DELETE SET NULL,
+  review_stage text NOT NULL CHECK (review_stage IN ('proposal','experiment')),
+  decision text NOT NULL CHECK (decision IN ('support','oppose','modify','ignore')),
+  rationale text NOT NULL CHECK (char_length(rationale) BETWEEN 3 AND 600),
+  suggested_specification jsonb CHECK (suggested_specification IS NULL OR jsonb_typeof(suggested_specification)='object'),
+  evidence jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(evidence)='object'),
+  created_world_minute bigint NOT NULL CHECK (created_world_minute >= 0),
+  action_id text NOT NULL CHECK (char_length(action_id) BETWEEN 8 AND 180),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (world_id,action_id),
+  FOREIGN KEY (world_id,proposal_id) REFERENCES world_capability_proposals(world_id,id) ON DELETE CASCADE,
+  FOREIGN KEY (world_id,experiment_id) REFERENCES world_capability_experiments(world_id,id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS world_capability_reviews_proposal_idx
+  ON world_capability_reviews(world_id,proposal_id,review_stage,created_world_minute DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS world_capability_proposals_one_review_idx
+  ON world_capability_reviews(world_id,proposal_id,reviewer_agent_id)
+  WHERE review_stage='proposal' AND reviewer_agent_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS world_capability_uses (
+  id bigserial PRIMARY KEY,
+  world_id uuid NOT NULL REFERENCES worlds(id) ON DELETE CASCADE,
+  capability_id uuid NOT NULL,
+  experiment_id uuid,
+  actor_agent_id uuid NOT NULL REFERENCES agents(id) ON DELETE RESTRICT,
+  partner_agent_id uuid REFERENCES agents(id) ON DELETE SET NULL,
+  action_id text NOT NULL CHECK (char_length(action_id) BETWEEN 8 AND 180),
+  decision_source text NOT NULL DEFAULT 'agent_api'
+    CHECK (decision_source IN ('agent_api','fruitfly','utility_fallback')),
+  world_minute bigint NOT NULL CHECK (world_minute >= 0),
+  status text NOT NULL CHECK (status IN ('completed','failed','abandoned')),
+  success boolean NOT NULL,
+  costs jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(costs)='object'),
+  effects jsonb NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(effects)='array'),
+  side_effects jsonb NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(side_effects)='array'),
+  result jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(result)='object'),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (world_id,action_id),
+  FOREIGN KEY (world_id,capability_id) REFERENCES world_capabilities(world_id,id) ON DELETE RESTRICT,
+  FOREIGN KEY (world_id,experiment_id) REFERENCES world_capability_experiments(world_id,id) ON DELETE RESTRICT
+);
+ALTER TABLE world_capability_uses ADD COLUMN IF NOT EXISTS decision_source text NOT NULL DEFAULT 'agent_api'
+  CHECK (decision_source IN ('agent_api','fruitfly','utility_fallback'));
+CREATE INDEX IF NOT EXISTS world_capability_uses_capability_idx
+  ON world_capability_uses(world_id,capability_id,world_minute DESC);
+
+CREATE TABLE IF NOT EXISTS world_capability_events (
+  id bigserial PRIMARY KEY,
+  world_id uuid NOT NULL REFERENCES worlds(id) ON DELETE CASCADE,
+  actor_agent_id uuid REFERENCES agents(id) ON DELETE SET NULL,
+  gap_id uuid,
+  proposal_id uuid,
+  capability_id uuid,
+  experiment_id uuid,
+  event_type text NOT NULL CHECK (event_type ~ '^[a-z][a-z0-9_]{1,63}$'),
+  event_key text NOT NULL,
+  world_minute bigint NOT NULL CHECK (world_minute >= 0),
+  details jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(details)='object'),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (world_id,event_key),
+  FOREIGN KEY (world_id,gap_id) REFERENCES world_capability_gaps(world_id,id) ON DELETE SET NULL (gap_id),
+  FOREIGN KEY (world_id,proposal_id) REFERENCES world_capability_proposals(world_id,id) ON DELETE SET NULL (proposal_id),
+  FOREIGN KEY (world_id,capability_id) REFERENCES world_capabilities(world_id,id) ON DELETE SET NULL (capability_id),
+  FOREIGN KEY (world_id,experiment_id) REFERENCES world_capability_experiments(world_id,id) ON DELETE SET NULL (experiment_id)
+);
+CREATE INDEX IF NOT EXISTS world_capability_events_recent_idx
+  ON world_capability_events(world_id,world_minute DESC,id DESC);
+
+CREATE UNIQUE INDEX IF NOT EXISTS agent_memories_world_epoch_once_idx
+  ON agent_memories(world_id,agent_id,consolidation_key)
+  WHERE consolidation_key LIKE 'world_epoch:%';
+
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_history'::regclass
+      AND conname='world_history_event_type_check'
+      AND pg_get_constraintdef(oid) LIKE '%world_epoch_started%') THEN
+    ALTER TABLE world_history DROP CONSTRAINT IF EXISTS world_history_event_type_check;
+    ALTER TABLE world_history ADD CONSTRAINT world_history_event_type_check CHECK (
+      event_type IN ('opportunity_created','project_proposed','project_started','project_completed','project_failed',
+        'organization_founded','organization_joined','organization_left','organization_invited','place_created',
+        'place_maintenance','place_closed','information_shared','information_accepted','information_doubted','information_ignored',
+        'cooperation_completed','milestone','project_invested','project_revenue','business_founded','business_invested',
+        'business_reopened','business_first_customer','business_revenue','business_profit','business_loss','business_closed',
+        'business_employment','business_price_changed','business_partnership','business_capability_practiced','economic_purchase',
+        'agreement_proposed','agreement_countered','agreement_accepted','agreement_rejected','agreement_completed','agreement_breached',
+        'organization_rule_changed','organization_proposal','organization_leadership_changed','norm_formed','ownership_transferred')
+      OR event_type ~ '^agreement_[a-z_]+$'
+      OR event_type ~ '^(capability|world_epoch)_[a-z_]+$'
+    );
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_history'::regclass
+      AND conname='world_history_entity_type_check'
+      AND pg_get_constraintdef(oid) LIKE '%capability_proposal%') THEN
+    ALTER TABLE world_history DROP CONSTRAINT IF EXISTS world_history_entity_type_check;
+    ALTER TABLE world_history ADD CONSTRAINT world_history_entity_type_check CHECK (
+      entity_type IN ('opportunity','project','organization','place','cooperation','world','business','job','order','agreement','norm',
+        'capability','capability_proposal')
+    );
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_agent_states'::regclass
+      AND conname='world_agent_states_planned_action_check'
+      AND pg_get_constraintdef(oid) LIKE '%capability_use%') THEN
+    ALTER TABLE world_agent_states DROP CONSTRAINT IF EXISTS world_agent_states_planned_action_check;
+    ALTER TABLE world_agent_states ADD CONSTRAINT world_agent_states_planned_action_check CHECK (
+      planned_action IS NULL OR planned_action IN (
+        'work','learn','rest','eat','socialize','trade','cooperate','opportunity','opportunity_reject','opportunity_propose',
+        'project_propose','project_join','project_reject','project_contribute','project_leave','organization_found','organization_join',
+        'organization_leave','organization_invite','organization_reject','organization_contribute','place_create','information_share',
+        'information_accept','information_ignore','information_doubt','goal_review','project_invest','project_distribute',
+        'business_found','business_service','business_apply','business_withdraw','business_leave','business_hire','business_work',
+        'business_invest','business_reject','business_price','business_distribute','business_close','business_skill_practice',
+        'business_seek_cofounder','business_market_observe','business_reopen','agreement_propose','agreement_respond',
+        'commitment_resolve','organization_propose','organization_vote','capability_use'
+      )
+    );
+  END IF;
+END $$;
+
+-- Keep V6 event and action vocabularies after all compatibility blocks above.
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_history'::regclass
+      AND conname='world_history_event_type_check' AND pg_get_constraintdef(oid) LIKE '%world_epoch_started%') THEN
+    ALTER TABLE world_history DROP CONSTRAINT IF EXISTS world_history_event_type_check;
+    ALTER TABLE world_history ADD CONSTRAINT world_history_event_type_check CHECK (
+      event_type IN ('opportunity_created','project_proposed','project_started','project_completed','project_failed',
+        'organization_founded','organization_joined','organization_left','organization_invited','place_created',
+        'place_maintenance','place_closed','information_shared','information_accepted','information_doubted','information_ignored',
+        'cooperation_completed','milestone','project_invested','project_revenue','business_founded','business_invested',
+        'business_reopened','business_first_customer','business_revenue','business_profit','business_loss','business_closed',
+        'business_employment','business_price_changed','business_partnership','business_capability_practiced','economic_purchase',
+        'agreement_proposed','agreement_countered','agreement_accepted','agreement_rejected','agreement_completed','agreement_breached',
+        'organization_rule_changed','organization_proposal','organization_leadership_changed','norm_formed','ownership_transferred')
+      OR event_type ~ '^agreement_[a-z_]+$'
+      OR event_type ~ '^(capability|world_epoch)_[a-z_]+$'
+    );
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_history'::regclass
+      AND conname='world_history_entity_type_check' AND pg_get_constraintdef(oid) LIKE '%capability_proposal%') THEN
+    ALTER TABLE world_history DROP CONSTRAINT IF EXISTS world_history_entity_type_check;
+    ALTER TABLE world_history ADD CONSTRAINT world_history_entity_type_check CHECK (
+      entity_type IN ('opportunity','project','organization','place','cooperation','world','business','job','order',
+        'agreement','norm','capability','capability_proposal')
+    );
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_agent_states'::regclass
+      AND conname='world_agent_states_planned_action_check' AND pg_get_constraintdef(oid) LIKE '%capability_use%') THEN
+    ALTER TABLE world_agent_states DROP CONSTRAINT IF EXISTS world_agent_states_planned_action_check;
+    ALTER TABLE world_agent_states ADD CONSTRAINT world_agent_states_planned_action_check CHECK (
+      planned_action IS NULL OR planned_action IN (
+        'work','learn','rest','eat','socialize','trade','cooperate','opportunity','opportunity_reject','opportunity_propose',
+        'project_propose','project_join','project_reject','project_contribute','project_leave','organization_found','organization_join',
+        'organization_leave','organization_invite','organization_reject','organization_contribute','place_create','information_share',
+        'information_accept','information_ignore','information_doubt','goal_review','project_invest','project_distribute',
+        'business_found','business_service','business_apply','business_withdraw','business_leave','business_hire','business_work',
+        'business_invest','business_reject','business_price','business_distribute','business_close','business_skill_practice',
+        'business_seek_cofounder','business_market_observe','business_reopen','agreement_propose','agreement_respond',
+        'commitment_resolve','organization_propose','organization_vote','capability_use'
+      )
+    );
+  END IF;
+END $$;
+
 -- Backfill active V4 jobs as agreements without changing their current wages,
 -- balances, application status, or transaction history.
 INSERT INTO world_agreements(world_id,agreement_type,proposer_agent_id,counterparty_agent_id,terms,status,
@@ -1568,12 +1892,14 @@ BEGIN
       AND conname='world_economic_transactions_transaction_type_check'
       AND pg_get_constraintdef(oid) LIKE '%ownership_transfer%'
       AND pg_get_constraintdef(oid) LIKE '%business_revenue_share%'
-      AND pg_get_constraintdef(oid) LIKE '%business_reopen%') THEN
+      AND pg_get_constraintdef(oid) LIKE '%business_reopen%'
+      AND pg_get_constraintdef(oid) LIKE '%capability_service%') THEN
     ALTER TABLE world_economic_transactions DROP CONSTRAINT IF EXISTS world_economic_transactions_transaction_type_check;
     ALTER TABLE world_economic_transactions ADD CONSTRAINT world_economic_transactions_transaction_type_check
       CHECK (transaction_type IN ('opening_balance','simulation_seed','business_found','business_investment','business_reopen','business_revenue',
         'business_expense','business_wage','profit_distribution','project_investment','organization_contribution','place_revenue',
-        'consumption','exchange_trade','maintenance','world_reward','refund','ownership_transfer','business_revenue_share','resource_transfer'));
+        'consumption','exchange_trade','maintenance','world_reward','refund','ownership_transfer','business_revenue_share',
+        'resource_transfer','capability_service'));
   END IF;
 END $$;
 CREATE INDEX IF NOT EXISTS world_businesses_active_idx ON world_businesses(world_id,status,reputation DESC);
@@ -1894,7 +2220,8 @@ BEGIN
       AND conname='world_agent_states_planned_action_check' AND pg_get_constraintdef(oid) LIKE '%agreement_propose%'
       AND pg_get_constraintdef(oid) LIKE '%organization_vote%'
       AND pg_get_constraintdef(oid) LIKE '%business_market_observe%'
-      AND pg_get_constraintdef(oid) LIKE '%business_reopen%') THEN
+      AND pg_get_constraintdef(oid) LIKE '%business_reopen%'
+      AND pg_get_constraintdef(oid) LIKE '%capability_use%') THEN
     ALTER TABLE world_agent_states DROP CONSTRAINT IF EXISTS world_agent_states_planned_action_check;
     ALTER TABLE world_agent_states ADD CONSTRAINT world_agent_states_planned_action_check CHECK (planned_action IS NULL OR planned_action IN (
       'work','learn','rest','eat','socialize','trade','cooperate','opportunity','opportunity_reject','opportunity_propose',
@@ -1904,6 +2231,51 @@ BEGIN
       'business_found','business_service','business_apply','business_withdraw','business_leave','business_hire','business_work',
       'business_invest','business_reject','business_price','business_distribute','business_close','business_skill_practice',
       'business_seek_cofounder','business_market_observe','business_reopen','agreement_propose','agreement_respond',
-      'commitment_resolve','organization_propose','organization_vote'));
+      'commitment_resolve','organization_propose','organization_vote','capability_use'));
+  END IF;
+END $$;
+
+-- Re-apply the open V6 event vocabulary after V5's compatibility DDL.
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_history'::regclass
+      AND conname='world_history_event_type_check' AND pg_get_constraintdef(oid) LIKE '%world_epoch_started%') THEN
+    ALTER TABLE world_history DROP CONSTRAINT IF EXISTS world_history_event_type_check;
+    ALTER TABLE world_history ADD CONSTRAINT world_history_event_type_check CHECK (
+      event_type IN ('opportunity_created','project_proposed','project_started','project_completed','project_failed',
+        'organization_founded','organization_joined','organization_left','organization_invited','place_created',
+        'place_maintenance','place_closed','information_shared','information_accepted','information_doubted','information_ignored',
+        'cooperation_completed','milestone','project_invested','project_revenue','business_founded','business_invested',
+        'business_reopened','business_first_customer','business_revenue','business_profit','business_loss','business_closed',
+        'business_employment','business_price_changed','business_partnership','business_capability_practiced','economic_purchase',
+        'agreement_proposed','agreement_countered','agreement_accepted','agreement_rejected','agreement_completed','agreement_breached',
+        'organization_rule_changed','organization_proposal','organization_leadership_changed','norm_formed','ownership_transferred')
+      OR event_type ~ '^agreement_[a-z_]+$'
+      OR event_type ~ '^(capability|world_epoch)_[a-z_]+$'
+    );
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_history'::regclass
+      AND conname='world_history_entity_type_check' AND pg_get_constraintdef(oid) LIKE '%capability_proposal%') THEN
+    ALTER TABLE world_history DROP CONSTRAINT IF EXISTS world_history_entity_type_check;
+    ALTER TABLE world_history ADD CONSTRAINT world_history_entity_type_check CHECK (
+      entity_type IN ('opportunity','project','organization','place','cooperation','world','business','job','order',
+        'agreement','norm','capability','capability_proposal')
+    );
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_agent_states'::regclass
+      AND conname='world_agent_states_planned_action_check' AND pg_get_constraintdef(oid) LIKE '%capability_use%') THEN
+    ALTER TABLE world_agent_states DROP CONSTRAINT IF EXISTS world_agent_states_planned_action_check;
+    ALTER TABLE world_agent_states ADD CONSTRAINT world_agent_states_planned_action_check CHECK (
+      planned_action IS NULL OR planned_action IN (
+        'work','learn','rest','eat','socialize','trade','cooperate','opportunity','opportunity_reject','opportunity_propose',
+        'project_propose','project_join','project_reject','project_contribute','project_leave','organization_found','organization_join',
+        'organization_leave','organization_invite','organization_reject','organization_contribute','place_create','information_share',
+        'information_accept','information_ignore','information_doubt','goal_review','project_invest','project_distribute',
+        'business_found','business_service','business_apply','business_withdraw','business_leave','business_hire','business_work',
+        'business_invest','business_reject','business_price','business_distribute','business_close','business_skill_practice',
+        'business_seek_cofounder','business_market_observe','business_reopen','agreement_propose','agreement_respond',
+        'commitment_resolve','organization_propose','organization_vote','capability_use'
+      )
+    );
   END IF;
 END $$;

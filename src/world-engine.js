@@ -35,6 +35,8 @@ import { applyToWorldBusinessJob, buildBusinessCandidates, closeWorldBusiness,
   practiceWorldBusinessCapability, reviewWorldBusinessPrice, settleWorldBusinessMaintenance,
   withdrawWorldBusinessApplication,
   settleWorldPlaceMaintenance, explainBusinessOpportunityGaps } from './world-businesses.js';
+import { advanceWorldCivilization, buildCapabilityUseCandidates, initializeWorldCivilization,
+  listWorldCapabilityUses, performWorldCapabilityUse, CIVILIZATION_REVIEW_INTERVAL_MINUTES } from './world-capabilities.js';
 
 export const WORLD_TICK_MS = 1_000;
 const TYPE_SAFE_INTERVAL_MS = 30 * 60_000;
@@ -50,7 +52,8 @@ const ACTION_SECONDS = Object.freeze({ work: 16, cooperate: 16, learn: 11, rest:
   business_withdraw: 6,
   business_work: 16, business_invest: 12, business_price: 10, business_distribute: 10, business_close: 10,
   business_skill_practice: 12, business_seek_cofounder: 14, business_market_observe: 12, business_reopen: 18,
-  agreement_propose: 12, agreement_respond: 8, commitment_resolve: 8, organization_propose: 12, organization_vote: 8 });
+  agreement_propose: 12, agreement_respond: 8, commitment_resolve: 8, organization_propose: 12, organization_vote: 8,
+  capability_use: 15 });
 const GOALS = Object.freeze(['wealth','learn','community','wellbeing','balanced','wealth','learn','community','wellbeing','balanced']);
 const RISK_TOLERANCE = Object.freeze([0.78,0.28,0.52,0.22,0.68,0.35,0.82,0.47,0.70,0.40]);
 const ALLOWED_GOALS = new Set(['wealth','learn','community','wellbeing','balanced']);
@@ -519,8 +522,12 @@ export async function pruneResidentMemories(client, worldId, agentId) {
     SELECT id FROM agent_memories WHERE world_id=$1 AND agent_id=$2 AND long_term=false
     ORDER BY importance DESC,world_minutes DESC,id DESC OFFSET 100)`, [worldId, agentId]);
   await client.query(`DELETE FROM agent_memories WHERE id IN (
-    SELECT id FROM agent_memories WHERE world_id=$1 AND agent_id=$2 AND long_term=true
-    ORDER BY importance DESC,world_minutes DESC,id DESC OFFSET 20)`, [worldId, agentId]);
+    SELECT memory.id FROM agent_memories memory WHERE memory.world_id=$1 AND memory.agent_id=$2 AND memory.long_term=true
+      AND (memory.consolidation_key IS NULL OR memory.consolidation_key NOT LIKE 'world_epoch:%')
+    ORDER BY memory.importance DESC,memory.world_minutes DESC,memory.id DESC
+    OFFSET GREATEST(0,20-(SELECT count(*) FROM agent_memories epoch_memory
+      WHERE epoch_memory.world_id=$1 AND epoch_memory.agent_id=$2 AND epoch_memory.long_term=true
+        AND epoch_memory.consolidation_key LIKE 'world_epoch:%')))`, [worldId, agentId]);
 }
 
 async function recordResidentMemory(client, { worldId, agentId, memoryType, summary, importance, worldMinutes,
@@ -1353,6 +1360,24 @@ async function completeActivity(client, worldId, agent, runtime, quotes, now, sc
         [worldId, agent.agentId, now]);
       needs.energy = -1;
     }
+  } else if (activity === 'capability_use') {
+    try {
+      const use = await performWorldCapabilityUse(client, { worldId, agentId: agent.agentId,
+        partnerId: agent.planned_partner_id || agent.planned_context?.capabilityContext?.partnerAgentId || null,
+        capabilityId: agent.planned_context?.capabilityId,
+        experimentId: agent.planned_context?.capabilityExperimentId || null,
+        selectionSource: agent.planned_context?.capabilitySelectionSource || 'utility_fallback',
+        actionId: actionId(agent.agentId, runtime.tick_count, 'capability-use'),
+        worldMinute: runtime.world_minutes, agentEnergy: agent.energy });
+      result.capability = use;
+      needs.energy = -Number(use.costs?.energy || 0);
+      needs.food = -Number(use.costs?.food || 0);
+    } catch (error) {
+      if (Number(error?.statusCode) >= 500 || !Number(error?.statusCode)) throw error;
+      result.abandoned = String(error.message || 'capability_use_unavailable').slice(0, 96);
+      needs.energy = -1;
+      needs.food = -1;
+    }
   } else if (['goal_review','opportunity','opportunity_reject','opportunity_propose','project_propose','project_join','project_reject','project_contribute','project_leave',
     'project_invest','project_distribute',
     'organization_found','organization_join','organization_reject','organization_leave','organization_invite',
@@ -1816,6 +1841,7 @@ async function runStrategicTypeSafe(pool, worldId, chooseWithTypeSafe, runtimeSt
 }
 
 export async function startWorldEngine(pool, { worldId: requestedWorldId = null, onError = () => {}, onStatus = () => {}, chooseWithTypeSafe = null,
+  chooseCivilizationOption = null,
   runtimeState = null, fruitfly = null, tickMs = WORLD_TICK_MS, nowProvider = () => Date.now(), schedule = true } = {}) {
   const worldResult = await pool.query(`SELECT w.id FROM worlds w WHERE w.open=true AND ($1::uuid IS NULL OR w.id=$1)
     ORDER BY w.created_at DESC LIMIT 1`, [requestedWorldId]);
@@ -1829,6 +1855,32 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
     lockClient.release();
     onStatus({ running: false, reason: 'another_server_owns_world_loop' });
     return { running: false, reason: 'another_server_owns_world_loop', stop: async () => {} };
+  }
+
+  try {
+    const initialize = await pool.connect();
+    try {
+      await initialize.query('BEGIN');
+      const clock = await initialize.query(`SELECT world_minutes FROM world_runtime_state WHERE world_id=$1 FOR UPDATE`, [worldId]);
+      if (!clock.rowCount) throw new Error('WORLD_RUNTIME_STATE_MISSING');
+      await initializeWorldCivilization(initialize, { worldId, worldMinute: Number(clock.rows[0].world_minutes) });
+        const unscheduled = await initialize.query(`SELECT agent_id FROM world_agent_states
+        WHERE world_id=$1 AND next_civilization_review_world_minutes IS NULL ORDER BY agent_id`, [worldId]);
+      for (const resident of unscheduled.rows) {
+        const phase = 1 + stableInt(`${worldId}:${resident.agent_id}:civilization-phase`) % CIVILIZATION_REVIEW_INTERVAL_MINUTES;
+        await initialize.query(`UPDATE world_agent_states SET next_civilization_review_world_minutes=$3
+          WHERE world_id=$1 AND agent_id=$2 AND next_civilization_review_world_minutes IS NULL`,
+        [worldId, resident.agent_id, Number(clock.rows[0].world_minutes) + phase]);
+      }
+      await initialize.query('COMMIT');
+    } catch (error) {
+      await initialize.query('ROLLBACK');
+      throw error;
+    } finally { initialize.release(); }
+  } catch (error) {
+    try { await lockClient.query(`SELECT pg_advisory_unlock(hashtextextended('synterra-world-engine',0))`); }
+    finally { lockClient.release(); }
+    throw error;
   }
 
   let stopped = false;
@@ -1926,6 +1978,7 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
             s.planned_partner_id AS planned_partner_id,s.planned_side,s.planned_asset,s.planned_quote_units::text AS planned_quote_units,s.planned_paid_meal,
             s.planned_context,s.next_strategic_decision_world_minutes AS next_strategic_decision_world_minutes,
             s.next_institutional_review_world_minutes AS next_institutional_review_world_minutes,
+            s.next_civilization_review_world_minutes AS next_civilization_review_world_minutes,
             s.strategic_goal_category AS strategic_goal_category,
             s.strategic_goal_progress::text AS strategic_goal_progress,
             s.strategic_goal_progress_world_minutes AS strategic_goal_progress_world_minutes,
@@ -1954,9 +2007,12 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
                 'summary',recent.summary,'importance',recent.importance,'worldMinutes',recent.world_minutes,
                 'location',recent.location,'relatedAgentId',recent.related_agent_id,'metadata',recent.metadata)
                 ORDER BY recent.world_minutes DESC,recent.id DESC)
-              FROM (SELECT id,memory_type,summary,importance,world_minutes,location,related_agent_id,metadata
-                FROM agent_memories WHERE world_id=m.world_id AND agent_id=m.agent_id
-                ORDER BY world_minutes DESC,id DESC LIMIT 12) recent),'[]'::jsonb) AS recent_memories,
+              FROM (SELECT memory.id,memory.memory_type,memory.summary,memory.importance,memory.world_minutes,
+                  memory.location,memory.related_agent_id,memory.metadata
+                FROM agent_memories memory WHERE memory.world_id=m.world_id AND memory.agent_id=m.agent_id
+                  AND (memory.consolidation_key LIKE 'world_epoch:%' OR memory.id IN (
+                    SELECT recent.id FROM agent_memories recent WHERE recent.world_id=m.world_id AND recent.agent_id=m.agent_id
+                    ORDER BY recent.world_minutes DESC,recent.id DESC LIMIT 12))) recent),'[]'::jsonb) AS recent_memories,
             COALESCE((SELECT jsonb_agg(jsonb_build_object('otherAgentId',recent.other_id,'name',recent.other_name,
                 'familiarity',recent.familiarity,'trust',recent.trust,'affinity',recent.affinity,
                 'interactionCount',recent.interaction_count,'lastInteractionWorldMinutes',recent.last_interaction_world_minutes)
@@ -1979,6 +2035,8 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
           FROM world_scenes
           WHERE world_id=$1 ORDER BY created_at,id`, [worldId]);
         const scenes = scenesResult.rows;
+        let capabilityOptions = await listWorldCapabilityUses(client, { worldId, limit: 100 });
+        const placeIdsByName = Object.fromEntries(scenes.map((scene) => [scene.name, scene.id]));
         const dueResidents = membersResult.rows.filter((member) => member.status === 'idle'
           && new Date(member.next_decision_at).getTime() <= now.getTime());
         let initiativeState = null;
@@ -2028,6 +2086,8 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
             lastTradeAt: row.last_trade_at, planned_paid_meal: row.planned_paid_meal,
             nextInstitutionalReviewWorldMinutes: row.next_institutional_review_world_minutes === null
               ? null : Number(row.next_institutional_review_world_minutes),
+            nextCivilizationReviewWorldMinutes: row.next_civilization_review_world_minutes === null
+              ? null : Number(row.next_civilization_review_world_minutes),
             social_partner_id: row.planned_partner_id,
             riskTolerance: clamp(finite(row.risk_tolerance) + finite(row.risk_modifier), 0, 1),
             priceSensitivity: finite(row.price_sensitivity, 0.5),
@@ -2040,6 +2100,24 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
             relationships: Array.isArray(row.relationships) ? row.relationships : [] };
           const initiativeData = initiativeState?.byAgent.get(agent.agentId) || {};
           Object.assign(agent, initiativeData);
+          if (agent.status === 'idle') {
+            let nextCivilizationAt = agent.nextCivilizationReviewWorldMinutes;
+            if (nextCivilizationAt === null || nextCivilizationAt === undefined) {
+              nextCivilizationAt = worldMinutes + 1
+                + stableInt(`${worldId}:${agent.agentId}:civilization-phase`) % CIVILIZATION_REVIEW_INTERVAL_MINUTES;
+              await client.query(`UPDATE world_agent_states SET next_civilization_review_world_minutes=$3,updated_at=$4
+                WHERE world_id=$1 AND agent_id=$2`, [worldId, agent.agentId, nextCivilizationAt, now]);
+            } else if (nextCivilizationAt <= worldMinutes) {
+              nextCivilizationAt = worldMinutes + CIVILIZATION_REVIEW_INTERVAL_MINUTES;
+              await client.query(`UPDATE world_agent_states SET next_civilization_review_world_minutes=$3,updated_at=$4
+                WHERE world_id=$1 AND agent_id=$2`, [worldId, agent.agentId, nextCivilizationAt, now]);
+              await advanceWorldCivilization(client, { worldId, agent, worldMinute: worldMinutes,
+                chooseWithTypeSafe: chooseCivilizationOption
+                  ? (request) => chooseCivilizationOption(request, runtimeState) : null });
+              capabilityOptions = await listWorldCapabilityUses(client, { worldId, limit: 100 });
+            }
+            agent.nextCivilizationReviewWorldMinutes = nextCivilizationAt;
+          }
           const lastReflection = row.last_reflection_world_minutes === null ? null : Number(row.last_reflection_world_minutes);
           const newImportantMemory = agent.recentMemories.some((memory) => Number(memory.importance) >= 0.7
             && Number(memory.worldMinutes) > (lastReflection ?? -1));
@@ -2086,8 +2164,12 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
                     primaryGoal: other.primary_goal, skills: safeJson(other.skills), relationship,
                     lastInteractionWorldMinutes: relationship?.lastInteractionWorldMinutes };
                 })]));
-          const utilityCandidates = buildActivityCandidates(agent, scenes, { tick: tickCount, worldMinutes, nowMs, quotes,
-              previousQuotes: priorSnapshot, residentsAt: placeCounts, residentsAtLocation });
+          const nativeUtilityCandidates = buildActivityCandidates(agent, scenes, { tick: tickCount, worldMinutes, nowMs, quotes,
+            previousQuotes: priorSnapshot, residentsAt: placeCounts, residentsAtLocation });
+          const capabilityCandidates = await buildCapabilityUseCandidates(agent, capabilityOptions, {
+            worldMinutes, residentsAtLocation, placeIdsByName,
+            maxAlternativeScore: Math.max(0, ...nativeUtilityCandidates.map((candidate) => Number(candidate.score) || 0)) });
+          const utilityCandidates = [...nativeUtilityCandidates, ...capabilityCandidates];
             let strategicDue = false;
             let nextStrategicAt = agent.next_strategic_decision_world_minutes === null
               || agent.next_strategic_decision_world_minutes === undefined
@@ -2152,7 +2234,7 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
             }
             const businessCandidates = strategicDue ? buildBusinessCandidates(agent, businessContext) : [];
             const initiativeCandidates = strategicDue
-              ? [...buildWorldInitiativeCandidates(agent, initiativeContext), ...businessCandidates] : [];
+              ? [...buildWorldInitiativeCandidates(agent, initiativeContext), ...businessCandidates, ...capabilityCandidates] : [];
             let candidates;
             let decisionLayer = 'tactical';
             let qualifiedStrategicCandidates = [];
@@ -2402,6 +2484,7 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
             const tradeFields = activity.action === 'trade'
               ? [activity.side, activity.asset, activity.quoteUnits] : [null, null, null];
             const plannedContext = Object.fromEntries(['opportunityId','opportunityProposal','projectId','decision','projectProposal','goalReviewProposal',
+              'capabilityId','capabilityExperimentId','capabilityContext',
               'organizationId','organizationProposal','inviteeAgentId','shareId','informationProposal','contributionType',
               'businessProposal','cofounderProposal','preparationSkill','preparationServiceType',
               'marketObservationServiceType','reopenProposal',
@@ -2411,6 +2494,9 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
               'agreementTerms','agreementId','counterTerms','expiresInWorldMinutes','parentAgreementId','commitmentId','outcome',
               'proposalId','proposalType','proposalPayload','institutionalTrace']
               .filter((key) => activity[key] !== undefined).map((key) => [key, activity[key]]));
+            if (activity.action === 'capability_use') {
+              plannedContext.capabilitySelectionSource = usedFruitfly ? 'fruitfly' : 'utility_fallback';
+            }
             if (activity.targetLocation !== agent.location) {
               const travelSeconds = 6 + stableInt(`${agent.agentId}:${tickCount}:travel`) % 11;
               const movementEnd = new Date(now.getTime() + travelSeconds * 1_000);

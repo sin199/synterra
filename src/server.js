@@ -13,7 +13,7 @@ import { formatRawTokenAmount, readRobinhoodMarket, scanRobinhoodMarket } from '
 import { executeRobinhoodPaperTrade, readRobinhoodPaperAccount } from './robinhood-paper-trading.js';
 import { loadState, STATE_DIR } from './agent-runtime/client.js';
 import { createFruitflyRuntime } from './agent-runtime/fruitfly.js';
-import { chooseWithTypeSafe } from './agent-runtime/typesafe.js';
+import { chooseCivilizationOption, chooseWithTypeSafe } from './agent-runtime/typesafe.js';
 import { startWorldEngine, worldClock } from './world-engine.js';
 import { createWorldOpportunity, decideWorldOpportunity, listAvailableOpportunities } from './world-opportunities.js';
 import { proposeWorldProject, decideProjectMembership, contributeToProject, listWorldProjects } from './world-projects.js';
@@ -21,6 +21,8 @@ import { foundWorldOrganization, inviteWorldOrganization, decideOrganizationMemb
   contributeOrganizationEffort, listWorldOrganizations } from './world-organizations.js';
 import { shareWorldInformation, decideWorldInformationShare, listInformationInbox } from './world-information.js';
 import { readEmergenceReport } from './world-emergence.js';
+import { createWorldCapabilityProposal, readWorldCapabilitySummary, reviewWorldCapabilityExperiment,
+  reviewWorldCapabilityProposal, performWorldCapabilityUse } from './world-capabilities.js';
 import { createWorldCommitment, listWorldAgreements, listWorldInstitutionSummary, proposeOrganizationGovernance,
   proposeWorldAgreement, resolveWorldCommitment, respondToWorldAgreement, voteOrganizationProposal } from './world-institutions.js';
 import { closeWorldBusiness, distributeWorldBusinessProfit, distributeWorldProjectRevenue,
@@ -379,12 +381,13 @@ app.get('/local/map-data', async (_request, reply) => {
     pool.query('SELECT COALESCE(sum(amount),0)::text AS units FROM token_ledger WHERE world_id=$1', [worldId])
   ]);
   const institutions = await listWorldInstitutionSummary(pool, { worldId, limit: 10 });
+  const capabilities = await readWorldCapabilitySummary(pool, { worldId, limit: 30 });
   const worldEvolution = { dashboard: { ...counts.rows[0], worldMinutes, worldAgeHours: Math.round(worldMinutes / 60),
       worldAgeDays: Math.floor(worldMinutes / 1_440) + 1,
       totalSimulatedWealthUsd: (Number(economyDashboard.rows[0]?.total_resident_net_worth_usd || 0)
         + [...memeValueByAgent.values()].reduce((sum, value) => sum + value, 0)).toFixed(2),
         totalInternalUnits: internalUnits.rows[0].units }, opportunities: opportunities.rows, projects,
-    organizations, institutions, history: history.rows };
+    organizations, institutions, capabilities, history: history.rows };
   worldEvolution.economy = { dashboard: economyDashboard.rows[0] || {}, businesses,
     demand: economicDemand.rows, history: economyHistory.rows, recovery: recoveryMetrics,
     settlement: 'simulated_internal_ledger', chainSettlementEnabled: false };
@@ -403,7 +406,7 @@ app.get('/local/map-data/residents/:agentId', async (request, reply) => {
   if (!world.rowCount) return fail(reply, 404, 'WORLD_NOT_FOUND');
   const worldId = world.rows[0].id;
   const [profile, skills, relationships, memories, goals, beliefs, decisions, reflections,
-    balances, employment, ownership, recentTransactions, recentPurchases, residentNetWorth] = await Promise.all([
+    balances, employment, ownership, recentTransactions, recentPurchases, residentNetWorth, capabilityHistory] = await Promise.all([
     pool.query(`SELECT a.id,a.name,COALESCE((SELECT g.category FROM world_agent_goals g
           WHERE g.world_id=m.world_id AND g.agent_id=m.agent_id AND g.goal_type='primary' AND g.status='active'
           ORDER BY g.priority DESC,g.id LIMIT 1),p.primary_goal) AS "primaryGoal",
@@ -436,7 +439,10 @@ app.get('/local/map-data/residents/:agentId', async (request, reply) => {
         related.name AS "relatedAgentName",memory.metadata,memory.created_at AS "createdAt",memory.long_term AS "longTerm"
       FROM agent_memories memory LEFT JOIN agents related ON related.id=memory.related_agent_id
       WHERE memory.world_id=$1 AND memory.agent_id=$2
-      ORDER BY memory.world_minutes DESC,memory.id DESC LIMIT 12`, [worldId, agentId]),
+        AND (memory.consolidation_key LIKE 'world_epoch:%' OR memory.id IN (
+          SELECT recent.id FROM agent_memories recent WHERE recent.world_id=$1 AND recent.agent_id=$2
+          ORDER BY recent.world_minutes DESC,recent.id DESC LIMIT 12))
+      ORDER BY memory.world_minutes DESC,memory.id DESC`, [worldId, agentId]),
     pool.query(`SELECT id,goal_type AS "goalType",category,description,priority::text AS priority,
         progress::text AS progress,status,source,parent_goal_id AS "parentGoalId",
         created_world_minutes AS "createdWorldMinutes",updated_world_minutes AS "updatedWorldMinutes",metadata
@@ -500,7 +506,24 @@ app.get('/local/map-data/residents/:agentId', async (request, reply) => {
         AND business.id=orders.business_id JOIN world_business_services service ON service.world_id=orders.world_id
         AND service.id=orders.service_id
       WHERE orders.world_id=$1 AND orders.customer_agent_id=$2 ORDER BY orders.world_time DESC,orders.created_at DESC LIMIT 8`,
-    [worldId, agentId])
+    [worldId, agentId]),
+    pool.query(`SELECT 'proposal' AS kind,proposal.name AS title,proposal.category,proposal.status,
+        proposal.created_world_minute AS "worldMinute",proposal.problem_statement AS detail
+      FROM world_capability_proposals proposal WHERE proposal.world_id=$1 AND proposal.creator_agent_id=$2
+      UNION ALL
+      SELECT 'review' AS kind,proposal.name AS title,proposal.category,review.decision AS status,
+        review.created_world_minute AS "worldMinute",review.rationale AS detail
+      FROM world_capability_reviews review JOIN world_capability_proposals proposal
+        ON proposal.world_id=review.world_id AND proposal.id=review.proposal_id
+      WHERE review.world_id=$1 AND review.reviewer_agent_id=$2
+      UNION ALL
+      SELECT 'use' AS kind,capability.name AS title,capability.category,use.status,
+        use.world_minute AS "worldMinute",CASE WHEN use.success THEN '声明式效果已执行并记录'
+          ELSE COALESCE(use.result->>'failureCode','能力执行未完成') END AS detail
+      FROM world_capability_uses use JOIN world_capabilities capability
+        ON capability.world_id=use.world_id AND capability.id=use.capability_id
+      WHERE use.world_id=$1 AND (use.actor_agent_id=$2 OR use.partner_agent_id=$2)
+      ORDER BY "worldMinute" DESC,kind LIMIT 12`, [worldId, agentId])
     ,pool.query(`WITH RECURSIVE holdings(asset_type,asset_id,share,path) AS (
         SELECT owner.asset_type,owner.asset_id,owner.share::numeric,ARRAY[owner.asset_type||':'||owner.asset_id::text]
         FROM world_economic_ownership owner WHERE owner.world_id=$1 AND owner.owner_type='resident' AND owner.owner_id=$2
@@ -561,6 +584,7 @@ app.get('/local/map-data/residents/:agentId', async (request, reply) => {
     `, [worldId, agentId])).rows[0];
   return { resident: profile.rows[0], skills: skills.rows, relationships: relationships.rows, recentMemories: memories.rows,
     goals: goals.rows, beliefs: beliefs.rows, decisions: decisions.rows, reflections: reflections.rows,
+    capabilityHistory: capabilityHistory.rows,
     institutions,
     economy: { netWorthUsd: residentNetWorth.rows[0]?.netWorthUsd || '0.00000000', balances: balances.rows,
       employment: employment.rows, ownership: ownership.rows, recentTransactions: recentTransactions.rows,
@@ -1878,6 +1902,95 @@ app.post('/v1/worlds/:worldId/organizations/:organizationId/contributions', asyn
   return reply.send(result);
 });
 
+app.get('/v1/worlds/:worldId/capabilities', async (request, reply) => {
+  const { worldId } = request.params;
+  if (!validUuid(worldId)) return fail(reply, 400, 'WORLD_ID_INVALID');
+  await assertMember(pool, worldId, request.agentId);
+  return { worldId, ...(await readWorldCapabilitySummary(pool, { worldId,
+    limit: Math.min(100, Math.max(1, Number(request.query.limit) || 30)) })) };
+});
+
+app.post('/v1/worlds/:worldId/capabilities/proposals', async (request, reply) => {
+  const { worldId } = request.params;
+  const body = request.body || {};
+  if (!validUuid(worldId) || !validUuid(body.gapId) || !body.proposal || typeof body.proposal !== 'object'
+      || Array.isArray(body.proposal)
+      || (body.creatorOrganizationId && !validUuid(body.creatorOrganizationId))) return fail(reply, 400, 'CAPABILITY_PROPOSAL_FIELDS_INVALID');
+  const actionId = requireActionId(body);
+  const proposal = await transaction(async (client) => {
+    await assertMember(client, worldId, request.agentId, true);
+    return createWorldCapabilityProposal(client, { worldId, agentId: request.agentId, gapId: body.gapId,
+      proposal: body.proposal, creatorOrganizationId: body.creatorOrganizationId || null,
+      actionId, worldMinute: await readWorldMinutes(client, worldId) });
+  });
+  return reply.code(proposal.idempotent ? 200 : 201).send({ proposal });
+});
+
+app.post('/v1/worlds/:worldId/capabilities/proposals/:proposalId/reviews', async (request, reply) => {
+  const { worldId, proposalId } = request.params;
+  const body = request.body || {};
+  if (!validUuid(worldId) || !validUuid(proposalId)
+      || !['support','oppose','modify','ignore'].includes(body.decision)
+      || !requiredString(body.rationale, 3, 600)
+      || (body.organizationId && !validUuid(body.organizationId))
+      || (body.decision === 'modify' && (!body.suggestedSpecification || typeof body.suggestedSpecification !== 'object'
+        || Array.isArray(body.suggestedSpecification)))) return fail(reply, 400, 'CAPABILITY_REVIEW_FIELDS_INVALID');
+  const actionId = requireActionId(body);
+  const review = await transaction(async (client) => {
+    await assertMember(client, worldId, request.agentId, true);
+    if (body.organizationId) {
+      const membership = await client.query(`SELECT 1 FROM world_organization_members
+        WHERE world_id=$1 AND organization_id=$2 AND agent_id=$3 AND status='active'`,
+      [worldId, body.organizationId, request.agentId]);
+      if (!membership.rowCount) throw Object.assign(new Error('ACTIVE_ORGANIZATION_MEMBERSHIP_REQUIRED'), { statusCode: 403 });
+    }
+    return reviewWorldCapabilityProposal(client, { worldId, agentId: request.agentId, proposalId,
+      organizationId: body.organizationId || null, decision: body.decision, rationale: body.rationale,
+      suggestedSpecification: body.suggestedSpecification, evidence: body.evidence || {}, actionId,
+      worldMinute: await readWorldMinutes(client, worldId) });
+  });
+  return reply.send({ review });
+});
+
+app.post('/v1/worlds/:worldId/capabilities/experiments/:experimentId/reviews', async (request, reply) => {
+  const { worldId, experimentId } = request.params;
+  const body = request.body || {};
+  if (!validUuid(worldId) || !validUuid(experimentId)
+      || !['support','oppose','ignore'].includes(body.decision)
+      || !requiredString(body.rationale, 3, 600)) return fail(reply, 400, 'CAPABILITY_EXPERIMENT_REVIEW_FIELDS_INVALID');
+  const actionId = requireActionId(body);
+  const review = await transaction(async (client) => {
+    await assertMember(client, worldId, request.agentId, true);
+    return reviewWorldCapabilityExperiment(client, { worldId, agentId: request.agentId, experimentId,
+      decision: body.decision, rationale: body.rationale, evidence: body.evidence || {}, actionId,
+      worldMinute: await readWorldMinutes(client, worldId) });
+  });
+  return reply.send({ review });
+});
+
+app.post('/v1/worlds/:worldId/capabilities/:capabilityId/use', async (request, reply) => {
+  const { worldId, capabilityId } = request.params;
+  const body = request.body || {};
+  if (!validUuid(worldId) || !validUuid(capabilityId)
+      || (body.partnerAgentId !== undefined && !validUuid(body.partnerAgentId))
+      || (body.experimentId !== undefined && !validUuid(body.experimentId))) return fail(reply, 400, 'CAPABILITY_USE_FIELDS_INVALID');
+  const actionId = requireActionId(body);
+  const use = await transaction(async (client) => {
+    await assertMember(client, worldId, request.agentId, true);
+    const resident = await client.query(`SELECT energy,food FROM world_members WHERE world_id=$1 AND agent_id=$2 FOR UPDATE`,
+      [worldId, request.agentId]);
+    if (!resident.rowCount) throw Object.assign(new Error('AGENT_NOT_IN_WORLD'), { statusCode: 403 });
+    const result = await performWorldCapabilityUse(client, { worldId, agentId: request.agentId,
+      partnerId: body.partnerAgentId || null, capabilityId, experimentId: body.experimentId || null,
+      actionId, worldMinute: await readWorldMinutes(client, worldId), agentEnergy: Number(resident.rows[0].energy) });
+    if (!result.idempotent) await client.query(`UPDATE world_members SET energy=GREATEST(0,energy-$3),food=GREATEST(0,food-$4)
+      WHERE world_id=$1 AND agent_id=$2`, [worldId, request.agentId,
+      Number(result.costs?.energy || 0), Number(result.costs?.food || 0)]);
+    return result;
+  });
+  return reply.code(use.idempotent ? 200 : 201).send({ use });
+});
+
 app.get('/v1/worlds/:worldId/agreements', async (request, reply) => {
   const { worldId } = request.params;
   if (!validUuid(worldId)) return fail(reply, 400, 'WORLD_ID_INVALID');
@@ -2042,6 +2155,7 @@ catch (error) { app.log.error({ err: error }, 'Fruitfly selection unavailable; u
 try {
   worldEngine = await startWorldEngine(pool, {
     chooseWithTypeSafe: process.env.TYPESAFE_API_KEY && typeSafeRuntimeState ? chooseWithTypeSafe : null,
+    chooseCivilizationOption: process.env.TYPESAFE_API_KEY && typeSafeRuntimeState ? chooseCivilizationOption : null,
     runtimeState: typeSafeRuntimeState,
     fruitfly: fruitflyRuntime,
     onStatus: (status) => {

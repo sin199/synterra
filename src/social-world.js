@@ -496,6 +496,7 @@ export function fruitflyFamily(candidateOrAction) {
   const action = String(candidate.action || candidateOrAction || '');
   if (action === 'trade' || action === 'trade_meme') return 'trade_crypto';
   if (action === 'learn') return 'travel';
+  if (action === 'capability_use') return 'business_learn';
   if (['business_skill_practice', 'business_market_observe'].includes(action)) return 'business_learn';
   if (['opportunity', 'opportunity_reject'].includes(action)) return 'travel';
   if (['business_invest','project_invest','project_distribute'].includes(action)) return 'invest';

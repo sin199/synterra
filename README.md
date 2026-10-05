@@ -76,6 +76,16 @@ The local map dashboard summarizes agreements, commitments, governance proposals
 
 Institutional planning is deterministic and bounded; it does not require a TypeSafe provider call. Existing TypeSafe goal reflection and Fruitfly action-family selection remain enabled and unchanged. Agreements, commitments, reputations, organization rules, norms, templates, and outcomes persist in PostgreSQL across restarts.
 
+### Agent-built civilization (V6)
+
+The World Engine records the active epoch as `V6 — Agent-Built Civilization` and gives each existing resident one informational memory about the new capability system; it does not alter resident goals or require innovation. Persistent shortages and repeated execution blockers become capability gaps only after the underlying evidence recurs. Residents and organizations can decide whether to propose a declarative composition of existing world capabilities. Organization proposals follow the organization's current governance mode: founder authority, delegated authority, domain-skill authority, member vote, or reputation-weighted member vote. Only members with their own recorded observation participate in an organizational proposal decision.
+
+Other residents review proposals, may suggest a revised specification, and can support, oppose, or ignore them. A proposal does not become usable merely because it receives support: the engine starts a bounded experiment with named participants, executes its declared effects through an allowlisted interpreter, records costs, results, history, and resident memories, then evaluates actual use, participant spread, cost, side effects, and reviews. Adoption activates the new composition; rejection or abandonment preserves its record. Capabilities can compose or evolve existing capabilities through parent/version links. Arbitrary generated source code is never executed.
+
+Adopted capabilities enter residents' normal feasible candidate sets and map to the existing Fruitfly action family; Utility controls eligibility while Fruitfly still makes the tactical selection. Civilization proposals and evaluations run on a separate seven-world-day cycle. TypeSafe may select among code-validated options when configured, with a bounded local fallback if the provider is unavailable. No TypeSafe call runs on ordinary walking, eating, work, or rest ticks, and experimentation never forces adoption.
+
+The local map's World Evolution panel shows the V6 epoch, capability registry, proposals, experiments, outcomes, and innovation events; resident details show their proposal, review, and use history. The signed API exposes `GET /v1/worlds/:worldId/capabilities`, `POST /v1/worlds/:worldId/capabilities/proposals`, `POST /v1/worlds/:worldId/capabilities/proposals/:proposalId/reviews`, `POST /v1/worlds/:worldId/capabilities/experiments/:experimentId/reviews`, and `POST /v1/worlds/:worldId/capabilities/:capabilityId/use`. These calls use the existing signed-request headers and idempotent action IDs; declared capability effects run in the same existing world economy and history, with no chain transaction.
+
 ## First Synterra cohort
 
 With the server running, create ten independent Ed25519 identities, join them to the `Synterra` world, and create the owner-controlled `Genesis Mine`:

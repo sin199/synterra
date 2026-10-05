@@ -24,6 +24,15 @@ const opportunityList = document.querySelector('#world-opportunity-list');
 const projectList = document.querySelector('#world-project-list');
 const organizationList = document.querySelector('#world-organization-list');
 const institutionsList = document.querySelector('#world-institutions-list');
+const worldEpochSummary = document.querySelector('#world-epoch-summary');
+const worldCapabilityCounts = document.querySelector('#world-capability-counts');
+const capabilityActiveList = document.querySelector('#world-capability-active-list');
+const capabilityExperimentalList = document.querySelector('#world-capability-experimental-list');
+const capabilityProposalList = document.querySelector('#world-capability-proposal-list');
+const capabilityAdoptedList = document.querySelector('#world-capability-adopted-list');
+const capabilityRejectedList = document.querySelector('#world-capability-rejected-list');
+const capabilityDeprecatedList = document.querySelector('#world-capability-deprecated-list');
+const capabilityEventList = document.querySelector('#world-capability-event-list');
 const businessList = document.querySelector('#world-business-list');
 const economicDemandList = document.querySelector('#world-economic-demand-list');
 const historyList = document.querySelector('#world-history-list');
@@ -475,7 +484,7 @@ function renderAgentPanel(agent, detail = selectedResidentDetail) {
   const beliefsSection = document.createElement('section');
   beliefsSection.className = 'agent-social-section';
   const beliefsHeading = document.createElement('h4');
-  beliefsHeading.textContent = '个人经验判断';
+  beliefsHeading.textContent = '个人经验与创新判断';
   const beliefsList = document.createElement('ul');
   beliefsList.className = 'agent-memory-list';
   for (const belief of (detail?.beliefs || []).slice(0, 6)) {
@@ -513,6 +522,30 @@ function renderAgentPanel(agent, detail = selectedResidentDetail) {
   }
   decisionsSection.append(decisionsHeading, decisionsList);
   card.append(decisionsSection);
+
+  const capabilitySection = document.createElement('section');
+  capabilitySection.className = 'agent-social-section';
+  const capabilityHeading = document.createElement('h4');
+  capabilityHeading.textContent = '能力提案、评议与使用';
+  const capabilityList = document.createElement('ul');
+  capabilityList.className = 'agent-memory-list';
+  const capabilityHistoryLabels = { proposal: '我提出', review: '我评议', use: '我参与使用' };
+  for (const entry of (detail?.capabilityHistory || []).slice(0, 8)) {
+    const item = document.createElement('li');
+    const status = ({ proposed: '待评议', reviewed: '已评议', revised: '已修订', adopted: '已采纳',
+      rejected: '已拒绝', abandoned: '已放弃', support: '支持', oppose: '反对', modify: '建议修改',
+      ignore: '未表态', completed: '完成', failed: '失败' })[entry.status] || entry.status;
+    item.textContent = `${capabilityHistoryLabels[entry.kind] || entry.kind} · ${entry.title} · ${status} · 第 ${displayCount(entry.worldMinute)} 世界分钟 · ${String(entry.detail || '').slice(0, 140)}`;
+    capabilityList.append(item);
+  }
+  if (!capabilityList.children.length) {
+    const item = document.createElement('li');
+    item.className = 'agent-social-empty';
+    item.textContent = detail ? '还没有能力提案、评议或使用记录' : '正在读取能力历史…';
+    capabilityList.append(item);
+  }
+  capabilitySection.append(capabilityHeading, capabilityList);
+  card.append(capabilitySection);
 
   const memoriesSection = document.createElement('section');
   memoriesSection.className = 'agent-social-section';
@@ -690,7 +723,41 @@ function renderWorldEvolution() {
       detail: `${template.agreementType} · 成功 ${template.successCount} / 样本 ${template.sampleCount}`
     }))
   ];
-  renderEvolutionList(institutionsList, institutionRows, '还没有形成制度互动。', (item) => item.detail);
+  const capabilityWorld = evolution.capabilities || {};
+  const statusLabels = { active: '有效', experimental: '实验中', proposed: '提案', reviewed: '已评议', revised: '已修订',
+    adopted: '已采纳', rejected: '已拒绝', deprecated: '已弃用', abandoned: '已放弃', evaluated: '已评估' };
+  const organizationCapabilityExperiments = (capabilityWorld.experiments || []).filter((item) => item.creatorOrganizationName)
+    .map((item) => ({ title: `组织实验 · ${item.creatorOrganizationName} · ${item.proposalName}`,
+      detail: `${statusLabels[item.status] || item.status} · 范围 ${item.scopeType} · 世界分钟 ${displayCount(item.startedWorldMinute)}` }));
+  renderEvolutionList(institutionsList, [...institutionRows, ...organizationCapabilityExperiments],
+    '还没有形成制度互动。', (item) => item.detail);
+  const epoch = capabilityWorld.epoch;
+  if (worldEpochSummary) worldEpochSummary.textContent = epoch
+    ? `${epoch.code} · ${epoch.name} · 第 ${Math.max(1, Math.floor(Number(epoch.startedWorldMinute || 0) / 1_440) + 1)} 世界日开始`
+    : '尚未记录世界时代';
+  const capabilityCounts = capabilityWorld.counts || {};
+  if (worldCapabilityCounts) worldCapabilityCounts.textContent = `有效 ${displayCount(capabilityCounts.active)} · 实验 ${displayCount(capabilityCounts.experimental)} · 提案 ${displayCount(capabilityCounts.proposals)} · 弃用 ${displayCount(capabilityCounts.deprecated)} · 缺口 ${displayCount(capabilityCounts.open_gaps)}`;
+  renderEvolutionList(capabilityActiveList, (capabilityWorld.capabilities || []).filter((item) => item.status === 'active').slice(0, 8),
+    '当前没有登记有效能力。', (item) => `v${item.version} · ${item.category} · 使用 ${displayCount(item.usageCount)} 次${item.creatorType === 'system' ? ' · 基础能力' : ' · 居民创建'}`);
+  renderEvolutionList(capabilityExperimentalList, (capabilityWorld.capabilities || []).filter((item) => item.status === 'experimental').slice(0, 6),
+    '当前没有进行中的能力实验。', (item) => `v${item.version} · ${item.category} · ${item.experimentScope?.scopeType || '限定范围'} · ${item.creatorOrganizationName || '居民提案'} · 已使用 ${displayCount(item.usageCount)} 次`);
+  const capabilityProposals = capabilityWorld.proposals || [];
+  renderEvolutionList(capabilityProposalList, capabilityProposals, '居民还没有提出能力提案。', (item) =>
+    `${statusLabels[item.status] || item.status} · ${item.category} · ${item.creatorOrganizationName || item.creatorName || '居民提案'} · 支持 ${displayCount(item.supportCount)} / 反对 ${displayCount(item.oppositionCount)} · ${item.problemStatement}`);
+  renderEvolutionList(capabilityAdoptedList, capabilityProposals.filter((item) => item.status === 'adopted').slice(0, 5),
+    '还没有能力通过实验评估并采纳。', (item) => `${item.category} · ${item.creatorOrganizationName || item.creatorName || '居民'} · 第 ${displayCount(item.updatedWorldMinute)} 世界分钟`);
+  renderEvolutionList(capabilityRejectedList, capabilityProposals.filter((item) => item.status === 'rejected').slice(0, 5),
+    '还没有因实验结果而拒绝的能力。', (item) => `${item.category} · ${item.creatorOrganizationName || item.creatorName || '居民'} · 第 ${displayCount(item.updatedWorldMinute)} 世界分钟`);
+  renderEvolutionList(capabilityDeprecatedList, (capabilityWorld.capabilities || []).filter((item) => item.status === 'deprecated').slice(0, 5),
+    '目前没有已弃用能力。', (item) => `v${item.version} · ${item.category} · 使用 ${displayCount(item.usageCount)} 次`);
+  const capabilityEventLabels = { capability_gap_observed: '发现能力缺口', capability_innovation_considered: '评估创新机会',
+    capability_proposed: '提出能力', capability_supported: '支持提案', capability_opposed: '反对提案',
+    capability_revision_suggested: '建议修订', capability_experiment_started: '启动实验', capability_used: '实际使用能力',
+    capability_use_failed: '能力使用失败', capability_proposal_expired: '提案等待超时',
+    capability_adopted: '采纳能力', capability_rejected: '拒绝能力', capability_abandoned: '放弃能力',
+    capability_deprecated: '弃用能力', capability_revision_created: '形成修订版' };
+  renderEvolutionList(capabilityEventList, capabilityWorld.recentEvents || [], '还没有创新事件。', (item) =>
+    `${capabilityEventLabels[item.eventType] || item.eventType} · 世界分钟 ${displayCount(item.worldMinute)}${item.details?.name ? ` · ${item.details.name}` : ''}`);
   renderEvolutionList(businessList, evolution.economy?.businesses, '居民还没有创建企业。', (item) => {
     const services = (item.services || []).map((service) => `${service.name} · ${service.stockUnits} 件库存`).join('；');
     const workers = (item.workers || []).length;
