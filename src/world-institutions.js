@@ -8,18 +8,32 @@ const AGREEMENT_TYPES = new Set(['employment','service','project_cooperation','i
   'resource_sharing','organization_membership','supplier_relationship','partnership']);
 const TERM_KEYS = {
   employment: ['businessId','jobId','applicationId','employmentId','wageUsdc','role','durationShifts'],
-  service: ['businessId','serviceId','customerAgentId','priceUsdc','units'],
+  service: ['businessId','serviceId','customerAgentId','priceUsdc','units','deliveryDelayWorldMinutes'],
   project_cooperation: ['projectId','effortPoints','rewardShare'],
   investment: ['businessId','amountUsdc','ownershipShare'],
   revenue_sharing: ['businessId','shareBps','recipientAgentId','capPerDayUsdc'],
   resource_sharing: ['resourceKey','amount','recipientAgentId'],
   organization_membership: ['organizationId','role'],
-  supplier_relationship: ['businessId','serviceId','customerAgentId','priceUsdc','maxUnits'],
+  supplier_relationship: ['businessId','serviceId','customerAgentId','priceUsdc','maxUnits','deliveryDelayWorldMinutes'],
   partnership: ['businessId','sellerAgentId','buyerAgentId','ownershipShare','priceUsdc','gift']
 };
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const clamp = (value, low, high) => Math.max(low, Math.min(high, Number(value) || 0));
 const round4 = (value) => Math.round(value * 10_000) / 10_000;
+const INSTITUTIONAL_RETRY_WORLD_MINUTES = 60;
+
+function agreementUnitLimit(terms = {}) {
+  const value = Number(terms.maxUnits ?? terms.units ?? 1);
+  return Math.max(1, Math.trunc(Number.isFinite(value) ? value : 1));
+}
+
+async function scheduleInstitutionalRetry(client, { worldId, agentId, worldTime }) {
+  const retryAt = Number(worldTime) + INSTITUTIONAL_RETRY_WORLD_MINUTES;
+  await client.query(`UPDATE world_agent_states SET next_institutional_review_world_minutes=$3,updated_at=now()
+    WHERE world_id=$1 AND agent_id=$2
+      AND (next_institutional_review_world_minutes IS NULL OR next_institutional_review_world_minutes>$3)`,
+  [worldId, agentId, retryAt]);
+}
 
 function institutionError(code, statusCode = 409) { return worldError(code, statusCode); }
 
@@ -48,6 +62,8 @@ function normalizeTerms(type, value) {
   if (terms.units !== undefined) terms.units = Math.trunc(boundedNumber(terms.units, 1, 10, 'units'));
   if (terms.maxUnits !== undefined) terms.maxUnits = Math.trunc(boundedNumber(terms.maxUnits, 1, 100, 'max_units'));
   if (terms.durationShifts !== undefined) terms.durationShifts = Math.trunc(boundedNumber(terms.durationShifts, 1, 500, 'duration_shifts'));
+  if (terms.deliveryDelayWorldMinutes !== undefined) terms.deliveryDelayWorldMinutes = Math.trunc(
+    boundedNumber(terms.deliveryDelayWorldMinutes, 60, 43_200, 'delivery_delay_world_minutes'));
   if (terms.effortPoints !== undefined) terms.effortPoints = boundedNumber(terms.effortPoints, 0.1, 1000, 'effort_points');
   if (terms.role !== undefined) terms.role = requiredText(terms.role, 3, 80, 'agreement_role');
   if (terms.resourceKey !== undefined && !['simulated_usdc','effort'].includes(terms.resourceKey)) {
@@ -182,20 +198,32 @@ export async function proposeWorldAgreement(client, { worldId, proposerAgentId, 
     WHERE world_id=$1 AND status IN ('proposed','accepted','active') AND
       (proposer_agent_id IN ($2,$3) OR counterparty_agent_id IN ($2,$3))`, [worldId, proposerAgentId, counterpartyAgentId]);
   if (Number(workload.rows[0].count) >= 40) throw institutionError('AGREEMENT_PARTICIPANT_CAPACITY_REACHED');
-  const parent = parentAgreementId ? await client.query(`SELECT id,agreement_type,negotiation_round,status,proposer_agent_id,
-      counterparty_agent_id,created_world_time FROM world_agreements WHERE world_id=$1 AND id=$2 FOR UPDATE`,
+  const parent = parentAgreementId ? await client.query(`SELECT * FROM world_agreements WHERE world_id=$1 AND id=$2 FOR UPDATE`,
   [worldId, parentAgreementId]) : null;
   let round = 1;
+  let activeRenegotiation = false;
   if (parentAgreementId) {
-    if (!parent?.rowCount || parent.rows[0].status !== 'proposed' || parent.rows[0].agreement_type !== kind
+    if (!parent?.rowCount || !['proposed','active'].includes(parent.rows[0].status) || parent.rows[0].agreement_type !== kind
         || parent.rows[0].negotiation_round >= 8) throw institutionError('AGREEMENT_COUNTER_NOT_AVAILABLE');
-    if (proposerAgentId !== parent.rows[0].counterparty_agent_id
-        || counterpartyAgentId !== parent.rows[0].proposer_agent_id) {
+    const original = parent.rows[0];
+    if (!((proposerAgentId === original.counterparty_agent_id && counterpartyAgentId === original.proposer_agent_id)
+        || (proposerAgentId === original.proposer_agent_id && counterpartyAgentId === original.counterparty_agent_id))) {
       throw institutionError('AGREEMENT_COUNTER_PARTIES_INVALID', 403);
+    }
+    activeRenegotiation = original.status === 'active';
+    if (activeRenegotiation) {
+      const oldTerms = original.terms || {};
+      if (!['service','supplier_relationship'].includes(kind)
+          || normalized.businessId !== oldTerms.businessId || normalized.serviceId !== oldTerms.serviceId
+          || (oldTerms.customerAgentId && normalized.customerAgentId
+            && normalized.customerAgentId !== oldTerms.customerAgentId)) {
+        throw institutionError('AGREEMENT_RENEGOTIATION_SCOPE_INVALID', 400);
+      }
+      if (original.metadata?.renegotiationPending) throw institutionError('AGREEMENT_RENEGOTIATION_PENDING');
     }
     const previousCounter = await client.query(`SELECT max(created_world_time)::bigint AS last_time FROM world_agreements
       WHERE world_id=$1 AND parent_agreement_id=$2`, [worldId, parentAgreementId]);
-    const lastCounterAt = Math.max(Number(parent.rows[0].created_world_time), Number(previousCounter.rows[0]?.last_time) || 0);
+    const lastCounterAt = Math.max(Number(original.created_world_time), Number(previousCounter.rows[0]?.last_time) || 0);
     if (worldTime - lastCounterAt < 10) throw institutionError('AGREEMENT_COUNTER_COOLDOWN');
     round = Number(parent.rows[0].negotiation_round) + 1;
   }
@@ -203,20 +231,33 @@ export async function proposeWorldAgreement(client, { worldId, proposerAgentId, 
       terms,status,parent_agreement_id,negotiation_round,action_id,created_world_time,expires_world_time,updated_world_time,metadata)
     VALUES($1,$2,$3,$4,$5::jsonb,'proposed',$6,$7,$8,$9,$10,$9,$11::jsonb) RETURNING *`,
   [worldId, kind, proposerAgentId, counterpartyAgentId, JSON.stringify(normalized), parentAgreementId, round, key, worldTime,
-    worldTime + duration, JSON.stringify({ source: parentAgreementId ? 'counter_offer' : 'resident_proposal' })]);
+    worldTime + duration, JSON.stringify({ source: activeRenegotiation ? 'renegotiation'
+      : parentAgreementId ? 'counter_offer' : 'resident_proposal',
+    ...(activeRenegotiation ? { renegotiates: parentAgreementId } : {}) })]);
   const agreement = inserted.rows[0];
   await insertParticipants(client, agreement, worldTime);
   if (parentAgreementId) {
     const original = parent.rows[0];
-    await client.query(`UPDATE world_agreements SET status='countered',updated_world_time=$3,updated_at=now(),
-        metadata=metadata||$4::jsonb WHERE world_id=$1 AND id=$2`,
-    [worldId, parentAgreementId, worldTime, JSON.stringify({ responseActionId: key, counteredBy: proposerAgentId })]);
-    await client.query(`UPDATE world_agreement_participants SET response='countered',responded_world_time=$3
-      WHERE agreement_id=$1 AND agent_id=$2`, [parentAgreementId, original.counterparty_agent_id, worldTime]);
-    await writeWorldHistory(client, { worldId, eventKey: `agreement:${agreement.id}:countered`, eventType: 'agreement_countered',
-      actorAgentId: proposerAgentId, entityType: 'agreement', entityId: agreement.id, worldTime,
-      title: 'Agreement counter-offer proposed', detail: `A resident countered round ${round - 1} with changed terms.`,
-      metadata: { agreementType: kind, parentAgreementId, round } });
+    if (activeRenegotiation) {
+      await client.query(`UPDATE world_agreements SET metadata=metadata||'{"renegotiationPending":true}'::jsonb,
+          updated_world_time=$3,updated_at=now() WHERE world_id=$1 AND id=$2 AND status='active'`,
+      [worldId, parentAgreementId, worldTime]);
+      await writeWorldHistory(client, { worldId, eventKey: `agreement:${agreement.id}:renegotiation-proposed`,
+        eventType: 'agreement_renegotiation_proposed', actorAgentId: proposerAgentId, entityType: 'agreement',
+        entityId: agreement.id, worldTime, title: 'Supplier terms proposed for renegotiation',
+        detail: 'A resident proposed revised timing or capacity terms for an active supplier agreement.',
+        metadata: { agreementType: kind, parentAgreementId, round } });
+    } else {
+      await client.query(`UPDATE world_agreements SET status='countered',updated_world_time=$3,updated_at=now(),
+          metadata=metadata||$4::jsonb WHERE world_id=$1 AND id=$2`,
+      [worldId, parentAgreementId, worldTime, JSON.stringify({ responseActionId: key, counteredBy: proposerAgentId })]);
+      await client.query(`UPDATE world_agreement_participants SET response='countered',responded_world_time=$3
+        WHERE agreement_id=$1 AND agent_id=$2`, [parentAgreementId, original.counterparty_agent_id, worldTime]);
+      await writeWorldHistory(client, { worldId, eventKey: `agreement:${agreement.id}:countered`, eventType: 'agreement_countered',
+        actorAgentId: proposerAgentId, entityType: 'agreement', entityId: agreement.id, worldTime,
+        title: 'Agreement counter-offer proposed', detail: `A resident countered round ${round - 1} with changed terms.`,
+        metadata: { agreementType: kind, parentAgreementId, round } });
+    }
   } else {
     await writeWorldHistory(client, { worldId, eventKey: `agreement:${agreement.id}:proposed`, eventType: 'agreement_proposed',
       actorAgentId: proposerAgentId, entityType: 'agreement', entityId: agreement.id, worldTime,
@@ -292,6 +333,14 @@ async function recordAgreementOutcome(client, { worldId, agreementId, worldTime,
     : row.agreement_type === 'employment' || row.agreement_type === 'service' ? 'professional' : 'cooperation';
   const affected = responsibleAgentId ? [responsibleAgentId]
     : positive ? [row.proposer_agent_id, row.counterparty_agent_id] : [row.counterparty_agent_id];
+  const supplierContext = row.agreement_type === 'supplier_relationship' || row.agreement_type === 'service'
+    ? await client.query(`SELECT business.founder_agent_id AS provider_id,business.name AS business_name,
+        service.name AS service_name,service.service_type
+      FROM world_businesses business LEFT JOIN world_business_services service
+        ON service.world_id=business.world_id AND service.id=$3
+      WHERE business.world_id=$1 AND business.id=$2`,
+    [worldId, row.terms.businessId, row.terms.serviceId]) : { rows: [] };
+  const supplier = supplierContext.rows[0] || null;
   const institutionalType = row.terms.businessId ? 'business'
     : row.terms.organizationId ? 'organization' : null;
   const institutionalId = row.terms.businessId || row.terms.organizationId || null;
@@ -303,7 +352,9 @@ async function recordAgreementOutcome(client, { worldId, agreementId, worldTime,
         outcome,reason,action_id,world_time,evidence)
       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb) ON CONFLICT(world_id,agent_id,action_id) DO NOTHING RETURNING id`,
     [worldId, agreementId, agentId, otherId, outcome, reason, outcomeKey, worldTime,
-      JSON.stringify({ agreementType: row.agreement_type, sourceActionId: actionId })]);
+      JSON.stringify({ agreementType: row.agreement_type, sourceActionId: actionId,
+        serviceType: supplier?.service_type || null, businessId: row.terms.businessId || null,
+        serviceId: row.terms.serviceId || null })]);
     if (!inserted.rowCount) continue;
     await updateAgentReputation(client, { worldId, agentId, otherAgentId: otherId, dimension, delta: reputationDelta,
       worldTime, outcome: positive ? 'fulfilled' : incapable ? 'unable' : 'breached', agreementId, actionId: outcomeKey });
@@ -314,15 +365,6 @@ async function recordAgreementOutcome(client, { worldId, agreementId, worldTime,
           updated_world_time=$4,updated_at=now() WHERE world_id=$1 AND agent_id=$2`,
       [worldId, agentId, reputationDelta * 0.5, worldTime]);
     }
-    const summary = positive ? `Completed the ${row.agreement_type.replaceAll('_',' ')} agreement as promised.`
-      : incapable ? `Declared an inability to fulfill a ${row.agreement_type.replaceAll('_',' ')} agreement.`
-        : `Did not fulfill a ${row.agreement_type.replaceAll('_',' ')} agreement (${reason || 'unfulfilled obligation'}).`;
-    await client.query(`INSERT INTO agent_memories(world_id,agent_id,memory_type,summary,importance,world_minutes,
-        related_agent_id,metadata,long_term)
-      VALUES($1,$2,'contract',$3,$4,$5,$6,$7::jsonb,$8)
-      ON CONFLICT DO NOTHING`, [worldId, agentId, summary, positive ? 0.68 : 0.76, worldTime, otherId,
-      JSON.stringify({ agreementId, agreementType: row.agreement_type, outcome, reason, actionId: outcomeKey }),
-      reputationScale >= 1]);
     const scopeType = row.terms.businessId ? 'business' : row.terms.organizationId ? 'organization' : 'world';
     const scopeId = row.terms.businessId || row.terms.organizationId || worldId;
     const normKey = `${row.agreement_type}:honor_terms`;
@@ -364,12 +406,229 @@ async function recordAgreementOutcome(client, { worldId, agreementId, worldTime,
         Number(templateCount.rows[0].count), worldTime]);
     }
   }
+  const participants = [row.proposer_agent_id, row.counterparty_agent_id];
+  for (const agentId of participants) {
+    const otherId = agentId === row.proposer_agent_id ? row.counterparty_agent_id : row.proposer_agent_id;
+    const providerId = supplier?.provider_id || null;
+    const supplierRole = providerId ? (agentId === providerId ? 'provider' : 'customer') : null;
+    let summary;
+    if (supplierRole === 'provider') {
+      summary = positive ? `Delivered ${supplier.service_name || 'a service'} under a supplier agreement${supplier.business_name ? ` for ${supplier.business_name}` : ''}.`
+        : incapable ? `Could not deliver ${supplier.service_name || 'a service'} under a supplier agreement${reason ? ` (${reason})` : ''}.`
+          : `Failed to deliver ${supplier.service_name || 'a service'} under a supplier agreement${reason ? ` (${reason})` : ''}.`;
+    } else if (supplierRole === 'customer') {
+      summary = positive ? `Received ${supplier.service_name || 'a service'} from supplier ${supplier.business_name || 'business'} as agreed.`
+        : incapable ? `Supplier ${supplier.business_name || 'business'} could not deliver ${supplier.service_name || 'the service'}.`
+          : `Supplier ${supplier.business_name || 'business'} failed to deliver ${supplier.service_name || 'the service'}${reason ? ` (${reason})` : ''}.`;
+    } else {
+      summary = positive ? `Completed the ${row.agreement_type.replaceAll('_',' ')} agreement as promised.`
+        : incapable ? `Declared an inability to fulfill a ${row.agreement_type.replaceAll('_',' ')} agreement.`
+          : `Did not fulfill a ${row.agreement_type.replaceAll('_',' ')} agreement (${reason || 'unfulfilled obligation'}).`;
+    }
+    const memoryKey = `contract:${agreementId}:${String(actionId).slice(0, 90)}:${outcome}`;
+    await client.query(`INSERT INTO agent_memories(world_id,agent_id,memory_type,summary,importance,world_minutes,
+        related_agent_id,metadata,long_term,consolidation_key)
+      VALUES($1,$2,'contract',$3,$4,$5,$6,$7::jsonb,$8,$9)
+      ON CONFLICT(world_id,agent_id,consolidation_key) WHERE consolidation_key IS NOT NULL DO NOTHING`,
+    [worldId, agentId, summary.slice(0, 240), positive ? 0.68 : 0.76, worldTime, otherId,
+      JSON.stringify({ agreementId, agreementType: row.agreement_type, outcome, reason, actionId,
+        role: supplierRole, businessId: row.terms.businessId || null, serviceId: row.terms.serviceId || null,
+        serviceType: supplier?.service_type || null }), reputationScale >= 1, memoryKey]);
+  }
   await recordInstitutionalMemory(client, { worldId, institutionType: institutionalType, institutionId: institutionalId,
     memoryType: positive ? 'agreement_success' : 'agreement_failure', worldTime,
     summary: positive ? `A ${row.agreement_type.replaceAll('_',' ')} agreement was fulfilled.`
       : `A ${row.agreement_type.replaceAll('_',' ')} obligation ended as ${outcome}.`,
     metadata: { agreementId, reason, outcome } });
   return true;
+}
+
+export async function recordAgreementExecutionStage(client, { worldId, agreementId, stage, worldTime,
+  reasonCode = null, agentId = null, eventKey, details = {} }) {
+  const agreement = await client.query(`SELECT agreement_type,terms FROM world_agreements WHERE world_id=$1 AND id=$2`,
+    [worldId, agreementId]);
+  if (!agreement.rowCount) return false;
+  const key = String(eventKey || `${stage}:${worldTime}`).replace(/[^a-zA-Z0-9:_-]/g, '_').slice(0, 160);
+  const executionState = { stage, worldTime, reasonCode, ...details };
+  await client.query(`UPDATE world_agreements SET metadata=metadata||jsonb_build_object('executionState',
+      COALESCE(metadata->'executionState','{}'::jsonb)||$3::jsonb),updated_world_time=GREATEST(updated_world_time,$4),updated_at=now()
+    WHERE world_id=$1 AND id=$2`, [worldId, agreementId, JSON.stringify(executionState), worldTime]);
+  await writeWorldHistory(client, { worldId, eventKey: `agreement-execution:${agreementId}:${key}`,
+    eventType: `agreement_${stage}`, actorAgentId: agentId, entityType: 'agreement', entityId: agreementId,
+    worldTime, title: `Agreement ${stage.replaceAll('_',' ')}`,
+    detail: reasonCode ? `${stage.replaceAll('_',' ')}; blocker or outcome: ${reasonCode}.`
+      : `${stage.replaceAll('_',' ')} for ${agreement.rows[0].agreement_type.replaceAll('_',' ')}.`,
+    metadata: { agreementType: agreement.rows[0].agreement_type, reasonCode, ...details } });
+  return true;
+}
+
+async function enqueueSupplierDeliveryCommitment(client, { agreement, worldTime }) {
+  const row = agreement;
+  if (!['service','supplier_relationship'].includes(row.agreement_type) || row.status !== 'active') return null;
+  const terms = row.terms || {};
+  const business = await client.query(`SELECT business.founder_agent_id,service.active
+    FROM world_businesses business JOIN world_business_services service
+      ON service.world_id=business.world_id AND service.business_id=business.id
+    WHERE business.world_id=$1 AND business.id=$2 AND service.id=$3`,
+  [row.world_id, terms.businessId, terms.serviceId]);
+  if (!business.rowCount) return null;
+  const providerId = business.rows[0].founder_agent_id;
+  const customerId = terms.customerAgentId
+    || (providerId === row.proposer_agent_id ? row.counterparty_agent_id : row.proposer_agent_id);
+  const maxUnits = agreementUnitLimit(terms);
+  const delivered = await client.query(`SELECT count(*)::int AS count FROM world_commitments
+    WHERE world_id=$1 AND agreement_id=$2 AND commitment_type='service' AND status='fulfilled'`, [row.world_id, row.id]);
+  const unitNumber = Number(delivered.rows[0]?.count || 0) + 1;
+  if (unitNumber > maxUnits) {
+    await client.query(`UPDATE world_agreements SET status='completed',completed_world_time=$3,updated_world_time=$3,
+        metadata=metadata||jsonb_build_object('completionReason','max_units_delivered'),updated_at=now()
+      WHERE world_id=$1 AND id=$2 AND status='active'`, [row.world_id, row.id, worldTime]);
+    await recordAgreementExecutionStage(client, { worldId: row.world_id, agreementId: row.id,
+      stage: 'completed', worldTime, eventKey: `max-units:${maxUnits}`, details: { deliveredUnits: unitNumber - 1, maxUnits } });
+    return null;
+  }
+  const active = await client.query(`SELECT * FROM world_commitments WHERE world_id=$1 AND agreement_id=$2
+    AND commitment_type='delivery' AND status='active' ORDER BY due_world_time,id LIMIT 1`, [row.world_id, row.id]);
+  if (active.rowCount) return active.rows[0];
+  if (!business.rows[0].active || !UUID_RE.test(String(customerId))) return null;
+  const actionId = `v51-supplier-delivery:${row.id}:${unitNumber}`;
+  const inserted = await client.query(`INSERT INTO world_commitments(world_id,agreement_id,agent_id,counterparty_agent_id,
+      commitment_type,description,due_world_time,action_id,metadata)
+    VALUES($1,$2,$3,$4,'delivery',$5,$6,$7,$8::jsonb)
+    ON CONFLICT(world_id,agent_id,action_id) DO NOTHING RETURNING *`,
+  [row.world_id, row.id, providerId, customerId,
+    `Make one contracted ${terms.serviceName || 'service'} unit available to the customer.`,
+    worldTime + Math.max(60, Math.min(43_200, Number(terms.deliveryDelayWorldMinutes) || 4_320)), actionId,
+    JSON.stringify({ businessId: terms.businessId, serviceId: terms.serviceId, customerAgentId: customerId,
+      unitNumber, maxUnits, priceUsdc: terms.priceUsdc })]);
+  const commitment = inserted.rows[0] || (await client.query(`SELECT * FROM world_commitments
+    WHERE world_id=$1 AND agent_id=$2 AND action_id=$3`, [row.world_id, providerId, actionId])).rows[0];
+  if (inserted.rowCount) await recordAgreementExecutionStage(client, { worldId: row.world_id,
+    agreementId: row.id, stage: 'commitment_created', worldTime, agentId: providerId,
+    eventKey: `commitment:${commitment.id}`, details: { commitmentId: commitment.id, unitNumber, maxUnits,
+      businessId: terms.businessId, serviceId: terms.serviceId, providerId, customerId } });
+  return commitment;
+}
+
+export async function resolveEmploymentAgreementOnExit(client, { worldId, employmentId, agentId, reason, worldTime,
+  commitmentOutcomeReason = 'voluntary_exit' }) {
+  const agreement = await client.query(`SELECT id,proposer_agent_id,counterparty_agent_id FROM world_agreements
+    WHERE world_id=$1 AND agreement_type='employment' AND status='active' AND terms->>'employmentId'=$2 FOR UPDATE`,
+  [worldId, employmentId]);
+  for (const row of agreement.rows) {
+    await client.query(`UPDATE world_agreements SET status='cancelled',updated_world_time=$3,
+        metadata=metadata||$4::jsonb,updated_at=now() WHERE world_id=$1 AND id=$2 AND status='active'`,
+    [worldId, row.id, worldTime, JSON.stringify({ resolution: { reason, actorAgentId: agentId, worldTime } })]);
+    await client.query(`UPDATE world_commitments SET status='cancelled',outcome_reason=$4,
+        completed_world_time=$3,updated_at=now(),metadata=metadata||$5::jsonb
+      WHERE world_id=$1 AND agreement_id=$2 AND status='active'`,
+    [worldId, row.id, worldTime, commitmentOutcomeReason, JSON.stringify({ resolution: reason })]);
+    await recordAgreementExecutionStage(client, { worldId, agreementId: row.id, stage: 'cancelled', worldTime,
+      agentId, eventKey: `employment-exit:${employmentId}:${reason}`, reasonCode: 'EMPLOYMENT_ENDED',
+      details: { employmentId, reason } });
+  }
+}
+
+export async function resolveBusinessAgreementsOnClosure(client, { worldId, businessId, founderAgentId,
+  worldTime, bankrupt = false }) {
+  const agreements = await client.query(`SELECT * FROM world_agreements WHERE world_id=$1 AND status='active'
+      AND terms->>'businessId'=$2::text ORDER BY id FOR UPDATE`, [worldId, businessId]);
+  for (const agreement of agreements.rows) {
+    const supplierContract = ['supplier_relationship','service'].includes(agreement.agreement_type);
+    const reason = bankrupt ? 'unable_to_fulfill' : 'voluntary_exit';
+    const nextStatus = supplierContract ? 'breached' : 'cancelled';
+    await client.query(`UPDATE world_commitments SET status=$3,outcome_reason=$4,completed_world_time=$5,updated_at=now(),
+        metadata=metadata||$6::jsonb WHERE world_id=$1 AND agreement_id=$2 AND status='active'`,
+    [worldId, agreement.id, supplierContract ? bankrupt ? 'unable' : 'breached' : 'cancelled', reason, worldTime,
+      JSON.stringify({ resolution: 'business_closed', businessId, bankrupt })]);
+    await client.query(`UPDATE world_agreements SET status=$3,updated_world_time=$4,
+        metadata=metadata||$5::jsonb,updated_at=now() WHERE world_id=$1 AND id=$2 AND status='active'`,
+    [worldId, agreement.id, nextStatus, worldTime,
+      JSON.stringify({ resolution: { reason: bankrupt ? 'provider_bankrupt' : 'provider_closed', worldTime } })]);
+    if (supplierContract) {
+      await recordAgreementOutcome(client, { worldId, agreementId: agreement.id, worldTime,
+        outcome: bankrupt ? 'unable' : 'breached', reason, actionId: `provider-closed:${businessId}:${agreement.id}`,
+        responsibleAgentId: founderAgentId, reputationScale: bankrupt ? 0.25 : 1 });
+    }
+    await recordAgreementExecutionStage(client, { worldId, agreementId: agreement.id,
+      stage: supplierContract ? 'breached' : 'cancelled', worldTime, agentId: founderAgentId,
+      eventKey: `provider-closed:${businessId}:${agreement.id}`, reasonCode: bankrupt ? 'PROVIDER_INSOLVENT' : 'PROVIDER_CLOSED',
+      details: { businessId, agreementStatus: nextStatus, reason } });
+  }
+}
+
+async function finalizeAgreementRenegotiation(client, { worldId, parentAgreementId, replacementAgreementId,
+  worldTime, actorAgentId }) {
+  const parent = await client.query(`SELECT * FROM world_agreements WHERE world_id=$1 AND id=$2 FOR UPDATE`,
+    [worldId, parentAgreementId]);
+  if (!parent.rowCount || parent.rows[0].status !== 'active') return false;
+  await client.query(`UPDATE world_commitments SET status='cancelled',completed_world_time=$3,updated_at=now(),
+      metadata=metadata||$4::jsonb WHERE world_id=$1 AND agreement_id=$2 AND status='active'`,
+  [worldId, parentAgreementId, worldTime, JSON.stringify({ resolution: 'renegotiated', replacementAgreementId })]);
+  await client.query(`UPDATE world_agreements SET status='cancelled',updated_world_time=$3,completed_world_time=$3,
+      metadata=(metadata-'renegotiationPending')||$4::jsonb,updated_at=now()
+    WHERE world_id=$1 AND id=$2 AND status='active'`,
+  [worldId, parentAgreementId, worldTime, JSON.stringify({ resolution: { reason: 'renegotiated',
+    replacementAgreementId, worldTime } })]);
+  await recordAgreementExecutionStage(client, { worldId, agreementId: parentAgreementId,
+    stage: 'renegotiated', worldTime, agentId: actorAgentId,
+    eventKey: `replacement:${replacementAgreementId}`, reasonCode: 'TERMS_REVISED',
+    details: { replacementAgreementId } });
+  for (const agentId of [parent.rows[0].proposer_agent_id, parent.rows[0].counterparty_agent_id]) {
+    const otherId = agentId === parent.rows[0].proposer_agent_id
+      ? parent.rows[0].counterparty_agent_id : parent.rows[0].proposer_agent_id;
+    await client.query(`INSERT INTO agent_memories(world_id,agent_id,memory_type,summary,importance,world_minutes,
+        related_agent_id,metadata,long_term,consolidation_key)
+      VALUES($1,$2,'contract','Renegotiated supplier terms with the other resident after a capacity delay.',
+        0.62,$3,$4,$5::jsonb,false,$6)
+      ON CONFLICT(world_id,agent_id,consolidation_key) WHERE consolidation_key IS NOT NULL DO NOTHING`,
+    [worldId, agentId, worldTime, otherId, JSON.stringify({ agreementId: parentAgreementId,
+      replacementAgreementId, outcome: 'renegotiated' }),
+    `contract:${parentAgreementId}:renegotiated:${replacementAgreementId}`]);
+  }
+  await recordInstitutionalMemory(client, { worldId, institutionType: 'business',
+    institutionId: parent.rows[0].terms.businessId, memoryType: 'conflict_resolved', worldTime,
+    summary: 'Supplier terms were renegotiated after a capacity delay.',
+    metadata: { agreementId: parentAgreementId, replacementAgreementId, outcome: 'renegotiated' } });
+  return true;
+}
+
+async function clearRenegotiationPending(client, { worldId, agreement }) {
+  const rootId = agreement.metadata?.renegotiates
+    || (agreement.metadata?.source === 'renegotiation' ? agreement.parent_agreement_id : null);
+  if (!rootId) return;
+  const pending = await client.query(`SELECT 1 FROM world_agreements WHERE world_id=$1
+    AND metadata->>'renegotiates'=$2 AND status='proposed' LIMIT 1`, [worldId, rootId]);
+  if (!pending.rowCount) await client.query(`UPDATE world_agreements SET metadata=metadata-'renegotiationPending',updated_at=now()
+    WHERE world_id=$1 AND id=$2 AND status='active'`, [worldId, rootId]);
+}
+
+async function resolveSupplierAgreementFailure(client, { agreement, worldTime, providerId, reasonCode,
+  outcome = 'unable', reputationScale = 0.25 }) {
+  const reason = outcome === 'breached' ? 'voluntary_exit' : 'unable_to_fulfill';
+  await client.query(`UPDATE world_commitments SET status=$3,outcome_reason=$4,completed_world_time=$5,updated_at=now(),
+      metadata=metadata||$6::jsonb WHERE world_id=$1 AND agreement_id=$2 AND status='active'`,
+  [agreement.world_id, agreement.id, outcome === 'breached' ? 'breached' : 'unable', reason, worldTime,
+    JSON.stringify({ resolution: reasonCode })]);
+  await client.query(`UPDATE world_agreements SET status='breached',updated_world_time=$3,
+      metadata=metadata||$4::jsonb,updated_at=now() WHERE world_id=$1 AND id=$2 AND status='active'`,
+  [agreement.world_id, agreement.id, worldTime, JSON.stringify({ resolution: { reasonCode, worldTime } })]);
+  await recordAgreementOutcome(client, { worldId: agreement.world_id, agreementId: agreement.id, worldTime,
+    outcome, reason, actionId: `supplier-failure:${agreement.id}:${reasonCode}`,
+    responsibleAgentId: providerId, reputationScale });
+  await recordAgreementExecutionStage(client, { worldId: agreement.world_id, agreementId: agreement.id,
+    stage: 'breached', worldTime, agentId: providerId, eventKey: `failure:${reasonCode}`, reasonCode,
+    details: { businessId: agreement.terms?.businessId, serviceId: agreement.terms?.serviceId,
+      outcome, agreementStatus: 'breached' } });
+}
+
+function serviceNeedIsPresent(serviceType, resident = {}) {
+  const goal = String(resident.primary_goal || resident.primaryGoal || '').toUpperCase();
+  if (serviceType === 'food_service') return Number(resident.food) < 76;
+  if (serviceType === 'social_service') return Number(resident.social) < 62 || /COMMUNITY|RELATIONSHIP/.test(goal);
+  if (serviceType === 'trading_service') return /TRADING|WEALTH|MARKET/.test(goal);
+  if (serviceType === 'engineering_service') return /ENGINEERING|BUILD/.test(goal) || Number(resident.knowledge) < 45;
+  return Number(resident.knowledge) < 62 || /RESEARCH|LEARN/.test(goal);
 }
 
 async function executeAgreement(client, agreement, worldTime) {
@@ -603,7 +862,8 @@ export async function respondToWorldAgreement(client, { worldId, agreementId, ag
       VALUES($1,$2,$3,$4,$5::jsonb,'proposed',$6,$7,$8,$9,$10,$9,$11::jsonb) RETURNING *`,
     [worldId, agreement.agreement_type, agentId, agreement.proposer_agent_id, JSON.stringify(normalized), agreement.id,
       Number(agreement.negotiation_round) + 1, key, worldTime, Math.min(Number(agreement.expires_world_time || worldTime + 1_440), worldTime + 1_440),
-      JSON.stringify({ source: 'counter_offer' })]);
+      JSON.stringify({ source: agreement.metadata?.renegotiates ? 'renegotiation_counter' : 'counter_offer',
+        ...(agreement.metadata?.renegotiates ? { renegotiates: agreement.metadata.renegotiates } : {}) })]);
     await insertParticipants(client, inserted.rows[0], worldTime);
     await client.query(`UPDATE world_agreements SET status='countered',updated_world_time=$3,updated_at=now(),
         metadata=metadata||$4::jsonb WHERE world_id=$1 AND id=$2`,
@@ -621,6 +881,7 @@ export async function respondToWorldAgreement(client, { worldId, agreementId, ag
     await client.query(`UPDATE world_agreements SET status='cancelled',updated_world_time=$3,updated_at=now(),
         metadata=metadata||$4::jsonb WHERE world_id=$1 AND id=$2`,
     [worldId, agreementId, worldTime, JSON.stringify({ responseActionId: key, cancelledBy: agentId })]);
+    await clearRenegotiationPending(client, { worldId, agreement });
     return { id: agreementId, status: 'cancelled' };
   }
   const status = choice === 'accept' ? 'active' : 'rejected';
@@ -636,6 +897,7 @@ export async function respondToWorldAgreement(client, { worldId, agreementId, ag
       eventType: 'agreement_rejected', actorAgentId: agentId, entityType: 'agreement', entityId: agreementId, worldTime,
       title: 'Agreement proposal declined', detail: 'A resident declined the proposed terms before they became binding.',
       metadata: { agreementType: agreement.agreement_type, response: 'rejected' } });
+    await clearRenegotiationPending(client, { worldId, agreement });
     return { id: agreementId, status: 'rejected' };
   }
   const execution = await executeAgreement(client, agreement, worldTime);
@@ -643,6 +905,16 @@ export async function respondToWorldAgreement(client, { worldId, agreementId, ag
   await client.query(`UPDATE world_agreements SET status=$3,completed_world_time=CASE WHEN $3='completed' THEN $4::bigint ELSE NULL END,
       updated_world_time=$4::bigint,updated_at=now(),metadata=metadata||$5::jsonb WHERE world_id=$1 AND id=$2`,
   [worldId, agreementId, terminal ? 'completed' : 'active', worldTime, JSON.stringify({ execution })]);
+  const renegotiatedParentId = agreement.metadata?.renegotiates
+    || (agreement.metadata?.source === 'renegotiation' ? agreement.parent_agreement_id : null);
+  if (!terminal && renegotiatedParentId) await finalizeAgreementRenegotiation(client, { worldId,
+    parentAgreementId: renegotiatedParentId, replacementAgreementId: agreement.id, worldTime, actorAgentId: agentId });
+  if (!terminal && ['service','supplier_relationship'].includes(agreement.agreement_type)) {
+    await recordAgreementExecutionStage(client, { worldId, agreementId, stage: 'agreement_active', worldTime,
+      agentId, eventKey: `accepted:${key}`, details: { agreementType: agreement.agreement_type,
+        businessId: agreement.terms.businessId, serviceId: agreement.terms.serviceId } });
+    await enqueueSupplierDeliveryCommitment(client, { agreement: { ...agreement, status: 'active' }, worldTime });
+  }
   if (terminal) await recordAgreementOutcome(client, { worldId, agreementId, worldTime, outcome: 'fulfilled', actionId: key });
   await writeWorldHistory(client, { worldId, eventKey: `agreement:${agreementId}:accepted`, eventType: 'agreement_accepted',
     actorAgentId: agentId, entityType: 'agreement', entityId: agreementId, worldTime,
@@ -788,23 +1060,24 @@ export async function settleActiveRevenueShares(client, { worldId, businessId, b
 }
 
 export async function activeServicePriceAgreement(client, { worldId, businessId, serviceId, customerAgentId, providerAgentId,
-  worldTime }) {
+  worldTime, agreementId = null }) {
   const result = await client.query(`SELECT agreement.id,agreement.agreement_type,agreement.terms
     FROM world_agreements agreement WHERE agreement.world_id=$1 AND agreement.status='active'
       AND agreement.agreement_type IN ('service','supplier_relationship')
+      AND ($6::uuid IS NULL OR agreement.id=$6::uuid)
       AND agreement.terms->>'businessId'=$2::text AND agreement.terms->>'serviceId'=$3::text
       AND $4 IN (agreement.proposer_agent_id,agreement.counterparty_agent_id)
       AND $5 IN (agreement.proposer_agent_id,agreement.counterparty_agent_id)
       AND agreement.proposer_agent_id<>agreement.counterparty_agent_id
       AND (agreement.terms->>'customerAgentId' IS NULL OR agreement.terms->>'customerAgentId'=$4::text)
       ORDER BY agreement.agreement_type='service' DESC,agreement.updated_world_time DESC
-      LIMIT 1 FOR UPDATE`, [worldId, businessId, serviceId, customerAgentId, providerAgentId]);
+      LIMIT 1 FOR UPDATE`, [worldId, businessId, serviceId, customerAgentId, providerAgentId, agreementId]);
   if (!result.rowCount) return null;
   const agreement = result.rows[0];
   if (agreement.agreement_type === 'service' || agreement.agreement_type === 'supplier_relationship') {
     const used = await client.query(`SELECT count(*)::int AS count FROM world_commitments WHERE world_id=$1 AND agreement_id=$2
-      AND status='fulfilled'`, [worldId, agreement.id]);
-    const limit = Number(agreement.terms.units || agreement.terms.maxUnits || 1);
+      AND commitment_type='service' AND status='fulfilled'`, [worldId, agreement.id]);
+    const limit = agreementUnitLimit(agreement.terms);
     if (Number(used.rows[0].count) >= limit) {
       await client.query(`UPDATE world_agreements SET status='completed',completed_world_time=$3,updated_world_time=$3,
         updated_at=now() WHERE world_id=$1 AND id=$2 AND status='active'`, [worldId, agreement.id, worldTime]);
@@ -828,19 +1101,47 @@ export async function settleServiceDelivery(client, { worldId, agreementId, cust
     ON CONFLICT(world_id,agent_id,action_id) DO NOTHING RETURNING id`,
   [worldId, agreementId, providerAgentId, customerAgentId, worldTime, commitmentId, JSON.stringify({ businessId, orderId })]);
   if (!inserted.rowCount) return;
+  if (['service','supplier_relationship'].includes(row.agreement_type)) {
+    const activeDelivery = await client.query(`SELECT id FROM world_commitments WHERE world_id=$1 AND agreement_id=$2
+      AND commitment_type='delivery' AND status='active' ORDER BY due_world_time,id LIMIT 1 FOR UPDATE`, [worldId, agreementId]);
+    if (activeDelivery.rowCount) await client.query(`UPDATE world_commitments SET status='fulfilled',outcome_reason='completed',
+        completed_world_time=$3,updated_at=now(),metadata=metadata||$4::jsonb WHERE world_id=$1 AND id=$2`,
+    [worldId, activeDelivery.rows[0].id, worldTime, JSON.stringify({ deliveredByOrderId: orderId, deliveryActionId: actionId })]);
+  }
+  await recordAgreementExecutionStage(client, { worldId, agreementId, stage: 'delivered', worldTime,
+    agentId: providerAgentId, eventKey: `delivered:${actionId}`,
+    details: { businessId, orderId, customerAgentId, providerAgentId } });
+  const order = await client.query(`SELECT transaction_id FROM world_business_orders WHERE world_id=$1 AND id=$2`,
+    [worldId, orderId]);
+  await recordAgreementExecutionStage(client, { worldId, agreementId, stage: 'payment_settled', worldTime,
+    agentId: customerAgentId, eventKey: `payment:${actionId}`,
+    details: { orderId, transactionId: order.rows[0]?.transaction_id || null, customerAgentId, providerAgentId } });
   if (row.agreement_type === 'service') {
     const deliveries = await client.query(`SELECT count(*)::int AS count FROM world_commitments
       WHERE world_id=$1 AND agreement_id=$2 AND commitment_type='service' AND status='fulfilled'`, [worldId, agreementId]);
-    if (Number(deliveries.rows[0]?.count) >= Number(row.terms.units || 1)) {
-    await client.query(`UPDATE world_agreements SET status='completed',completed_world_time=$3,updated_world_time=$3,
-      updated_at=now() WHERE world_id=$1 AND id=$2 AND status='active'`, [worldId, agreementId, worldTime]);
+    const maxUnits = agreementUnitLimit(row.terms);
+    if (Number(deliveries.rows[0]?.count) >= maxUnits) {
+      await client.query(`UPDATE world_agreements SET status='completed',completed_world_time=$3,updated_world_time=$3,
+        metadata=metadata||'{"completionReason":"max_units_delivered"}'::jsonb,updated_at=now()
+        WHERE world_id=$1 AND id=$2 AND status='active'`, [worldId, agreementId, worldTime]);
+      await recordAgreementExecutionStage(client, { worldId, agreementId, stage: 'completed', worldTime,
+        agentId: providerAgentId, eventKey: `units:${deliveries.rows[0]?.count}`,
+        details: { deliveredUnits: Number(deliveries.rows[0]?.count), maxUnits } });
     }
-  } else if (row.agreement_type === 'supplier_relationship' && Number(row.terms.maxUnits) > 0) {
+  } else if (row.agreement_type === 'supplier_relationship') {
     const deliveries = await client.query(`SELECT count(*)::int AS count FROM world_commitments
       WHERE world_id=$1 AND agreement_id=$2 AND commitment_type='service' AND status='fulfilled'`, [worldId, agreementId]);
-    if (Number(deliveries.rows[0]?.count) >= Number(row.terms.maxUnits)) {
+    const maxUnits = agreementUnitLimit(row.terms);
+    if (Number(deliveries.rows[0]?.count) >= maxUnits) {
       await client.query(`UPDATE world_agreements SET status='completed',completed_world_time=$3,updated_world_time=$3,
-        updated_at=now() WHERE world_id=$1 AND id=$2 AND status='active'`, [worldId, agreementId, worldTime]);
+        metadata=metadata||'{"completionReason":"max_units_delivered"}'::jsonb,updated_at=now()
+        WHERE world_id=$1 AND id=$2 AND status='active'`, [worldId, agreementId, worldTime]);
+      await recordAgreementExecutionStage(client, { worldId, agreementId, stage: 'completed', worldTime,
+        agentId: providerAgentId, eventKey: `max-units:${deliveries.rows[0]?.count}`,
+        details: { deliveredUnits: Number(deliveries.rows[0]?.count), maxUnits } });
+    } else {
+      const current = await client.query(`SELECT * FROM world_agreements WHERE world_id=$1 AND id=$2`, [worldId, agreementId]);
+      await enqueueSupplierDeliveryCommitment(client, { agreement: current.rows[0], worldTime });
     }
   }
   await recordAgreementOutcome(client, { worldId, agreementId, worldTime, outcome: 'fulfilled', actionId: commitmentId });
@@ -848,9 +1149,140 @@ export async function settleServiceDelivery(client, { worldId, agreementId, cust
 
 export async function expireInstitutionalState(client, { worldId, worldTime }) {
   const expiredOffers = await client.query(`UPDATE world_agreements SET status='expired',updated_world_time=$2,updated_at=now()
-    WHERE world_id=$1 AND status='proposed' AND expires_world_time<=$2 RETURNING id,agreement_type`, [worldId, worldTime]);
+    WHERE world_id=$1 AND status='proposed' AND expires_world_time<=$2
+    RETURNING id,agreement_type,parent_agreement_id,metadata`, [worldId, worldTime]);
+  for (const agreement of expiredOffers.rows) await clearRenegotiationPending(client, { worldId, agreement });
+
+  const endedEmployment = await client.query(`SELECT agreement.terms->>'employmentId' AS employment_id,
+      agreement.counterparty_agent_id AS employee_id,agreement.proposer_agent_id AS employer_id,
+      employment.status AS employment_status,business.status AS business_status
+    FROM world_agreements agreement LEFT JOIN world_businesses business ON business.world_id=agreement.world_id
+      AND business.id=(agreement.terms->>'businessId')::uuid
+    LEFT JOIN world_business_employment employment ON employment.world_id=agreement.world_id
+      AND employment.id=(agreement.terms->>'employmentId')::uuid
+    WHERE agreement.world_id=$1 AND agreement.agreement_type='employment' AND agreement.status='active'
+      AND (employment.status IS DISTINCT FROM 'active' OR business.status IS DISTINCT FROM 'active')
+    ORDER BY agreement.id`, [worldId]);
+  for (const item of endedEmployment.rows) await resolveEmploymentAgreementOnExit(client, {
+    worldId, employmentId: item.employment_id,
+    agentId: item.employment_status === 'left' ? item.employee_id : item.employer_id,
+    reason: item.business_status === 'active' ? 'employee_left' : 'business_closed', worldTime,
+    commitmentOutcomeReason: item.business_status === 'active' ? 'voluntary_exit' : null
+  });
+
+  const unavailableSuppliers = await client.query(`SELECT agreement.terms->>'businessId' AS business_id,
+      COALESCE(business.founder_agent_id,agreement.proposer_agent_id) AS provider_id,
+      agreement.id AS agreement_id,agreement.world_id,agreement.terms,business.status AS business_status,
+      business.metadata AS business_metadata,service.id AS service_id,service.active AS service_active,
+      place.status AS place_status
+    FROM world_agreements agreement LEFT JOIN world_businesses business ON business.world_id=agreement.world_id
+      AND business.id=(agreement.terms->>'businessId')::uuid
+    LEFT JOIN world_business_services service ON service.world_id=agreement.world_id
+      AND service.business_id=business.id AND service.id=(agreement.terms->>'serviceId')::uuid
+    LEFT JOIN world_scenes place ON place.world_id=business.world_id AND place.id=business.place_id
+    WHERE agreement.world_id=$1 AND agreement.status='active'
+      AND agreement.agreement_type IN ('supplier_relationship','service')
+      AND (business.id IS NULL OR business.status<>'active' OR service.id IS NULL OR service.active=false
+        OR (business.place_id IS NOT NULL AND place.status IS DISTINCT FROM 'active'))
+    ORDER BY agreement.id`, [worldId]);
+  let resolvedSupplierFailures = 0;
+  const closedBusinessIds = new Set();
+  for (const item of unavailableSuppliers.rows) {
+    if (item.business_id && (item.business_status === 'closed' || item.business_status === 'bankrupt')) {
+      closedBusinessIds.add(item.business_id);
+      continue;
+    }
+    const reasonCode = !item.service_id || item.service_active === false || item.place_status !== 'active'
+      ? 'NO_REQUIRED_PLACE' : 'PROVIDER_CLOSED';
+    await resolveSupplierAgreementFailure(client, { agreement: { id: item.agreement_id, world_id: item.world_id,
+      terms: item.terms }, worldTime, providerId: item.provider_id, reasonCode });
+    resolvedSupplierFailures++;
+  }
+  for (const businessId of closedBusinessIds) {
+    const item = unavailableSuppliers.rows.find((row) => row.business_id === businessId);
+    const latest = await client.query(`SELECT founder_agent_id,status,metadata FROM world_businesses
+      WHERE world_id=$1 AND id=$2`, [worldId, businessId]);
+    if (!latest.rowCount) continue;
+    await resolveBusinessAgreementsOnClosure(client, { worldId, businessId,
+      founderAgentId: latest.rows[0].founder_agent_id, worldTime,
+      bankrupt: latest.rows[0].status === 'bankrupt'
+        || latest.rows[0].metadata?.closedReason === 'owner_declared_bankruptcy' });
+    void item;
+  }
+
+  const activeSupplierAgreements = await client.query(`SELECT agreement.* FROM world_agreements agreement
+    JOIN world_businesses business ON business.world_id=agreement.world_id
+      AND business.id=(agreement.terms->>'businessId')::uuid AND business.status='active'
+    JOIN world_business_services service ON service.world_id=business.world_id AND service.business_id=business.id
+      AND service.id=(agreement.terms->>'serviceId')::uuid AND service.active=true
+    WHERE agreement.world_id=$1 AND agreement.agreement_type IN ('service','supplier_relationship') AND agreement.status='active'
+    ORDER BY agreement.created_world_time,agreement.id`, [worldId]);
+  let supplierCommitmentsCreated = 0;
+  for (const agreement of activeSupplierAgreements.rows) {
+    const fulfilled = await client.query(`SELECT count(*)::int AS count FROM world_commitments WHERE world_id=$1
+      AND agreement_id=$2 AND commitment_type='service' AND status='fulfilled'`, [worldId, agreement.id]);
+    if (Number(fulfilled.rows[0]?.count || 0) >= agreementUnitLimit(agreement.terms)) {
+      await client.query(`UPDATE world_agreements SET status='completed',completed_world_time=$3,updated_world_time=$3,
+          metadata=metadata||'{"completionReason":"max_units_delivered"}'::jsonb,updated_at=now()
+        WHERE world_id=$1 AND id=$2 AND status='active'`, [worldId, agreement.id, worldTime]);
+      await recordAgreementExecutionStage(client, { worldId, agreementId: agreement.id, stage: 'completed',
+        worldTime, eventKey: `max-units:${fulfilled.rows[0]?.count}`,
+        details: { deliveredUnits: Number(fulfilled.rows[0]?.count) } });
+      continue;
+    }
+    const before = await client.query(`SELECT count(*)::int AS count FROM world_commitments WHERE world_id=$1
+      AND agreement_id=$2 AND commitment_type='delivery' AND status='active'`, [worldId, agreement.id]);
+    const created = await enqueueSupplierDeliveryCommitment(client, { agreement, worldTime });
+    if (!before.rows[0]?.count && created) supplierCommitmentsCreated++;
+  }
+
+  const dueSupplierDeliveries = await client.query(`SELECT commitment.id AS commitment_id,commitment.agreement_id,
+      agreement.world_id,agreement.terms,agreement.proposer_agent_id,agreement.counterparty_agent_id,
+      service.stock_units,service.service_type,service.base_price_usdc,business.founder_agent_id,
+      COALESCE(account.balance,0)::text AS customer_cash,member.food,member.social,
+      COALESCE(state.knowledge,20) AS knowledge,profile.primary_goal
+    FROM world_commitments commitment JOIN world_agreements agreement
+      ON agreement.world_id=commitment.world_id AND agreement.id=commitment.agreement_id AND agreement.status='active'
+    JOIN world_businesses business ON business.world_id=agreement.world_id
+      AND business.id=(agreement.terms->>'businessId')::uuid
+    JOIN world_business_services service ON service.world_id=business.world_id AND service.business_id=business.id
+      AND service.id=(agreement.terms->>'serviceId')::uuid
+    JOIN world_members member ON member.world_id=agreement.world_id AND member.agent_id=commitment.counterparty_agent_id
+    LEFT JOIN world_agent_states state ON state.world_id=member.world_id AND state.agent_id=member.agent_id
+    LEFT JOIN world_social_profiles profile ON profile.world_id=member.world_id AND profile.agent_id=member.agent_id
+    LEFT JOIN world_economic_accounts account ON account.world_id=member.world_id
+      AND account.account_type='resident' AND account.owner_id=member.agent_id AND account.asset_symbol='USDC'
+    WHERE commitment.world_id=$1 AND commitment.status='active' AND commitment.commitment_type='delivery'
+      AND agreement.agreement_type IN ('service','supplier_relationship') AND commitment.due_world_time<=$2
+      AND COALESCE(agreement.metadata->>'renegotiationPending','false')<>'true'
+    ORDER BY commitment.due_world_time,commitment.id FOR UPDATE OF commitment,agreement`, [worldId, worldTime]);
+  for (const delivery of dueSupplierDeliveries.rows) {
+    const cash = Number(delivery.customer_cash) || 0;
+    const price = Number(delivery.terms.priceUsdc) || Number(delivery.base_price_usdc) || 0;
+    const demand = serviceNeedIsPresent(delivery.service_type, delivery);
+    if (Number(delivery.stock_units) > 0) {
+      const reasonCode = cash < price ? 'NO_FUNDS' : !demand ? 'NO_CUSTOMER_DEMAND' : 'EXECUTION_NOT_SELECTED';
+      await client.query(`UPDATE world_commitments SET status='expired',completed_world_time=$3,updated_at=now(),
+          metadata=metadata||$4::jsonb WHERE world_id=$1 AND id=$2 AND status='active'`,
+      [worldId, delivery.commitment_id, worldTime, JSON.stringify({ resolution: reasonCode })]);
+      await client.query(`UPDATE world_agreements SET status='expired',updated_world_time=$3,
+          metadata=metadata||$4::jsonb,updated_at=now() WHERE world_id=$1 AND id=$2 AND status='active'`,
+      [worldId, delivery.agreement_id, worldTime, JSON.stringify({ resolution: { reasonCode, worldTime } })]);
+      await recordAgreementExecutionStage(client, { worldId, agreementId: delivery.agreement_id, stage: 'expired',
+        worldTime, eventKey: `delivery:${delivery.commitment_id}:${reasonCode}`, reasonCode,
+        details: { commitmentId: delivery.commitment_id, stockUnits: Number(delivery.stock_units), customerCash: cash, price } });
+    } else {
+      await resolveSupplierAgreementFailure(client, { agreement: { id: delivery.agreement_id,
+        world_id: worldId, terms: delivery.terms }, worldTime, providerId: delivery.founder_agent_id,
+        reasonCode: 'NO_INVENTORY', outcome: 'unable', reputationScale: 0.25 });
+      resolvedSupplierFailures++;
+    }
+  }
+
   const expiredCommitments = await client.query(`UPDATE world_commitments SET status='breached',outcome_reason='missed_deadline',
       completed_world_time=$2,updated_at=now() WHERE world_id=$1 AND status='active' AND due_world_time<=$2
+      AND NOT (commitment_type='delivery' AND agreement_id IN (SELECT id FROM world_agreements
+        WHERE world_id=$1 AND agreement_type IN ('service','supplier_relationship')))
     RETURNING id,agreement_id,agent_id,counterparty_agent_id,description,commitment_type`, [worldId, worldTime]);
   for (const item of expiredCommitments.rows) {
     await recordAgreementOutcome(client, { worldId, agreementId: item.agreement_id, worldTime, outcome: 'breached',
@@ -866,7 +1298,9 @@ export async function expireInstitutionalState(client, { worldId, worldTime }) {
   }
   const expiredProposals = await client.query(`UPDATE world_organization_proposals SET status='expired',resolved_world_time=$2,updated_at=now()
     WHERE world_id=$1 AND status='proposed' AND expires_world_time<=$2 RETURNING id,organization_id,proposer_agent_id`, [worldId, worldTime]);
-  return { agreements: expiredOffers.rowCount, commitments: expiredCommitments.rowCount, organizationProposals: expiredProposals.rowCount };
+  return { agreements: expiredOffers.rowCount, commitments: expiredCommitments.rowCount,
+    supplierCommitmentsCreated, supplierFailures: resolvedSupplierFailures,
+    organizationProposals: expiredProposals.rowCount };
 }
 
 export async function listWorldAgreements(client, { worldId, agentId = null, status = null, limit = 100 }) {
@@ -973,8 +1407,9 @@ function governanceVote(proposal, organization, cash, trust, reputation, skill) 
 }
 
 /**
- * A low-frequency institutional lane, separate from Fruitfly's tactical choice.
- * It returns one explainable action for the caller to schedule, or null.
+ * A low-frequency institutional planner. Returned actions remain candidates;
+ * the world engine qualifies them with the normal candidate set and Fruitfly
+ * makes the final selection.
  */
 export async function planInstitutionalAction(client, { worldId, agent, worldTime }) {
   const agentId = agent.agentId;
@@ -1091,13 +1526,77 @@ export async function planInstitutionalAction(client, { worldId, agent, worldTim
           evidence: { reputation, templateReference: referenceValue } } });
   }
 
-  const commitment = await client.query(`SELECT commitment.*,agreement.agreement_type,agreement.terms
+  const commitment = await client.query(`SELECT commitment.*,agreement.agreement_type,agreement.terms,
+      agreement.metadata AS agreement_metadata
     FROM world_commitments commitment JOIN world_agreements agreement ON agreement.world_id=commitment.world_id
       AND agreement.id=commitment.agreement_id
     WHERE commitment.world_id=$1 AND commitment.agent_id=$2 AND commitment.status='active'
-    ORDER BY commitment.due_world_time,commitment.id LIMIT 1`, [worldId, agentId]);
+    ORDER BY CASE WHEN commitment.commitment_type='delivery'
+      AND agreement.agreement_type IN ('service','supplier_relationship') THEN 0 ELSE 1 END,
+      commitment.due_world_time,commitment.id LIMIT 1`, [worldId, agentId]);
   if (commitment.rowCount) {
     const duty = commitment.rows[0];
+    if (duty.commitment_type === 'delivery' && ['service','supplier_relationship'].includes(duty.agreement_type)) {
+      const supplier = await client.query(`SELECT business.id AS business_id,business.status AS business_status,
+          business.name AS business_name,business.founder_agent_id,service.id AS service_id,
+          service.name AS service_name,service.service_type,service.active AS service_active,
+          service.stock_units,place.name AS place_name,place.status AS place_status
+        FROM world_businesses business LEFT JOIN world_business_services service
+          ON service.world_id=business.world_id AND service.business_id=business.id
+            AND service.id=(SELECT agreement.terms->>'serviceId' FROM world_agreements agreement
+              WHERE agreement.world_id=$1 AND agreement.id=$2)::uuid
+        LEFT JOIN world_scenes place ON place.world_id=business.world_id AND place.id=business.place_id
+        WHERE business.world_id=$1 AND business.id=$3`, [worldId, duty.agreement_id, duty.terms.businessId]);
+      const provider = supplier.rows[0];
+      if (!provider || provider.business_status !== 'active') return institutionCandidate(agent,
+        'commitment_resolve', `${duty.id}:provider-closed`, 'Resolve a supplier obligation whose business has closed', 125,
+        { commitmentId: duty.id, outcome: 'unable', institutionalTrace: { agreementId: duty.agreement_id,
+          commitmentId: duty.id, reason: 'PROVIDER_CLOSED' } });
+      if (!provider.service_active || (provider.place_name && provider.place_status !== 'active')) return institutionCandidate(agent,
+        'commitment_resolve', `${duty.id}:service-unavailable`, 'Resolve a supplier obligation whose service venue is unavailable', 125,
+        { commitmentId: duty.id, outcome: 'unable', institutionalTrace: { agreementId: duty.agreement_id,
+          commitmentId: duty.id, reason: 'NO_REQUIRED_PLACE' } });
+      if (Number(provider.stock_units) < 1) {
+        if (Number(duty.due_world_time) > worldTime && Number(duty.due_world_time) <= worldTime + 1_440
+            && !duty.agreement_metadata?.renegotiationPending) {
+          const fulfilled = await client.query(`SELECT count(*)::int AS count FROM world_commitments WHERE world_id=$1
+            AND agreement_id=$2 AND commitment_type='service' AND status='fulfilled'`, [worldId, duty.agreement_id]);
+          const remainingUnits = Math.max(1, agreementUnitLimit(duty.terms) - Number(fulfilled.rows[0]?.count || 0));
+          const revisedTerms = { ...duty.terms, deliveryDelayWorldMinutes: Math.min(43_200,
+            Math.max(8_640, (Number(duty.terms.deliveryDelayWorldMinutes) || 4_320) * 2)) };
+          if (duty.agreement_type === 'supplier_relationship') revisedTerms.maxUnits = remainingUnits;
+          else revisedTerms.units = remainingUnits;
+          return institutionCandidate(agent, 'agreement_propose', `${duty.agreement_id}:capacity-renegotiation`,
+            'Ask the customer to revise the delivery window after production capacity fell short', 104,
+            { counterpartyAgentId: duty.counterparty_agent_id, agreementType: duty.agreement_type,
+              agreementTerms: revisedTerms, parentAgreementId: duty.agreement_id, expiresInWorldMinutes: 720,
+              institutionalTrace: { agreementId: duty.agreement_id, commitmentId: duty.id,
+                reason: 'CAPACITY_SHORTAGE', stockUnits: Number(provider.stock_units),
+                revisedDeliveryDelayWorldMinutes: revisedTerms.deliveryDelayWorldMinutes } });
+        }
+        if (Number(agent.energy) < 20 || Number(agent.food) < 12) {
+          await recordAgreementExecutionStage(client, { worldId, agreementId: duty.agreement_id,
+            stage: 'blocked', worldTime, agentId, eventKey: `needs:${duty.id}:${Math.floor(worldTime / 360)}`,
+            reasonCode: Number(agent.energy) < 20 ? 'ENERGY_LOW' : 'FOOD_LOW',
+            details: { commitmentId: duty.id, currentEnergy: Number(agent.energy) || 0,
+              currentFood: Number(agent.food) || 0, requiredEnergy: 20, requiredFood: 12 } });
+        } else {
+          return institutionCandidate(agent, 'business_work', `${duty.id}:contract-production`,
+            `Produce one ${provider.service_name} unit for the supplier contract`, 120,
+            { businessId: provider.business_id, serviceId: provider.service_id, commitmentId: duty.id,
+              contractAgreementId: duty.agreement_id, targetLocation: provider.place_name || agent.location,
+              institutionalTrace: { agreementId: duty.agreement_id, commitmentId: duty.id,
+                businessId: provider.business_id, serviceId: provider.service_id,
+                inventory: Number(provider.stock_units) || 0, action: 'business_work' } });
+        }
+      } else {
+        await recordAgreementExecutionStage(client, { worldId, agreementId: duty.agreement_id,
+          stage: 'delivery_ready', worldTime, agentId,
+          eventKey: `ready:${duty.id}:${Number(provider.stock_units)}`,
+          details: { commitmentId: duty.id, businessId: provider.business_id, serviceId: provider.service_id,
+            stockUnits: Number(provider.stock_units), customerAgentId: duty.counterparty_agent_id } });
+      }
+    }
     if (duty.commitment_type === 'work' && duty.agreement_type === 'employment') {
       const job = await client.query(`SELECT employment.business_id,employment.id AS employment_id,job.id AS service_id,
           job.active AS service_active,business.status AS business_status
@@ -1159,9 +1658,103 @@ export async function planInstitutionalAction(client, { worldId, agent, worldTim
     }
   }
 
+  const contractedPurchases = await client.query(`SELECT agreement.id AS agreement_id,agreement.terms,
+      service.id AS service_id,service.name AS service_name,service.service_type,service.stock_units,
+      business.name AS business_name,business.founder_agent_id,place.name AS place_name
+    FROM world_agreements agreement JOIN world_businesses business
+      ON business.world_id=agreement.world_id AND business.id=(agreement.terms->>'businessId')::uuid
+        AND business.status='active'
+    JOIN world_business_services service ON service.world_id=business.world_id AND service.business_id=business.id
+      AND service.id=(agreement.terms->>'serviceId')::uuid AND service.active=true
+    LEFT JOIN world_scenes place ON place.world_id=business.world_id AND place.id=business.place_id
+    WHERE agreement.world_id=$1 AND agreement.status='active'
+      AND agreement.agreement_type IN ('service','supplier_relationship')
+      AND (agreement.terms->>'customerAgentId'=$2::text OR
+        (agreement.terms->>'customerAgentId' IS NULL AND
+          CASE WHEN business.founder_agent_id=agreement.proposer_agent_id THEN agreement.counterparty_agent_id
+            ELSE agreement.proposer_agent_id END=$2::uuid))
+      AND agreement.proposer_agent_id<>agreement.counterparty_agent_id
+    ORDER BY agreement.accepted_world_time,agreement.id`, [worldId, agentId]);
+  for (const contract of contractedPurchases.rows) {
+    if (contract.founder_agent_id === agentId) continue;
+    const limit = agreementUnitLimit(contract.terms);
+    const delivered = await client.query(`SELECT count(*)::int AS count FROM world_commitments WHERE world_id=$1
+      AND agreement_id=$2 AND commitment_type='service' AND status='fulfilled'`, [worldId, contract.agreement_id]);
+    if (Number(delivered.rows[0]?.count || 0) >= limit) continue;
+    if (Number(contract.stock_units) < 1) {
+      await recordAgreementExecutionStage(client, { worldId, agreementId: contract.agreement_id,
+        stage: 'blocked', worldTime, agentId,
+        eventKey: `buyer-inventory:${agentId}:${Math.floor(worldTime / INSTITUTIONAL_RETRY_WORLD_MINUTES)}`,
+        reasonCode: 'NO_PROVIDER_INVENTORY',
+        details: { businessId: contract.terms.businessId, serviceId: contract.service_id,
+          stockUnits: Number(contract.stock_units) || 0 } });
+      await scheduleInstitutionalRetry(client, { worldId, agentId, worldTime });
+      continue;
+    }
+    if (!serviceNeedIsPresent(contract.service_type, agent)) {
+      await recordAgreementExecutionStage(client, { worldId, agreementId: contract.agreement_id,
+        stage: 'blocked', worldTime, agentId,
+        eventKey: `buyer-need:${agentId}:${Math.floor(worldTime / 360)}`, reasonCode: 'NO_CUSTOMER_DEMAND',
+        details: { serviceId: contract.service_id, serviceType: contract.service_type,
+          stockUnits: Number(contract.stock_units) } });
+      await scheduleInstitutionalRetry(client, { worldId, agentId, worldTime });
+      continue;
+    }
+    const price = Number(contract.terms.priceUsdc) || 0;
+    if (wealth < price) {
+      await recordAgreementExecutionStage(client, { worldId, agreementId: contract.agreement_id,
+        stage: 'blocked', worldTime, agentId,
+        eventKey: `buyer-funds:${agentId}:${Math.floor(worldTime / 360)}`, reasonCode: 'NO_FUNDS',
+        details: { priceUsdc: contract.terms.priceUsdc, availableUsdc: wealth } });
+      await scheduleInstitutionalRetry(client, { worldId, agentId, worldTime });
+      continue;
+    }
+    return institutionCandidate(agent, 'business_service', `${contract.agreement_id}:purchase:${Number(delivered.rows[0]?.count || 0) + 1}`,
+      `Purchase ${contract.service_name} from the supplier under the agreed price`, 118,
+      { businessId: contract.terms.businessId, serviceId: contract.service_id,
+        maxPriceUsdc: contract.terms.priceUsdc, contractAgreementId: contract.agreement_id,
+        targetLocation: contract.place_name || agent.location,
+        institutionalTrace: { agreementId: contract.agreement_id, serviceId: contract.service_id,
+          customerAgentId: agentId, providerAgentId: contract.founder_agent_id,
+          stockUnits: Number(contract.stock_units), priceUsdc: contract.terms.priceUsdc, action: 'business_service' } });
+  }
+
+  const contractedEmployeeWork = await client.query(`SELECT commitment.id AS commitment_id,commitment.agreement_id,
+      commitment.due_world_time,business.id AS business_id,service.id AS service_id,employment.id AS employment_id,
+      service.name AS service_name,service.stock_units,place.name AS place_name
+    FROM world_business_employment employment JOIN world_businesses business
+      ON business.world_id=employment.world_id AND business.id=employment.business_id AND business.status='active'
+    JOIN world_business_services service ON service.world_id=business.world_id AND service.business_id=business.id
+      AND service.active=true AND service.stock_units<1
+    JOIN world_commitments commitment ON commitment.world_id=employment.world_id
+      AND commitment.agent_id=business.founder_agent_id AND commitment.status='active'
+      AND commitment.commitment_type='delivery'
+    JOIN world_agreements agreement ON agreement.world_id=commitment.world_id AND agreement.id=commitment.agreement_id
+      AND agreement.status='active' AND agreement.agreement_type IN ('service','supplier_relationship')
+      AND agreement.terms->>'businessId'=business.id::text AND agreement.terms->>'serviceId'=service.id::text
+    LEFT JOIN world_scenes place ON place.world_id=business.world_id AND place.id=business.place_id
+    WHERE employment.world_id=$1 AND employment.agent_id=$2 AND employment.status='active'
+      AND NOT EXISTS (SELECT 1 FROM world_commitments own WHERE own.world_id=employment.world_id
+        AND own.agent_id=employment.agent_id AND own.status='active')
+    ORDER BY commitment.due_world_time,commitment.id LIMIT 1`, [worldId, agentId]);
+  if (contractedEmployeeWork.rowCount && Number(agent.energy) >= 20 && Number(agent.food) >= 12) {
+    const row = contractedEmployeeWork.rows[0];
+    return institutionCandidate(agent, 'business_work', `${row.commitment_id}:employee-production`,
+      `Produce one ${row.service_name} unit as a paid shift to fulfill the supplier agreement`, 116,
+      { businessId: row.business_id, serviceId: row.service_id, employmentId: row.employment_id,
+        contractAgreementId: row.agreement_id, commitmentId: row.commitment_id,
+        targetLocation: row.place_name || agent.location,
+        institutionalTrace: { agreementId: row.agreement_id, commitmentId: row.commitment_id,
+          businessId: row.business_id, serviceId: row.service_id, employmentId: row.employment_id,
+          stockUnits: Number(row.stock_units), action: 'business_work', hiringReason: 'FULFILL_CONTRACT' } });
+  }
+
   const activeCommitments = Number((await client.query(`SELECT count(*)::int AS count FROM world_commitments
     WHERE world_id=$1 AND agent_id=$2 AND status='active'`, [worldId, agentId])).rows[0]?.count || 0);
-  if (activeCommitments > 0) return null;
+  if (activeCommitments > 0) {
+    await scheduleInstitutionalRetry(client, { worldId, agentId, worldTime });
+    return null;
+  }
 
   const supplier = await client.query(`SELECT business.id AS business_id,service.id AS service_id,business.founder_agent_id,
         business.name AS business_name,service.name AS service_name,service.service_type,

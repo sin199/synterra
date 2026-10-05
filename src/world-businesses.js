@@ -1,7 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import { formatUnits, parsePositiveUnits } from './crypto-market.js';
 import { ensureEconomicAccount, getEconomicAccount, postEconomicTransfer, transferBetweenAccounts } from './economic-ledger.js';
-import { activeServicePriceAgreement, createSystemEmploymentAgreement, recordEmploymentShift,
+import { activeServicePriceAgreement, createSystemEmploymentAgreement, recordAgreementExecutionStage,
+  recordEmploymentShift, resolveBusinessAgreementsOnClosure, resolveEmploymentAgreementOnExit,
   settleActiveRevenueShares, settleServiceDelivery } from './world-institutions.js';
 
 const SERVICE_INFO = Object.freeze({
@@ -596,7 +597,8 @@ export async function observeResidentEconomicMarket(client, { worldId, agent, co
 }
 
 export async function loadWorldBusinessContext(client, worldId, worldMinutes = 0, residents = []) {
-  const [businesses, services, jobs, applications, employment, ownership, organizations, projects, places] = await Promise.all([
+  const [businesses, services, jobs, applications, employment, ownership, organizations, projects, places,
+    contractDemand] = await Promise.all([
     client.query(`SELECT business.*,account.balance::text AS cash_balance,
         COALESCE((business.metadata->>'lastDistributionWorldTime')::bigint,0) AS last_distribution_world_time,
         COALESCE((SELECT jsonb_agg(jsonb_build_object('ownerType',owner.owner_type,'ownerId',owner.owner_id,
@@ -683,7 +685,30 @@ export async function loadWorldBusinessContext(client, worldId, worldMinutes = 0
           'share',owner.share::text)) FILTER (WHERE owner.owner_id IS NOT NULL),'[]'::jsonb) AS owners
       FROM world_scenes scene LEFT JOIN world_economic_ownership owner ON owner.world_id=scene.world_id
         AND owner.asset_type='place' AND owner.asset_id=scene.id
-      WHERE scene.world_id=$1 GROUP BY scene.id`, [worldId])
+      WHERE scene.world_id=$1 GROUP BY scene.id`, [worldId]),
+    client.query(`SELECT agreement.id AS agreement_id,business.id AS business_id,business.founder_agent_id,
+        service.id AS service_id,service.stock_units,service.service_type,
+        COALESCE((agreement.terms->>'maxUnits')::integer,(agreement.terms->>'units')::integer,1) AS agreed_units,
+        COALESCE(delivered.units,0)::int AS delivered_units,
+        GREATEST(0,COALESCE((agreement.terms->>'maxUnits')::integer,
+          (agreement.terms->>'units')::integer,1)-COALESCE(delivered.units,0))::int AS remaining_units,
+        (agreement.terms->>'priceUsdc')::numeric::text AS price_usdc,
+        COALESCE(business_cash.balance,0)::text AS business_cash,
+        COALESCE(employees.count,0)::int AS active_employee_count
+      FROM world_agreements agreement JOIN world_businesses business ON business.world_id=agreement.world_id
+        AND business.id=(agreement.terms->>'businessId')::uuid AND business.status='active'
+      JOIN world_business_services service ON service.world_id=business.world_id AND service.business_id=business.id
+        AND service.id=(agreement.terms->>'serviceId')::uuid AND service.active=true
+      LEFT JOIN LATERAL (SELECT count(*)::int AS units FROM world_commitments commitment
+        WHERE commitment.world_id=agreement.world_id AND commitment.agreement_id=agreement.id
+          AND commitment.commitment_type='service' AND commitment.status='fulfilled') delivered ON true
+      LEFT JOIN LATERAL (SELECT count(*)::int AS count FROM world_business_employment employment
+        WHERE employment.world_id=business.world_id AND employment.business_id=business.id AND employment.status='active') employees ON true
+      LEFT JOIN world_economic_accounts business_cash ON business_cash.world_id=business.world_id
+        AND business_cash.account_key='business:'||business.id::text AND business_cash.asset_symbol='USDC'
+      WHERE agreement.world_id=$1 AND agreement.status='active'
+        AND agreement.agreement_type IN ('service','supplier_relationship')
+      ORDER BY agreement.created_world_time,agreement.id`, [worldId])
   ]);
   const demand = deriveWorldEconomicDemand(residents, services.rows, worldMinutes);
   await persistWorldEconomicDemand(client, worldId, worldMinutes, demand);
@@ -691,7 +716,8 @@ export async function loadWorldBusinessContext(client, worldId, worldMinutes = 0
     resident.skills || {}]));
   return { businesses: businesses.rows, services: services.rows, jobs: jobs.rows,
     applications: applications.rows, employment: employment.rows, ownership: ownership.rows, demand,
-    organizations: organizations.rows, projects: projects.rows, places: places.rows, residentSkills, worldMinutes };
+    organizations: organizations.rows, projects: projects.rows, places: places.rows,
+    contractDemand: contractDemand.rows, residentSkills, worldMinutes };
 }
 
 async function persistWorldEconomicDemand(client, worldId, worldMinutes, rows) {
@@ -715,6 +741,7 @@ export function buildBusinessCandidates(agent, context = {}) {
   const businesses = context.businesses || [];
   const services = context.services || [];
   const jobs = context.jobs || [];
+  const contractDemand = context.contractDemand || [];
   const employment = context.employment || [];
   const owned = businesses.filter((business) => business.founder_agent_id === agent.agentId
     || isBusinessBeneficiary(agent.agentId, business, context.ownership || []));
@@ -826,13 +853,21 @@ export function buildBusinessCandidates(agent, context = {}) {
       const skillValue = required ? Number(skills[required]) || 0 : 0;
       const wage = Number(job.wage_usdc || job.wage || 0);
       const businessCash = Number(job.businessCash) || 0;
+      const contract = contractDemand.find((item) => item.business_id === (job.business_id || job.businessId)
+        && Number(item.remaining_units) > Number(item.stock_units) + Number(item.active_employee_count));
+      const contractCanFundWork = Boolean(contract && Number(contract.price_usdc) >= wage
+        && businessCash >= wage * 8);
       if (wage > 0 && businessCash >= wage * 8) options.push({
         id: `business:apply:${job.id}`, action: 'business_apply', targetLocation: agent.location,
-        goal: `Apply for ${job.role} at ${job.businessName}; the wage is funded by the employer's business account.`,
+        goal: contractCanFundWork
+          ? `Apply for ${job.role} at ${job.businessName}; paid production can fulfill an active supplier contract.`
+          : `Apply for ${job.role} at ${job.businessName}; the wage is funded by the employer's business account.`,
         jobId: job.id, businessId: job.business_id || job.businessId,
         score: 40 + Math.min(16, skillValue * 0.2) + Math.min(10, wage * 0.4)
           + (cash < 2_500 ? 8 : 0) + (goal.includes('WEALTH') ? 8 : 0)
           + (goal.includes('ENGINEERING') && required === 'engineering' ? 8 : 0)
+          + (contractCanFundWork ? 10 : 0),
+        businessHiringReason: contractCanFundWork ? 'FULFILL_CONTRACT' : null
       });
     }
   }
@@ -854,11 +889,17 @@ export function buildBusinessCandidates(agent, context = {}) {
     const applicantSkill = Number(context.residentSkills?.[application.agent_id]?.[application.requiredSkill]) || 0;
     const wage = Number(application.wage || 0);
     const payrollRunway = wage > 0 ? Number(application.businessCash || 0) / wage : 0;
+    const contract = contractDemand.find((item) => item.business_id === application.business_id
+      && Number(item.remaining_units) > Number(item.stock_units) + Number(item.active_employee_count));
+    const contractCanFundWork = Boolean(contract && Number(contract.price_usdc) >= wage && payrollRunway >= 8);
     if (wage > 0 && payrollRunway >= 8) options.push({ id: `business:hire:${application.id}`, action: 'business_hire', targetLocation: agent.location,
-      goal: `Review ${application.agent_name || 'a resident'}'s application for ${application.role}, considering skill and working capital.`,
+      goal: contractCanFundWork
+        ? `Review ${application.agent_name || 'a resident'}'s application; funded contract production is short of capacity.`
+        : `Review ${application.agent_name || 'a resident'}'s application for ${application.role}, considering skill and working capital.`,
       applicationId: application.id, businessId: application.business_id,
       score: 48 + Math.min(16, applicantSkill * 0.2) + Math.min(10, payrollRunway * 0.5)
-        + Math.max(-4, Number(relation?.trust || 0) * 0.2) });
+        + Math.max(-4, Number(relation?.trust || 0) * 0.2) + (contractCanFundWork ? 18 : 0),
+      businessHiringReason: contractCanFundWork ? 'FULFILL_CONTRACT' : null });
     options.push({ id: `business:reject:${application.id}`, action: 'business_reject', targetLocation: agent.location,
       goal: `Decline ${application.agent_name || 'the resident'}'s application if the role, skill fit, or business finances do not align.`,
       applicationId: application.id, businessId: application.business_id,
@@ -1257,6 +1298,8 @@ export async function leaveWorldBusinessJob(client, { worldId, employmentId, age
     WHERE world_id=$1 AND id=$2`, [worldId, employmentId, worldTime]);
   await client.query(`UPDATE world_business_jobs SET status=CASE WHEN $3='active' THEN 'open' ELSE 'closed' END
     WHERE world_id=$1 AND id=$2`, [worldId, row.jobId, row.businessStatus]);
+  await resolveEmploymentAgreementOnExit(client, { worldId, employmentId, agentId,
+    reason: 'employee_left', worldTime });
   const metadata = { businessId: row.business_id, jobId: row.jobId, role: row.role, status: 'left' };
   await recordHistory(client, { worldId, eventKey, eventType: 'business_employment', actorAgentId: agentId,
     entityType: 'job', entityId: row.jobId, worldTime, title: `${row.businessName} role ended`,
@@ -1316,7 +1359,7 @@ export async function decideWorldBusinessApplication(client, { worldId, applicat
 }
 
 export async function purchaseWorldBusinessService(client, { worldId, serviceId, customerAgentId, actionId, worldTime,
-  maxPriceUsdc, demand = 1, supply = 1, relationship = 0, wealth = 0, priceSensitivity = 0.5 }) {
+  maxPriceUsdc, contractAgreementId = null, demand = 1, supply = 1, relationship = 0, wealth = 0, priceSensitivity = 0.5 }) {
   const prior = await client.query(`SELECT id,status,price_usdc::text AS price,transaction_id AS "transactionId"
     FROM world_business_orders WHERE world_id=$1 AND customer_agent_id=$2 AND action_id=$3`, [worldId, customerAgentId, actionId]);
   if (prior.rowCount) return { ...prior.rows[0], idempotent: true };
@@ -1335,7 +1378,8 @@ export async function purchaseWorldBusinessService(client, { worldId, serviceId,
   await assertNotBusinessBeneficiary(client, worldId, service.business_id, customerAgentId);
   if (service.stock_units < 1) throw error('BUSINESS_SERVICE_OUT_OF_STOCK');
   const serviceAgreement = await activeServicePriceAgreement(client, { worldId, businessId: service.business_id,
-    serviceId, customerAgentId, providerAgentId: service.founderAgentId, worldTime });
+    serviceId, customerAgentId, providerAgentId: service.founderAgentId, worldTime, agreementId: contractAgreementId });
+  if (contractAgreementId && !serviceAgreement) throw error('BUSINESS_AGREEMENT_UNAVAILABLE', 409);
   const quotedPrice = serviceAgreement?.terms.priceUsdc || quoteBusinessPrice({ basePrice: service.base_price_usdc, demand, supply,
     reputation: service.businessReputation, relationship, wealth, priceSensitivity });
   if (maxPriceUsdc && Number(quotedPrice) > Number(maxPriceUsdc) + 1e-8) throw error('BUSINESS_PRICE_CHANGED');
@@ -1407,7 +1451,7 @@ export async function purchaseWorldBusinessService(client, { worldId, serviceId,
 }
 
 export async function completeWorldBusinessShift(client, { worldId, businessId, serviceId, agentId, employmentId = null,
-  actionId, worldTime }) {
+  contractAgreementId = null, commitmentId = null, actionId, worldTime }) {
   const previous = await client.query(`SELECT production.id,service.service_type AS "serviceType",service.stock_units AS "stockUnits"
     FROM world_business_production production JOIN world_business_services service ON service.id=production.service_id
     WHERE production.world_id=$1 AND production.action_id=$2`, [worldId, actionId]);
@@ -1418,6 +1462,37 @@ export async function completeWorldBusinessShift(client, { worldId, businessId, 
   const service = await client.query(`SELECT * FROM world_business_services WHERE world_id=$1 AND business_id=$2
     AND id=$3 AND active=true FOR UPDATE`, [worldId, businessId, serviceId]);
   if (!service.rowCount) throw error('BUSINESS_SERVICE_UNAVAILABLE', 404);
+  let productionAgreementId = null;
+  let supplierCommitmentId = commitmentId;
+  if (contractAgreementId) {
+    const contract = await client.query(`SELECT agreement.id FROM world_agreements agreement
+      JOIN world_commitments commitment ON commitment.world_id=agreement.world_id AND commitment.agreement_id=agreement.id
+        AND commitment.id=$4 AND commitment.status='active'
+        AND commitment.commitment_type='delivery'
+      WHERE agreement.world_id=$1 AND agreement.id=$2 AND agreement.status='active'
+        AND agreement.agreement_type IN ('service','supplier_relationship')
+        AND agreement.terms->>'businessId'=$3::text AND agreement.terms->>'serviceId'=$5::text
+        AND (commitment.agent_id=$6 OR EXISTS (SELECT 1 FROM world_business_employment employee
+          WHERE employee.world_id=$1 AND employee.business_id=$3::uuid AND employee.agent_id=$6
+            AND employee.id=$7::uuid AND employee.status='active'))`,
+    [worldId, contractAgreementId, businessId, commitmentId, serviceId, agentId, employmentId]);
+    if (!contract.rowCount) throw error('SUPPLIER_COMMITMENT_NOT_ACTIVE', 409);
+    productionAgreementId = contract.rows[0].id;
+  } else if (!employmentId) {
+    const contract = await client.query(`SELECT agreement.id AS agreement_id,commitment.id AS commitment_id
+      FROM world_commitments commitment JOIN world_agreements agreement
+        ON agreement.world_id=commitment.world_id AND agreement.id=commitment.agreement_id
+      WHERE commitment.world_id=$1 AND commitment.agent_id=$2 AND commitment.status='active'
+        AND commitment.commitment_type='delivery' AND agreement.status='active'
+        AND agreement.agreement_type IN ('service','supplier_relationship')
+        AND agreement.terms->>'businessId'=$3::text AND agreement.terms->>'serviceId'=$4::text
+      ORDER BY commitment.due_world_time,commitment.id LIMIT 1 FOR UPDATE OF commitment,agreement`,
+    [worldId, agentId, businessId, serviceId]);
+    if (contract.rowCount) {
+      productionAgreementId = contract.rows[0].agreement_id;
+      supplierCommitmentId = contract.rows[0].commitment_id;
+    }
+  }
   let wage = null;
   let employmentAgreementId = null;
   if (employmentId) {
@@ -1440,15 +1515,24 @@ export async function completeWorldBusinessShift(client, { worldId, businessId, 
   }
   await client.query(`INSERT INTO world_business_production(world_id,business_id,service_id,agent_id,employment_id,
       agreement_id,action_id,units,world_time) VALUES($1,$2,$3,$4,$5,$6,$7,1,$8)`,
-  [worldId, businessId, serviceId, agentId, employmentId, employmentAgreementId, actionId, worldTime]);
+  [worldId, businessId, serviceId, agentId, employmentId, productionAgreementId || employmentAgreementId, actionId, worldTime]);
   if (employmentId) await recordEmploymentShift(client, { worldId, employmentId, workActionId: actionId,
     worldTime, businessId, agentId });
   const updated = await client.query(`UPDATE world_business_services SET stock_units=stock_units+1
     WHERE id=$1 RETURNING stock_units`, [serviceId]);
+  if (productionAgreementId) {
+    await recordAgreementExecutionStage(client, { worldId, agreementId: productionAgreementId,
+      stage: 'production_started', worldTime, agentId, eventKey: `production:${actionId}`,
+      details: { commitmentId: supplierCommitmentId, businessId, serviceId, productionActionId: actionId } });
+    await recordAgreementExecutionStage(client, { worldId, agreementId: productionAgreementId,
+      stage: 'delivery_ready', worldTime, agentId, eventKey: `production-ready:${actionId}`,
+      details: { commitmentId: supplierCommitmentId, businessId, serviceId, stockUnits: Number(updated.rows[0].stock_units) } });
+  }
   return { businessId, serviceId, serviceType: service.rows[0].service_type,
     businessName: business.name, businessFounderAgentId: business.founder_agent_id,
     stockUnits: updated.rows[0].stock_units, wageUsdc: wage, producerAgentId: agentId, employmentId,
-    agreementId: employmentAgreementId };
+    agreementId: productionAgreementId || employmentAgreementId,
+    commitmentId: supplierCommitmentId };
 }
 
 export async function investInWorldBusiness(client, { worldId, businessId, investorAgentId, amount, actionId, worldTime,
@@ -1697,6 +1781,7 @@ export async function closeWorldBusiness(client, { worldId, businessId, founderA
   await client.query(`UPDATE world_business_jobs SET status='closed' WHERE world_id=$1 AND business_id=$2 AND status='open'`, [worldId, businessId]);
   await client.query(`UPDATE world_business_employment SET status='terminated',ended_world_time=$3
     WHERE world_id=$1 AND business_id=$2 AND status='active'`, [worldId, businessId, worldTime]);
+  await resolveBusinessAgreementsOnClosure(client, { worldId, businessId, founderAgentId, worldTime, bankrupt });
   const expiredApplications = await expirePendingWorldBusinessApplications(client, { worldId, worldTime });
   await recordHistory(client, { worldId, eventKey: `business-close:${businessId}:${actionId}`,
     eventType: 'business_closed', actorAgentId: founderAgentId, entityType: 'business', entityId: businessId,

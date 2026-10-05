@@ -1867,7 +1867,8 @@ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_history'::regclass
       AND conname='world_history_event_type_check' AND pg_get_constraintdef(oid) LIKE '%agreement_proposed%'
       AND pg_get_constraintdef(oid) LIKE '%agreement_rejected%' AND pg_get_constraintdef(oid) LIKE '%norm_formed%'
-      AND pg_get_constraintdef(oid) LIKE '%ownership_transferred%') THEN
+      AND pg_get_constraintdef(oid) LIKE '%ownership_transferred%'
+      AND pg_get_constraintdef(oid) LIKE '%[a-z_]+$%') THEN
     ALTER TABLE world_history DROP CONSTRAINT IF EXISTS world_history_event_type_check;
     ALTER TABLE world_history ADD CONSTRAINT world_history_event_type_check CHECK (event_type IN (
       'opportunity_created','project_proposed','project_started','project_completed','project_failed',
@@ -1877,7 +1878,8 @@ BEGIN
       'business_first_customer','business_revenue','business_profit','business_loss','business_closed','business_employment',
       'business_price_changed','business_partnership','business_capability_practiced','economic_purchase',
       'agreement_proposed','agreement_countered','agreement_accepted','agreement_rejected','agreement_completed','agreement_breached',
-      'organization_rule_changed','organization_proposal','organization_leadership_changed','norm_formed','ownership_transferred'));
+      'organization_rule_changed','organization_proposal','organization_leadership_changed','norm_formed','ownership_transferred')
+      OR event_type ~ '^agreement_[a-z_]+$');
   END IF;
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_history'::regclass
       AND conname='world_history_entity_type_check' AND pg_get_constraintdef(oid) LIKE '%agreement%'

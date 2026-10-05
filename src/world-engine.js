@@ -23,6 +23,7 @@ import { foundWorldOrganization, decideOrganizationMembership, contributeOrganiz
 import { shareWorldInformation, decideWorldInformationShare, expireInformationShares,
   listInformationInbox } from './world-information.js';
 import { expireInstitutionalState, planInstitutionalAction, proposeWorldAgreement, proposeOrganizationGovernance,
+  recordAgreementExecutionStage,
   resolveWorldCommitment, respondToWorldAgreement, voteOrganizationProposal } from './world-institutions.js';
 import { applyToWorldBusinessJob, buildBusinessCandidates, closeWorldBusiness,
   completeWorldBusinessShift, decideWorldBusinessApplication, distributeWorldBusinessProfit,
@@ -36,6 +37,7 @@ import { applyToWorldBusinessJob, buildBusinessCandidates, closeWorldBusiness,
 export const WORLD_TICK_MS = 1_000;
 const TYPE_SAFE_INTERVAL_MS = 30 * 60_000;
 const MAX_CATCH_UP_SECONDS = 30;
+const INSTITUTIONAL_RETRY_WORLD_MINUTES = 60;
 const ACTION_SECONDS = Object.freeze({ work: 16, cooperate: 16, learn: 11, rest: 9, eat: 8, socialize: 12, trade: 7,
   opportunity: 12, opportunity_reject: 8, opportunity_propose: 10, project_propose: 12, project_join: 10, project_reject: 8, project_contribute: 16,
   project_leave: 8, organization_found: 14, organization_join: 10, organization_reject: 8,
@@ -952,6 +954,7 @@ async function completeWorldInitiativeActivity(client, worldId, agent, runtime, 
     } else if (activity === 'business_work') {
       detail = await completeWorldBusinessShift(client, { worldId, businessId: context.businessId,
         serviceId: context.serviceId, employmentId: context.employmentId || null,
+        contractAgreementId: context.contractAgreementId || null, commitmentId: context.commitmentId || null,
         agentId: agent.agentId, actionId: key, worldTime: nowWorld });
     } else if (activity === 'business_service') {
       const service = (agent.services || []).find((item) => item.id === context.serviceId);
@@ -960,7 +963,7 @@ async function completeWorldInitiativeActivity(client, worldId, agent, runtime, 
       const pricingContext = context.pricingContext || {};
       detail = await purchaseWorldBusinessService(client, { worldId, serviceId: context.serviceId,
         customerAgentId: agent.agentId, actionId: key, worldTime: nowWorld,
-        maxPriceUsdc: context.maxPriceUsdc,
+        maxPriceUsdc: context.maxPriceUsdc, contractAgreementId: context.contractAgreementId || null,
         demand: pricingContext.demand ?? demandRow?.demandCount ?? 1,
         supply: pricingContext.supply ?? demandRow?.supplyCount ?? 0,
         relationship: pricingContext.relationship ?? (relation ? Number(relation.familiarity) * 0.3
@@ -2076,11 +2079,12 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
             let candidates;
             let decisionLayer = 'tactical';
             let qualifiedStrategicCandidates = [];
+            let permittedInitiatives = [];
             if (strategicDue) {
               const minimumEnergy = 15;
               const minimumFood = 8;
               const needsBlocked = agent.energy < minimumEnergy || agent.food < minimumFood;
-              const permittedInitiatives = needsBlocked ? [] : initiativeCandidates.filter((candidate) => {
+              permittedInitiatives = needsBlocked ? [] : initiativeCandidates.filter((candidate) => {
                 if (candidate.action === 'project_contribute' && (agent.energy < 20 || agent.food < 10)) return false;
                 return true;
               });
@@ -2141,29 +2145,56 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
               } else candidates = qualifyUtilityCandidates(utilityCandidates);
             } else candidates = qualifyUtilityCandidates(utilityCandidates);
             let institutionalPlan = null;
+            let institutionalPlanEligible = false;
             if (institutionalDue) {
               institutionalPlan = await planInstitutionalAction(client, { worldId, agent, worldTime: worldMinutes });
               if (institutionalPlan) {
-                candidates = [institutionalPlan];
-                qualifiedStrategicCandidates = [];
-                decisionLayer = 'institutional';
                 await recordEmergenceEvent(client, { worldId, agentId: agent.agentId, worldMinutes, tickCount,
                   system: 'institution', stage: 'considered', eventKey: `institution:${agent.agentId}:${tickCount}:considered`,
                   candidateId: institutionalPlan.id, action: institutionalPlan.action, utilityScore: institutionalPlan.score,
                   details: institutionalPlan.institutionalTrace || {} });
-                await recordEmergenceEvent(client, { worldId, agentId: agent.agentId, worldMinutes, tickCount,
-                  system: 'institution', stage: 'eligible', eventKey: `institution:${agent.agentId}:${tickCount}:eligible`,
-                  candidateId: institutionalPlan.id, action: institutionalPlan.action, utilityScore: institutionalPlan.score,
-                  details: institutionalPlan.institutionalTrace || {} });
+                const minimumEnergy = institutionalPlan.action === 'business_work' ? 20 : 15;
+                const minimumFood = institutionalPlan.action === 'business_work' ? 12 : 8;
+                const needsReason = agent.energy < minimumEnergy ? 'ENERGY_LOW'
+                  : agent.food < minimumFood ? 'FOOD_LOW' : null;
+                if (!needsReason) {
+                  const baseCandidates = decisionLayer === 'strategic' ? permittedInitiatives : utilityCandidates;
+                  const combined = [...baseCandidates, institutionalPlan];
+                  candidates = decisionLayer === 'strategic'
+                    ? qualifyLayeredStrategicCandidates(combined) : qualifyUtilityCandidates(combined);
+                  if (decisionLayer === 'strategic') qualifiedStrategicCandidates = candidates;
+                  else decisionLayer = 'tactical_institutional';
+                  institutionalPlanEligible = candidates.some((item) => item.id === institutionalPlan.id);
+                }
+                if (needsReason) {
+                  await recordEmergenceEvent(client, { worldId, agentId: agent.agentId, worldMinutes, tickCount,
+                    system: 'institution', stage: 'blocked', reasonCode: needsReason,
+                    eventKey: `institution:${agent.agentId}:${tickCount}:blocked`,
+                    candidateId: institutionalPlan.id, action: institutionalPlan.action, utilityScore: institutionalPlan.score,
+                    details: { ...institutionalPlan.institutionalTrace, requiredEnergy: minimumEnergy,
+                      requiredFood: minimumFood, energy: agent.energy, food: agent.food } });
+                } else {
+                  await recordEmergenceEvent(client, { worldId, agentId: agent.agentId, worldMinutes, tickCount,
+                    system: 'institution', stage: institutionalPlanEligible ? 'eligible' : 'blocked',
+                    reasonCode: institutionalPlanEligible ? 'NONE' : 'UTILITY_BELOW_THRESHOLD',
+                    eventKey: `institution:${agent.agentId}:${tickCount}:${institutionalPlanEligible ? 'eligible' : 'blocked'}`,
+                    candidateId: institutionalPlan.id, action: institutionalPlan.action, utilityScore: institutionalPlan.score,
+                    details: { ...institutionalPlan.institutionalTrace,
+                      eligibleCandidateCount: candidates.length } });
+                }
+                const retryAt = worldMinutes + INSTITUTIONAL_RETRY_WORLD_MINUTES;
+                await client.query(`UPDATE world_agent_states SET next_institutional_review_world_minutes=$3,updated_at=$4
+                  WHERE world_id=$1 AND agent_id=$2`, [worldId, agent.agentId, retryAt, now]);
+                agent.nextInstitutionalReviewWorldMinutes = retryAt;
               }
             }
-            let activity = institutionalPlan;
+            let activity = null;
             let flyObservation = null;
             let flyCandidates = [];
             let flySelected = null;
             let decision = null;
             let usedFruitfly = false;
-            if (fruitfly && candidates.length && decisionLayer !== 'institutional') {
+            if (fruitfly && candidates.length) {
               const businessBeliefs = agent.beliefs.filter((belief) => belief.subjectType === 'business'
                 && belief.beliefKey === 'business_outcome');
               const marketBeliefs = agent.beliefs.filter((belief) => belief.subjectType === 'market'
@@ -2201,13 +2232,30 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
                 WHERE world_id=$1 AND agent_id=$2`, [worldId, agent.agentId, new Date(now.getTime() + 30_000), now]);
               continue;
             }
-            if (decisionLayer === 'institutional') await recordEmergenceEvent(client, { worldId,
-              agentId: agent.agentId, worldMinutes, tickCount, system: 'institution', stage: 'selected',
-              eventKey: `institution:${agent.agentId}:${tickCount}:selected`, candidateId: activity.id,
-              action: activity.action, utilityScore: activity.score, details: activity.institutionalTrace || {} });
+            if (institutionalPlan && institutionalPlanEligible) {
+              const selectedPlan = institutionalPlan.id === activity.id;
+              await recordEmergenceEvent(client, { worldId, agentId: agent.agentId, worldMinutes, tickCount,
+                system: 'institution', stage: selectedPlan ? 'selected' : 'not_selected',
+                reasonCode: selectedPlan ? 'NONE' : 'FRUITFLY_NOT_SELECTED',
+                eventKey: `institution:${agent.agentId}:${tickCount}:${selectedPlan ? 'selected' : 'not-selected'}`,
+                candidateId: institutionalPlan.id, action: institutionalPlan.action,
+                utilityScore: institutionalPlan.score,
+                details: { ...(institutionalPlan.institutionalTrace || {}), selectedByFruitfly: selectedPlan && usedFruitfly,
+                  selectedAction: activity.action } });
+              if (institutionalPlan.institutionalTrace?.agreementId) {
+                await recordAgreementExecutionStage(client, { worldId,
+                  agreementId: institutionalPlan.institutionalTrace.agreementId,
+                  stage: selectedPlan ? 'action_selected' : 'candidate_not_selected', worldTime: worldMinutes,
+                  agentId: agent.agentId,
+                  eventKey: `${tickCount}:${institutionalPlan.id}:${selectedPlan ? 'selected' : 'not-selected'}`,
+                  reasonCode: selectedPlan ? null : 'FRUITFLY_NOT_SELECTED',
+                  details: { candidateId: institutionalPlan.id, action: institutionalPlan.action,
+                    selectedAction: activity.action, commitmentId: institutionalPlan.commitmentId || null } });
+              }
+            }
             if (decisionLayer === 'strategic') {
               for (const candidate of qualifiedStrategicCandidates) {
-                if (candidate.id === activity.id) continue;
+                if (candidate.id === activity.id || candidate.id === institutionalPlan?.id) continue;
                 await recordEmergenceEvent(client, { worldId, agentId: agent.agentId, worldMinutes, tickCount,
                   system: initiativeSystem(candidate.action),
                   stage: 'not_selected', reasonCode: candidate.action.startsWith('business_') ? 'NOT_SELECTED' : 'FRUITFLY_NOT_SELECTED',
@@ -2258,6 +2306,7 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
               'businessProposal','cofounderProposal','preparationSkill','preparationServiceType',
               'businessId','serviceId','jobId','applicationId','maxPriceUsdc','amountUsdc','fundingSource',
               'direction','contributionAmountUsdc','employmentId','pricingContext','counterpartyAgentId','agreementType',
+              'contractAgreementId',
               'agreementTerms','agreementId','counterTerms','expiresInWorldMinutes','parentAgreementId','commitmentId','outcome',
               'proposalId','proposalType','proposalPayload','institutionalTrace']
               .filter((key) => activity[key] !== undefined).map((key) => [key, activity[key]]));

@@ -8,7 +8,7 @@ import { Pool } from 'pg';
 import { ensureCryptoAccount } from '../src/crypto-trading.js';
 import { getEconomicAccount } from '../src/economic-ledger.js';
 import { applyToWorldBusinessJob, completeWorldBusinessShift, decideWorldBusinessApplication,
-  foundWorldBusiness, purchaseWorldBusinessService } from '../src/world-businesses.js';
+  closeWorldBusiness, foundWorldBusiness, purchaseWorldBusinessService } from '../src/world-businesses.js';
 import { startWorldEngine } from '../src/world-engine.js';
 import { createWorldCommitment, expireInstitutionalState, listWorldInstitutionSummary,
   planInstitutionalAction, proposeOrganizationGovernance, proposeWorldAgreement,
@@ -192,6 +192,140 @@ test('V5 agreements negotiate, execute against V4 ledger, affect cognition, gove
       AND action_id LIKE 'business-revshare:v5-service-order:%'`, [worldId])).rows[0].count), 1,
     'retrying the purchase cannot settle the revenue share twice');
 
+    await pool.query(`UPDATE world_business_services SET stock_units=0 WHERE world_id=$1 AND id=$2`, [worldId, business.serviceId]);
+    const supplierAgreement = await inTransaction(pool, (client) => proposeWorldAgreement(client, { worldId,
+      proposerAgentId: founderId, counterpartyAgentId: customerId, agreementType: 'supplier_relationship',
+      terms: { businessId: business.id, serviceId: business.serviceId, customerAgentId: customerId,
+        priceUsdc: '20.00000000', maxUnits: 1 }, actionId: 'v5-supplier-terms', worldTime: 1_925 }));
+    await inTransaction(pool, (client) => respondToWorldAgreement(client, { worldId, agreementId: supplierAgreement.id,
+      agentId: customerId, decision: 'accept', actionId: 'v5-supplier-accept', worldTime: 1_926 }));
+    const competingServiceAgreement = await inTransaction(pool, (client) => proposeWorldAgreement(client, { worldId,
+      proposerAgentId: founderId, counterpartyAgentId: customerId, agreementType: 'service',
+      terms: { businessId: business.id, serviceId: business.serviceId, customerAgentId: customerId,
+        priceUsdc: '22.00000000', units: 1 }, actionId: 'v5-competing-service-terms', worldTime: 1_927 }));
+    await inTransaction(pool, (client) => respondToWorldAgreement(client, { worldId,
+      agreementId: competingServiceAgreement.id, agentId: customerId, decision: 'accept',
+      actionId: 'v5-competing-service-accept', worldTime: 1_928 }));
+    const supplierDelivery = (await pool.query(`SELECT id FROM world_commitments WHERE world_id=$1 AND agreement_id=$2
+      AND commitment_type='delivery' AND status='active'`, [worldId, supplierAgreement.id])).rows[0];
+    assert.ok(supplierDelivery, 'accepting supplier terms creates a durable provider delivery commitment');
+    const supplierWorkPlan = await planInstitutionalAction(pool, { worldId, agent: workerAgent, worldTime: 1_930 });
+    assert.equal(supplierWorkPlan?.action, 'business_work', 'a supplier with no stock receives a production candidate');
+    assert.equal(supplierWorkPlan.contractAgreementId, supplierAgreement.id);
+    assert.equal(supplierWorkPlan.commitmentId, supplierDelivery.id);
+    assert.equal(supplierWorkPlan.employmentId, hired.id, 'an active employee can take contract-driven production work');
+    const contractWorkerCashBefore = Number((await getEconomicAccount(pool, { worldId,
+      accountType: 'resident', ownerId: workerId })).balance);
+    const supplierProduction = await inTransaction(pool, (client) => completeWorldBusinessShift(client, { worldId,
+      businessId: business.id, serviceId: business.serviceId, agentId: workerId, employmentId: hired.id,
+      contractAgreementId: supplierWorkPlan.contractAgreementId, commitmentId: supplierWorkPlan.commitmentId,
+      actionId: 'v5-supplier-production', worldTime: 1_940 }));
+    assert.equal(Number(supplierProduction.stockUnits), 1, 'production makes one unit available to fulfill the contract');
+    assert.equal(supplierProduction.agreementId, supplierAgreement.id,
+      'production history points to the supplier agreement even when other agreements exist');
+    assert.ok(Math.abs(Number((await getEconomicAccount(pool, { worldId, accountType: 'resident', ownerId: workerId })).balance)
+      - contractWorkerCashBefore - negotiatedWage) < 1e-7,
+    'a contract production shift settles the employee wage');
+    const buyerAgent = { agentId: customerId, location: 'Workshop', energy: 90, food: 90, social: 90,
+      knowledge: 20, primaryGoal: 'BALANCED_LIFE', riskTolerance: 0.4,
+      skills: {}, relationships: [], reliability: 0.1, sociability: 0.5, discipline: 0.5 };
+    const supplierPurchasePlan = await planInstitutionalAction(pool, { worldId, agent: buyerAgent, worldTime: 1_950 });
+    assert.equal(supplierPurchasePlan?.action, 'business_service');
+    assert.equal(supplierPurchasePlan.contractAgreementId, supplierAgreement.id,
+      'the customer selects the specific active supplier agreement');
+    const supplierPurchase = await inTransaction(pool, (client) => purchaseWorldBusinessService(client, { worldId,
+      serviceId: business.serviceId, customerAgentId: customerId, actionId: 'v5-supplier-order', worldTime: 1_960,
+      maxPriceUsdc: '20.00000000', contractAgreementId: supplierPurchasePlan.contractAgreementId }));
+    assert.equal(supplierPurchase.priceUsdc, '20.00000000',
+      'the supplier contract price is honored instead of a competing service price');
+    const supplierSettlement = await pool.query(`SELECT agreement.status,delivery.status AS delivery_status,
+        order_row.agreement_id,order_row.status AS order_status
+      FROM world_agreements agreement JOIN world_commitments delivery ON delivery.world_id=agreement.world_id
+        AND delivery.agreement_id=agreement.id AND delivery.commitment_type='delivery'
+      JOIN world_business_orders order_row ON order_row.world_id=agreement.world_id
+        AND order_row.id=$3
+      WHERE agreement.world_id=$1 AND agreement.id=$2`, [worldId, supplierAgreement.id, supplierPurchase.orderId]);
+    assert.equal(supplierSettlement.rows[0].status, 'completed');
+    assert.equal(supplierSettlement.rows[0].delivery_status, 'fulfilled');
+    assert.equal(supplierSettlement.rows[0].order_status, 'fulfilled');
+    assert.equal(supplierSettlement.rows[0].agreement_id, supplierAgreement.id,
+      'the order, payment, and service delivery settle against the same agreement');
+    assert.equal(Number((await pool.query(`SELECT count(*)::int FROM world_agreement_outcomes
+      WHERE world_id=$1 AND agreement_id=$2 AND outcome='fulfilled' AND action_id LIKE 'v5-outcome:v5-delivery:%'`,
+    [worldId, supplierAgreement.id])).rows[0].count), 2,
+    'both parties receive one idempotent fulfillment outcome');
+    await pool.query(`UPDATE world_commitments SET status='cancelled',completed_world_time=1_970
+      WHERE world_id=$1 AND agreement_id=$2 AND status='active'`, [worldId, competingServiceAgreement.id]);
+    await pool.query(`UPDATE world_agreements SET status='cancelled',updated_world_time=1_970
+      WHERE world_id=$1 AND id=$2 AND status='active'`, [worldId, competingServiceAgreement.id]);
+
+    const serviceBase = (await pool.query(`SELECT base_price_usdc::text AS price FROM world_business_services
+      WHERE world_id=$1 AND id=$2`, [worldId, business.serviceId])).rows[0].price;
+    const renegotiatedAgreement = await inTransaction(pool, (client) => proposeWorldAgreement(client, { worldId,
+      proposerAgentId: founderId, counterpartyAgentId: customerId, agreementType: 'supplier_relationship',
+      terms: { businessId: business.id, serviceId: business.serviceId, customerAgentId: customerId,
+        priceUsdc: serviceBase, maxUnits: 1 }, actionId: 'v5-renegotiation-origin', worldTime: 2_000 }));
+    await inTransaction(pool, (client) => respondToWorldAgreement(client, { worldId,
+      agreementId: renegotiatedAgreement.id, agentId: customerId, decision: 'accept',
+      actionId: 'v5-renegotiation-origin-accept', worldTime: 2_001 }));
+    await pool.query(`UPDATE world_business_services SET stock_units=0 WHERE world_id=$1 AND id=$2`, [worldId, business.serviceId]);
+    const renegotiationDelivery = (await pool.query(`SELECT id,due_world_time FROM world_commitments
+      WHERE world_id=$1 AND agreement_id=$2 AND commitment_type='delivery' AND status='active'`,
+    [worldId, renegotiatedAgreement.id])).rows[0];
+    const renegotiationPlan = await planInstitutionalAction(pool, { worldId, agent: founderAgent,
+      worldTime: Number(renegotiationDelivery.due_world_time) - 1_200 });
+    assert.equal(renegotiationPlan?.action, 'agreement_propose',
+      'a provider facing a capacity deadline can propose revised delivery terms');
+    assert.equal(renegotiationPlan.parentAgreementId, renegotiatedAgreement.id);
+    const renegotiation = await inTransaction(pool, (client) => proposeWorldAgreement(client, { worldId,
+      proposerAgentId: founderId, counterpartyAgentId: customerId, agreementType: renegotiationPlan.agreementType,
+      terms: renegotiationPlan.agreementTerms, actionId: 'v5-capacity-renegotiation',
+      parentAgreementId: renegotiationPlan.parentAgreementId,
+      expiresInWorldMinutes: renegotiationPlan.expiresInWorldMinutes,
+      worldTime: Number(renegotiationDelivery.due_world_time) - 1_200 }));
+    assert.equal((await pool.query(`SELECT metadata->>'renegotiationPending' AS pending FROM world_agreements
+      WHERE world_id=$1 AND id=$2`, [worldId, renegotiatedAgreement.id])).rows[0].pending, 'true');
+    const renegotiationAcceptance = await inTransaction(pool, (client) => respondToWorldAgreement(client, { worldId,
+      agreementId: renegotiation.id, agentId: customerId, decision: 'accept',
+      actionId: 'v5-capacity-renegotiation-accept', worldTime: Number(renegotiationDelivery.due_world_time) - 1_199 }));
+    assert.equal(renegotiationAcceptance.status, 'active');
+    assert.equal((await pool.query(`SELECT status,metadata->'resolution'->>'reason' AS reason
+      FROM world_agreements WHERE world_id=$1 AND id=$2`, [worldId, renegotiatedAgreement.id])).rows[0].reason,
+    'renegotiated', 'mutual renegotiation replaces the old active obligation without recording a breach');
+    assert.equal((await pool.query(`SELECT status FROM world_commitments WHERE world_id=$1 AND id=$2`,
+      [worldId, renegotiationDelivery.id])).rows[0].status, 'cancelled');
+    assert.ok(Number((await pool.query(`SELECT count(*)::int FROM agent_memories WHERE world_id=$1
+      AND memory_type='contract' AND metadata->>'outcome'='renegotiated'`, [worldId])).rows[0].count) >= 2,
+    'both residents remember the renegotiated supplier terms');
+
+    const closedBusiness = await inTransaction(pool, (client) => foundWorldBusiness(client, { worldId,
+      agentId: investorId, actionId: 'v5-closure-business', worldTime: 3_000,
+      proposal: { name: 'Temporary Supply Studio', businessType: 'research',
+        purpose: 'A temporary provider used to verify contract closure handling.', serviceType: 'research_service',
+        serviceName: 'Research Packet', serviceDescription: 'A prepared research packet for resident customers.',
+        basePriceUsdc: '12.00000000', capitalUsdc: '250.00000000' } }));
+    const closedServiceId = (await pool.query(`SELECT id FROM world_business_services WHERE world_id=$1 AND business_id=$2`,
+      [worldId, closedBusiness.id])).rows[0].id;
+    const closureAgreement = await inTransaction(pool, (client) => proposeWorldAgreement(client, { worldId,
+      proposerAgentId: investorId, counterpartyAgentId: customerId, agreementType: 'supplier_relationship',
+      terms: { businessId: closedBusiness.id, serviceId: closedServiceId, customerAgentId: customerId,
+        priceUsdc: '12.00000000', maxUnits: 1 }, actionId: 'v5-closure-supplier', worldTime: 3_010 }));
+    await inTransaction(pool, (client) => respondToWorldAgreement(client, { worldId, agreementId: closureAgreement.id,
+      agentId: customerId, decision: 'accept', actionId: 'v5-closure-supplier-accept', worldTime: 3_011 }));
+    const closedDeliveryId = (await pool.query(`SELECT id FROM world_commitments WHERE world_id=$1 AND agreement_id=$2
+      AND commitment_type='delivery' AND status='active'`, [worldId, closureAgreement.id])).rows[0].id;
+    await inTransaction(pool, (client) => closeWorldBusiness(client, { worldId, businessId: closedBusiness.id,
+      founderAgentId: investorId, actionId: 'v5-provider-closed', worldTime: 3_012 }));
+    assert.equal((await pool.query(`SELECT status FROM world_agreements WHERE world_id=$1 AND id=$2`,
+      [worldId, closureAgreement.id])).rows[0].status, 'breached');
+    assert.equal((await pool.query(`SELECT status FROM world_commitments WHERE world_id=$1 AND id=$2`,
+      [worldId, closedDeliveryId])).rows[0].status, 'breached');
+    assert.ok(Number((await pool.query(`SELECT breach_count FROM world_agent_reputations WHERE world_id=$1 AND agent_id=$2`,
+      [worldId, investorId])).rows[0].breach_count) > 0, 'closure changes provider reputation');
+    assert.ok(Number((await pool.query(`SELECT count(*)::int FROM agent_memories WHERE world_id=$1
+      AND metadata->>'agreementId'=$2 AND memory_type='contract'`, [worldId, closureAgreement.id])).rows[0].count) >= 2,
+    'closure outcome enters both participants’ memories');
+
     const investment = await inTransaction(pool, (client) => proposeWorldAgreement(client, { worldId,
       proposerAgentId: founderId, counterpartyAgentId: investorId, agreementType: 'investment',
       terms: { businessId: business.id, amountUsdc: '50.00000000', ownershipShare: 0.2 },
@@ -328,12 +462,73 @@ test('V5 agreements negotiate, execute against V4 ledger, affect cognition, gove
       AND event_type IN ('agreement_countered','agreement_accepted','agreement_completed','agreement_breached',
         'organization_rule_changed','norm_formed','ownership_transferred')`, [worldId])).rows[0].count > 0);
 
+    await pool.query(`UPDATE world_commitments SET status='cancelled',completed_world_time=2_200
+      WHERE world_id=$1 AND commitment_type='delivery' AND status='active'`, [worldId]);
+    await pool.query(`UPDATE world_agreements SET status='cancelled',updated_world_time=2_200
+      WHERE world_id=$1 AND agreement_type IN ('service','supplier_relationship') AND status='active'`, [worldId]);
+    const engineAgreement = await inTransaction(pool, (client) => proposeWorldAgreement(client, { worldId,
+      proposerAgentId: founderId, counterpartyAgentId: customerId, agreementType: 'supplier_relationship',
+      terms: { businessId: business.id, serviceId: business.serviceId, customerAgentId: customerId,
+        priceUsdc: serviceBase, maxUnits: 1 }, actionId: 'v5-engine-contract', worldTime: 2_210 }));
+    await inTransaction(pool, (client) => respondToWorldAgreement(client, { worldId, agreementId: engineAgreement.id,
+      agentId: customerId, decision: 'accept', actionId: 'v5-engine-contract-accept', worldTime: 2_211 }));
+    const engineDelivery = (await pool.query(`SELECT id FROM world_commitments WHERE world_id=$1 AND agreement_id=$2
+      AND commitment_type='delivery' AND status='active'`, [worldId, engineAgreement.id])).rows[0];
+    assert.ok(engineDelivery, 'an accepted supplier agreement remains an unresolved engine task');
+    await pool.query(`UPDATE world_commitments SET status='cancelled',outcome_reason='voluntary_exit',
+        completed_world_time=2_100 WHERE world_id=$1 AND agent_id=$2 AND status='active' AND id<>$3`,
+    [worldId, founderId, engineDelivery.id]);
+    await pool.query(`UPDATE world_agreements SET status='expired',updated_world_time=2_100
+      WHERE world_id=$1 AND status IN ('proposed','countered') AND $2 IN (proposer_agent_id,counterparty_agent_id)`,
+    [worldId, founderId]);
+    await pool.query(`INSERT INTO world_scenes(world_id,created_by,name,scene_type,description,purpose,capacity,features,position)
+      VALUES($1,$2,'Research Garden','garden','A quiet garden for short resident breaks.','Restore energy and mood.',12,'{}','{}'),
+        ($1,$2,'Commons Cafe','cafe','A cafe for meals and everyday resident activity.','Eat and meet residents.',12,'{}','{}')`,
+    [worldId, founderId]);
+    await pool.query(`INSERT INTO world_agent_states(world_id,agent_id,goal,risk_tolerance,next_decision_at)
+      SELECT world_id,agent_id,'balanced',0.4,now()+interval '1 day' FROM world_members WHERE world_id=$1
+      ON CONFLICT(world_id,agent_id) DO UPDATE SET status='idle',planned_action=NULL,target_location=NULL,
+        movement_started_at=NULL,movement_ends_at=NULL,action_started_at=NULL,action_ends_at=NULL,
+        next_decision_at=now()+interval '1 day'`, [worldId]);
+    await pool.query(`UPDATE world_agent_states SET next_decision_at=now()-interval '1 minute',
+        next_strategic_decision_world_minutes=100_000,next_institutional_review_world_minutes=0
+      WHERE world_id=$1 AND agent_id=$2`, [worldId, founderId]);
     fruitflyDirectory = await import('node:fs/promises').then(({ mkdtemp }) => mkdtemp('/tmp/synterra-v5-runtime-'));
     const { createFruitflyRuntime } = await import('../src/agent-runtime/fruitfly.js');
     const fruitfly = await createFruitflyRuntime(fruitflyDirectory);
+    const engineErrors = [];
     await pool.query(`INSERT INTO world_runtime_state(world_id,tick_count,world_minutes,last_tick_at,typesafe_next_at)
-      VALUES($1,0,0,now()-interval '1 minute',now()+interval '1 day')`, [worldId]);
-    engine = await startWorldEngine(pool, { worldId, schedule: false, fruitfly, nowProvider: () => Date.now() });
+      VALUES($1,0,0,now()-interval '1 minute',now()+interval '1 day')
+      ON CONFLICT(world_id) DO UPDATE SET tick_count=0,world_minutes=0,last_tick_at=now()-interval '1 minute',
+        typesafe_next_at=now()+interval '1 day'`, [worldId]);
+    engine = await startWorldEngine(pool, { worldId, schedule: false, fruitfly, nowProvider: () => Date.now(),
+      onError: (error, context) => engineErrors.push(`${context}: ${error.message}`) });
+    assert.equal(engine.running, true, `integration engine must start: ${engine.reason || 'no reason returned'}`);
+    assert.deepEqual(engineErrors, [], `integration engine tick must be clean: ${engineErrors.join('; ')}`);
+    const engineState = (await pool.query(`SELECT fruitfly_candidates,fruitfly_selected,planned_context,planned_action,
+        status,next_decision_at,next_institutional_review_world_minutes
+      FROM world_agent_states WHERE world_id=$1 AND agent_id=$2`, [worldId, founderId])).rows[0];
+    const engineClock = (await pool.query(`SELECT tick_count,world_minutes,last_tick_at FROM world_runtime_state WHERE world_id=$1`,
+      [worldId])).rows[0];
+    const contractCandidateId = `institution:${engineDelivery.id}:contract-production`;
+    assert.ok(engineState.fruitfly_candidates.some((item) => item.id === contractCandidateId),
+      `the active contract work remains in the Utility-qualified Fruitfly candidate set: ${JSON.stringify({
+        expected: contractCandidateId, plannedAction: engineState.planned_action,
+        status: engineState.status, nextDecisionAt: engineState.next_decision_at,
+        nextInstitutionalAt: engineState.next_institutional_review_world_minutes, clock: engineClock,
+        selected: engineState.fruitfly_selected,
+        candidates: engineState.fruitfly_candidates.map(({ id, action, score }) => ({ id, action, score }))
+      })}`);
+    assert.ok(new Set(engineState.fruitfly_candidates.map((item) => item.action)).size >= 2,
+      'Fruitfly retains multiple qualified action families instead of being forced to the contract action');
+    assert.equal(engineState.fruitfly_selected.learnerUsed, true,
+      'Fruitfly makes the final choice from the qualified candidate set');
+    assert.ok(engineState.fruitfly_candidates.some((item) => item.id === engineState.fruitfly_selected.id),
+      'the chosen candidate is one of the candidates passed to Fruitfly');
+    const engineDecision = await pool.query(`SELECT chosen_candidate_id FROM world_decision_traces
+      WHERE world_id=$1 AND agent_id=$2 ORDER BY tick_count DESC LIMIT 1`, [worldId, founderId]);
+    assert.equal(engineDecision.rows[0]?.chosen_candidate_id, engineState.fruitfly_selected.id,
+      'the durable decision trace matches Fruitfly’s selected candidate');
     const institutionalSchema = await pool.query(`SELECT pg_get_constraintdef(oid) AS definition FROM pg_constraint
       WHERE conrelid='world_emergence_events'::regclass AND conname='world_emergence_events_system_check'`);
     assert.match(institutionalSchema.rows[0].definition, /institution/);

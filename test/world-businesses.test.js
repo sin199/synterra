@@ -246,6 +246,31 @@ test('business hiring and service candidates require funded payroll and reflect 
   assert.ok(buildBusinessCandidates(resident, { ...context, jobs: [fundedJob] })
     .some((candidate) => candidate.action === 'business_apply'));
 
+  const fundedContractDemand = [{ agreement_id: 'agreement-a', business_id: 'business-a', service_id: 'service-a',
+    remaining_units: 2, stock_units: 0, active_employee_count: 0, price_usdc: '20.00' }];
+  const baseApply = buildBusinessCandidates(resident, { ...context, jobs: [fundedJob] })
+    .find((candidate) => candidate.action === 'business_apply');
+  const contractApply = buildBusinessCandidates(resident, { ...context, jobs: [fundedJob],
+    contractDemand: fundedContractDemand }).find((candidate) => candidate.action === 'business_apply');
+  assert.equal(contractApply.businessHiringReason, 'FULFILL_CONTRACT');
+  assert.equal(contractApply.score, baseApply.score + 10,
+    'a funded contract with a production capacity gap increases the worker application candidate score');
+  const baseHire = buildBusinessCandidates({ ...resident, agentId: 'founder-a' }, { ...context,
+    jobs: [], applications: [wellFundedApplication], residentSkills: { [resident.agentId]: resident.skills } })
+    .find((candidate) => candidate.action === 'business_hire');
+  const contractHire = buildBusinessCandidates({ ...resident, agentId: 'founder-a' }, { ...context,
+    jobs: [], applications: [wellFundedApplication], residentSkills: { [resident.agentId]: resident.skills },
+    contractDemand: fundedContractDemand }).find((candidate) => candidate.action === 'business_hire');
+  assert.equal(contractHire.businessHiringReason, 'FULFILL_CONTRACT');
+  assert.equal(contractHire.score, baseHire.score + 18,
+    'a funded contract with a production capacity gap increases the employer hiring candidate score');
+  const coveredContract = { ...fundedContractDemand[0], remaining_units: 1, active_employee_count: 1 };
+  const coveredHire = buildBusinessCandidates({ ...resident, agentId: 'founder-a' }, { ...context,
+    jobs: [], applications: [wellFundedApplication], residentSkills: { [resident.agentId]: resident.skills },
+    contractDemand: [coveredContract] }).find((candidate) => candidate.action === 'business_hire');
+  assert.equal(coveredHire.businessHiringReason, null,
+    'a contract already covered by inventory and active employee capacity does not create a hiring preference');
+
   const pendingOwnApplication = { ...application, id: 'application-own', agent_id: resident.agentId,
     businessName: 'Research Studio', created_world_time: 1_000 };
   const applicantCandidates = buildBusinessCandidates(resident, { ...context, jobs: [],
