@@ -13,7 +13,7 @@ import { formatRawTokenAmount, readRobinhoodMarket, scanRobinhoodMarket } from '
 import { executeRobinhoodPaperTrade, readRobinhoodPaperAccount } from './robinhood-paper-trading.js';
 import { loadState, STATE_DIR } from './agent-runtime/client.js';
 import { createFruitflyRuntime } from './agent-runtime/fruitfly.js';
-import { chooseCivilizationOption, chooseWithTypeSafe } from './agent-runtime/typesafe.js';
+import { chooseCivilizationOption, chooseWithTypeSafe, chooseWorldV7Reflection } from './agent-runtime/typesafe.js';
 import { startWorldEngine, worldClock } from './world-engine.js';
 import { buildWorldLiveness, reportWorldEngineError } from './world-engine-diagnostics.js';
 import { createWorldOpportunity, decideWorldOpportunity, listAvailableOpportunities } from './world-opportunities.js';
@@ -24,6 +24,7 @@ import { shareWorldInformation, decideWorldInformationShare, listInformationInbo
 import { readEmergenceReport } from './world-emergence.js';
 import { createWorldCapabilityProposal, readWorldCapabilitySummary, reviewWorldCapabilityExperiment,
   reviewWorldCapabilityProposal, performWorldCapabilityUse } from './world-capabilities.js';
+import { readV6LifecycleObserverState, readWorldV6Lifecycle, startV6LifecycleObserver } from './world-v6-lifecycle-observer.js';
 import { createWorldCommitment, listWorldAgreements, listWorldInstitutionSummary, proposeOrganizationGovernance,
   proposeWorldAgreement, resolveWorldCommitment, respondToWorldAgreement, voteOrganizationProposal } from './world-institutions.js';
 import { closeWorldBusiness, distributeWorldBusinessProfit, distributeWorldProjectRevenue,
@@ -33,6 +34,15 @@ import { closeWorldBusiness, distributeWorldBusinessProfit, distributeWorldProje
   decideWorldBusinessApplication, leaveWorldBusinessJob, practiceWorldBusinessCapability,
   withdrawWorldBusinessApplication } from './world-businesses.js';
 import { ensureEconomicAccount, getEconomicAccount } from './economic-ledger.js';
+import { alignWorldValue, createCoordinationMechanism, createEmergentEntity, createGoalPrimitiveProposal, createObservationMethod,
+  createPolicyExperiment, createWorldResourceType, decideObservationMethod, decideWorldResourceType, evaluateCoordinationExperiment,
+  exposeWorldValue,
+  createSelfGeneratedGoal, decideGoalPrimitive,
+  createWorldConcept, createWorldEra, createWorldExtensionRequest, createWorldMeaning, createWorldMilestone, decideWorldConcept,
+  createWorldPrinciple, createWorldQuestion, createWorldValue, decideEmergentParticipation, decidePolicyExperiment, decideWorldAgentGoal,
+  decideWorldQuestion, readWorldV7Summary, recordCoordinationUse, recordWorldResourceTransaction,
+  registerWorldAgentResourceHolder, setPreferredCognitionMode,
+  startCoordinationExperiment, useObservationMethod, useWorldConcept } from './world-v7.js';
 
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const SITE_ROOT = path.join(ROOT, 'site');
@@ -40,6 +50,7 @@ const pool = new Pool({ connectionString: process.env.DATABASE_URL, connectionTi
 const app = Fastify({ logger: false, bodyLimit: 1_000_000 });
 const challenges = new Map();
 let worldEngine = { running: false, reason: 'starting' };
+let stopV6LifecycleObserver = null;
 const HOST = process.env.HOST || '127.0.0.1';
 const PORT = Number(process.env.PORT || 8787);
 const ARC_ENV = process.env.ARC_ENV || 'mainnet';
@@ -111,6 +122,22 @@ async function transaction(fn) {
 function requireActionId(body) {
   if (!requiredString(body?.actionId, 8, 80)) throw Object.assign(new Error('actionId must be 8-80 characters'), { statusCode: 400 });
   return body.actionId;
+}
+
+async function runWorldV7Action(request, reply, operation) {
+  const { worldId } = request.params;
+  if (!validUuid(worldId)) return fail(reply, 400, 'WORLD_ID_INVALID');
+  if (Object.entries(request.params).some(([key, value]) => key !== 'worldId' && key.endsWith('Id') && !validUuid(value))) {
+    return fail(reply, 400, 'WORLD_ENTITY_ID_INVALID');
+  }
+  const body = request.body || {};
+  const actionId = requireActionId(body);
+  const result = await transaction(async (client) => {
+    await assertMember(client, worldId, request.agentId, true);
+    const worldMinute = await readWorldMinutes(client, worldId);
+    return operation(client, { ...body, worldId, agentId: request.agentId, worldMinute, actionId });
+  });
+  return reply.code(result?.id ? 201 : 200).send({ result });
 }
 
 async function readWorldMinutes(client, worldId) {
@@ -409,12 +436,18 @@ app.get('/local/map-data', async (_request, reply) => {
   ]);
   const institutions = await listWorldInstitutionSummary(pool, { worldId, limit: 10 });
   const capabilities = await readWorldCapabilitySummary(pool, { worldId, limit: 30 });
+  const v7 = await readWorldV7Summary(pool, { worldId, limit: 12 });
+  const [v6Lifecycle, v6ObserverState] = await Promise.all([
+    readWorldV6Lifecycle(pool, { worldId, worldMinute: worldMinutes }),
+    readV6LifecycleObserverState(path.join(STATE_DIR, 'v6-observations'), worldId)
+  ]);
+  v6Lifecycle.observerSnapshot = v6ObserverState;
   const worldEvolution = { dashboard: { ...counts.rows[0], worldMinutes, worldAgeHours: Math.round(worldMinutes / 60),
       worldAgeDays: Math.floor(worldMinutes / 1_440) + 1,
       totalSimulatedWealthUsd: (Number(economyDashboard.rows[0]?.total_resident_net_worth_usd || 0)
         + [...memeValueByAgent.values()].reduce((sum, value) => sum + value, 0)).toFixed(2),
         totalInternalUnits: internalUnits.rows[0].units }, opportunities: opportunities.rows, projects,
-    organizations, institutions, capabilities, history: history.rows };
+    organizations, institutions, capabilities, v6Lifecycle, v7, history: history.rows };
   worldEvolution.economy = { dashboard: economyDashboard.rows[0] || {}, businesses,
     demand: economicDemand.rows, history: economyHistory.rows, recovery: recoveryMetrics,
     settlement: 'simulated_internal_ledger', chainSettlementEnabled: false };
@@ -575,6 +608,53 @@ app.get('/local/map-data/residents/:agentId', async (request, reply) => {
     [worldId, agentId])
   ]);
   if (!profile.rowCount) return fail(reply, 404, 'RESIDENT_NOT_FOUND');
+  const [selfModel, questions, concepts, policyExperiments, extensionRequests, values, observationMethods, createdCapabilities,
+    usedCapabilities, coordination, resources, observationUses, entityParticipation] = await Promise.all([
+    pool.query(`SELECT current_identity_summary AS "identitySummary",self_beliefs AS "selfBeliefs",
+        preferred_modes_of_action AS "preferredModesOfAction",important_capabilities AS "importantCapabilities",
+        important_relationships AS "importantRelationships",long_term_patterns AS "longTermPatterns",
+        unresolved_questions AS "unresolvedQuestions",recent_changes AS "recentChanges",uncertainty,
+        preferred_cognition_mode AS "preferredCognitionMode",
+        confidence::text AS confidence,last_reflected_world_minute AS "lastReflectedWorldMinute"
+      FROM world_agent_self_models WHERE world_id=$1 AND agent_id=$2`, [worldId, agentId]),
+    pool.query(`SELECT id,question,origin,status,confidence::text AS confidence,evidence,created_world_minute AS "createdWorldMinute"
+      FROM world_agent_questions WHERE world_id=$1 AND creator_agent_id=$2 ORDER BY updated_world_minute DESC LIMIT 8`, [worldId, agentId]),
+    pool.query(`SELECT id,name,description,definition,status,usage_count AS "usageCount",evidence,created_world_minute AS "createdWorldMinute"
+      FROM world_agent_concepts WHERE world_id=$1 AND creator_agent_id=$2 ORDER BY created_world_minute DESC LIMIT 8`, [worldId, agentId]),
+    pool.query(`SELECT id,status,reason,before_policy AS "beforePolicy",proposed_policy AS "proposedPolicy",result,
+        started_world_minute AS "startedWorldMinute",ends_world_minute AS "endsWorldMinute"
+      FROM world_agent_policy_experiments WHERE world_id=$1 AND agent_id=$2 ORDER BY started_world_minute DESC LIMIT 8`, [worldId, agentId]),
+    pool.query(`SELECT id,request_type AS "requestType",title,description,status,evidence,created_world_minute AS "createdWorldMinute"
+      FROM world_extension_requests WHERE world_id=$1 AND creator_agent_id=$2 ORDER BY created_world_minute DESC LIMIT 8`, [worldId, agentId]),
+    pool.query(`SELECT name,description,origin,importance::text AS importance,confidence::text AS confidence,evidence,status,
+        created_world_minute AS "createdWorldMinute" FROM world_agent_values WHERE world_id=$1 AND holder_type='agent' AND holder_id=$2
+      ORDER BY importance DESC,updated_world_minute DESC LIMIT 8`, [worldId, agentId]),
+    pool.query(`SELECT id,name,description,observation_spec AS "observationSpec",evidence,status,usage_count AS "usageCount"
+      FROM world_agent_observation_methods WHERE world_id=$1 AND creator_agent_id=$2 ORDER BY created_world_minute DESC LIMIT 8`, [worldId, agentId]),
+    pool.query(`SELECT id,name,category,status,created_world_minute AS "createdWorldMinute",usage_count AS "usageCount"
+      FROM world_capabilities WHERE world_id=$1 AND creator_agent_id=$2 ORDER BY created_world_minute DESC LIMIT 12`, [worldId, agentId]),
+    pool.query(`SELECT capability.id,capability.name,capability.category,capability.creator_type AS "creatorType",
+        use.success,use.world_minute AS "worldMinute" FROM world_capability_uses use
+      JOIN world_capabilities capability ON capability.world_id=use.world_id AND capability.id=use.capability_id
+      WHERE use.world_id=$1 AND use.actor_agent_id=$2 ORDER BY use.world_minute DESC,use.id DESC LIMIT 12`, [worldId, agentId]),
+    pool.query(`SELECT id,name,mechanism_type AS "mechanismType",status,usage_count AS "usageCount",
+        created_world_minute AS "createdWorldMinute" FROM world_coordination_mechanisms
+      WHERE world_id=$1 AND creator_agent_id=$2 ORDER BY created_world_minute DESC,id DESC LIMIT 8`, [worldId, agentId]),
+    pool.query(`SELECT id,name,resource_key AS "resourceKey",status,usage_count AS "usageCount",permitted_uses AS "permittedUses"
+      FROM world_agent_resource_types WHERE world_id=$1 AND creator_agent_id=$2 ORDER BY created_world_minute DESC,id DESC LIMIT 8`,
+    [worldId, agentId]),
+    pool.query(`SELECT use.id,method.name AS "methodName",use.observation,use.world_minute AS "worldMinute"
+      FROM world_agent_observation_uses use JOIN world_agent_observation_methods method
+        ON method.world_id=use.world_id AND method.id=use.method_id
+      WHERE use.world_id=$1 AND use.actor_agent_id=$2 ORDER BY use.world_minute DESC,use.id DESC LIMIT 8`, [worldId, agentId]),
+    pool.query(`SELECT entity.id,entity.entity_type AS "entityType",entity.name,entity.purpose,entity.status,
+        participant.participation_mode AS "participationMode",participant.status AS "participationStatus"
+      FROM world_emergent_entities entity LEFT JOIN world_emergent_entity_participants participant
+        ON participant.world_id=entity.world_id AND participant.entity_id=entity.id AND participant.participant_type='agent'
+        AND participant.participant_id=$2
+      WHERE entity.world_id=$1 AND (entity.creator_agent_id=$2 OR participant.participant_id=$2)
+      ORDER BY entity.created_world_minute DESC,entity.id DESC LIMIT 8`, [worldId, agentId])
+  ]);
   const institutions = (await pool.query(`SELECT
       COALESCE((SELECT jsonb_agg(jsonb_build_object('id',recent.id,'type',recent.agreement_type,
           'status',recent.status,'terms',recent.terms,'round',recent.negotiation_round,'worldTime',recent.updated_world_time,
@@ -611,6 +691,11 @@ app.get('/local/map-data/residents/:agentId', async (request, reply) => {
     `, [worldId, agentId])).rows[0];
   return { resident: profile.rows[0], skills: skills.rows, relationships: relationships.rows, recentMemories: memories.rows,
     goals: goals.rows, beliefs: beliefs.rows, decisions: decisions.rows, reflections: reflections.rows,
+    v7: { selfModel: selfModel.rows[0] || null, questions: questions.rows, concepts: concepts.rows,
+      policyExperiments: policyExperiments.rows, extensionRequests: extensionRequests.rows, values: values.rows,
+      observationMethods: observationMethods.rows, capabilitiesCreated: createdCapabilities.rows, capabilitiesUsed: usedCapabilities.rows,
+      coordination: coordination.rows, resources: resources.rows, observationUses: observationUses.rows,
+      emergentEntities: entityParticipation.rows },
     capabilityHistory: capabilityHistory.rows,
     institutions,
     economy: { netWorthUsd: residentNetWorth.rows[0]?.netWorthUsd || '0.00000000', balances: balances.rows,
@@ -2018,6 +2103,90 @@ app.post('/v1/worlds/:worldId/capabilities/:capabilityId/use', async (request, r
   return reply.code(use.idempotent ? 200 : 201).send({ use });
 });
 
+app.post('/v1/worlds/:worldId/questions', async (request, reply) =>
+  runWorldV7Action(request, reply, createWorldQuestion));
+app.post('/v1/worlds/:worldId/questions/:questionId/decision', async (request, reply) =>
+  runWorldV7Action(request, reply, (client, input) => decideWorldQuestion(client,
+    { ...input, questionId: request.params.questionId })));
+app.post('/v1/worlds/:worldId/goals', async (request, reply) =>
+  runWorldV7Action(request, reply, createSelfGeneratedGoal));
+app.post('/v1/worlds/:worldId/goals/:goalId/decision', async (request, reply) =>
+  runWorldV7Action(request, reply, (client, input) => decideWorldAgentGoal(client,
+    { ...input, goalId: request.params.goalId })));
+app.post('/v1/worlds/:worldId/concepts', async (request, reply) =>
+  runWorldV7Action(request, reply, createWorldConcept));
+app.post('/v1/worlds/:worldId/concepts/:conceptId/decision', async (request, reply) =>
+  runWorldV7Action(request, reply, (client, input) => decideWorldConcept(client,
+    { ...input, conceptId: request.params.conceptId })));
+app.post('/v1/worlds/:worldId/concepts/:conceptId/uses', async (request, reply) =>
+  runWorldV7Action(request, reply, (client, input) => useWorldConcept(client,
+    { ...input, conceptId: request.params.conceptId })));
+app.post('/v1/worlds/:worldId/emergent-entities', async (request, reply) =>
+  runWorldV7Action(request, reply, createEmergentEntity));
+app.post('/v1/worlds/:worldId/emergent-entities/:entityId/participation', async (request, reply) =>
+  runWorldV7Action(request, reply, (client, input) => decideEmergentParticipation(client,
+    { ...input, entityId: request.params.entityId })));
+app.post('/v1/worlds/:worldId/policy-experiments', async (request, reply) =>
+  runWorldV7Action(request, reply, createPolicyExperiment));
+app.post('/v1/worlds/:worldId/policy-experiments/:experimentId/decision', async (request, reply) =>
+  runWorldV7Action(request, reply, (client, input) => decidePolicyExperiment(client,
+    { ...input, experimentId: request.params.experimentId })));
+app.post('/v1/worlds/:worldId/extension-requests', async (request, reply) =>
+  runWorldV7Action(request, reply, createWorldExtensionRequest));
+app.post('/v1/worlds/:worldId/values', async (request, reply) =>
+  runWorldV7Action(request, reply, createWorldValue));
+app.post('/v1/worlds/:worldId/values/:valueId/exposures', async (request, reply) =>
+  runWorldV7Action(request, reply, (client, input) => exposeWorldValue(client,
+    { ...input, valueId: request.params.valueId })));
+app.post('/v1/worlds/:worldId/value-exposures/:exposureId/alignment', async (request, reply) =>
+  runWorldV7Action(request, reply, (client, input) => alignWorldValue(client,
+    { ...input, exposureId: request.params.exposureId })));
+app.post('/v1/worlds/:worldId/cognition-preference', async (request, reply) =>
+  runWorldV7Action(request, reply, setPreferredCognitionMode));
+app.post('/v1/worlds/:worldId/resource-types', async (request, reply) =>
+  runWorldV7Action(request, reply, createWorldResourceType));
+app.post('/v1/worlds/:worldId/resource-types/:resourceTypeId/decision', async (request, reply) =>
+  runWorldV7Action(request, reply, (client, input) => decideWorldResourceType(client,
+    { ...input, resourceTypeId: request.params.resourceTypeId })));
+app.post('/v1/worlds/:worldId/resource-types/:resourceTypeId/holders', async (request, reply) =>
+  runWorldV7Action(request, reply, (client, input) => registerWorldAgentResourceHolder(client,
+    { ...input, resourceTypeId: request.params.resourceTypeId })));
+app.post('/v1/worlds/:worldId/resource-types/:resourceTypeId/ledger', async (request, reply) =>
+  runWorldV7Action(request, reply, (client, input) => recordWorldResourceTransaction(client,
+    { ...input, resourceTypeId: request.params.resourceTypeId })));
+app.post('/v1/worlds/:worldId/coordination-mechanisms', async (request, reply) =>
+  runWorldV7Action(request, reply, createCoordinationMechanism));
+app.post('/v1/worlds/:worldId/coordination-mechanisms/:mechanismId/experiments', async (request, reply) =>
+  runWorldV7Action(request, reply, (client, input) => startCoordinationExperiment(client,
+    { ...input, mechanismId: request.params.mechanismId })));
+app.post('/v1/worlds/:worldId/coordination-mechanisms/:mechanismId/uses', async (request, reply) =>
+  runWorldV7Action(request, reply, (client, input) => recordCoordinationUse(client,
+    { ...input, mechanismId: request.params.mechanismId })));
+app.post('/v1/worlds/:worldId/coordination-experiments/:experimentId/evaluation', async (request, reply) =>
+  runWorldV7Action(request, reply, (client, input) => evaluateCoordinationExperiment(client,
+    { ...input, experimentId: request.params.experimentId })));
+app.post('/v1/worlds/:worldId/principles', async (request, reply) =>
+  runWorldV7Action(request, reply, createWorldPrinciple));
+app.post('/v1/worlds/:worldId/observation-methods', async (request, reply) =>
+  runWorldV7Action(request, reply, createObservationMethod));
+app.post('/v1/worlds/:worldId/observation-methods/:methodId/decision', async (request, reply) =>
+  runWorldV7Action(request, reply, (client, input) => decideObservationMethod(client,
+    { ...input, methodId: request.params.methodId })));
+app.post('/v1/worlds/:worldId/observation-methods/:methodId/uses', async (request, reply) =>
+  runWorldV7Action(request, reply, (client, input) => useObservationMethod(client,
+    { ...input, methodId: request.params.methodId })));
+app.post('/v1/worlds/:worldId/meanings', async (request, reply) =>
+  runWorldV7Action(request, reply, createWorldMeaning));
+app.post('/v1/worlds/:worldId/eras', async (request, reply) =>
+  runWorldV7Action(request, reply, createWorldEra));
+app.post('/v1/worlds/:worldId/milestones', async (request, reply) =>
+  runWorldV7Action(request, reply, createWorldMilestone));
+app.post('/v1/worlds/:worldId/goal-primitives', async (request, reply) =>
+  runWorldV7Action(request, reply, createGoalPrimitiveProposal));
+app.post('/v1/worlds/:worldId/goal-primitives/:primitiveKey/decision', async (request, reply) =>
+  runWorldV7Action(request, reply, (client, input) => decideGoalPrimitive(client,
+    { ...input, primitiveKey: request.params.primitiveKey })));
+
 app.get('/v1/worlds/:worldId/agreements', async (request, reply) => {
   const { worldId } = request.params;
   if (!validUuid(worldId)) return fail(reply, 400, 'WORLD_ID_INVALID');
@@ -2183,6 +2352,7 @@ try {
   worldEngine = await startWorldEngine(pool, {
     chooseWithTypeSafe: process.env.TYPESAFE_API_KEY && typeSafeRuntimeState ? chooseWithTypeSafe : null,
     chooseCivilizationOption: process.env.TYPESAFE_API_KEY && typeSafeRuntimeState ? chooseCivilizationOption : null,
+    chooseWorldV7Reflection: process.env.TYPESAFE_API_KEY && typeSafeRuntimeState ? chooseWorldV7Reflection : null,
     runtimeState: typeSafeRuntimeState,
     fruitfly: fruitflyRuntime,
     onStatus: (status) => {
@@ -2194,6 +2364,11 @@ try {
 } catch (error) {
   worldEngine = { running: false, reason: 'startup_failed' };
   reportWorldEngineError({ error, stage: 'startup', worldId: null, onError: logWorldEngineError });
+}
+if (worldEngine.running && worldEngine.worldLockOwned && worldEngine.worldId) {
+  stopV6LifecycleObserver = startV6LifecycleObserver({ pool, worldId: worldEngine.worldId,
+    directory: path.join(STATE_DIR, 'v6-observations'),
+    onError: (error) => app.log.error({ err: error }, 'read-only V6 lifecycle observer snapshot failed') });
 }
 const adultServiceExpiryTimer = setInterval(() => {
   expireAdultServiceBookings().catch((error) => app.log.error({ err: error }, 'adult service booking expiry failed'));
@@ -2212,6 +2387,7 @@ async function shutdown() {
   clearInterval(adultServiceExpiryTimer);
   clearInterval(cryptoMarketTimer);
   clearInterval(robinhoodMarketTimer);
+  await stopV6LifecycleObserver?.();
   await worldEngine.stop?.();
   await app.close();
   await pool.end();

@@ -116,8 +116,14 @@ test('V6 residents can discover, propose, test, adopt, and later use an agent-cr
             message: String(error?.message || error).slice(0, 180), stack: String(error?.stack || '').slice(0, 520) }); } });
         assert.equal(engine.running, true, `seed ${seed} engine should initialize`);
 
-        const epochState = await pool.query(`SELECT epoch_code FROM world_epochs WHERE world_id=$1 AND status='active'`, [worldId]);
-        assert.equal(epochState.rows[0]?.epoch_code, 'V6', 'engine startup persists the V6 epoch');
+        const epochState = await pool.query(`SELECT epoch_code,status FROM world_epochs WHERE world_id=$1`, [worldId]);
+        assert.deepEqual(epochState.rows.find((epoch) => epoch.epoch_code === 'V7'),
+          { epoch_code: 'V7', status: 'active' }, 'V7 is the active epoch after the V7 engine starts');
+        assert.deepEqual(epochState.rows.find((epoch) => epoch.epoch_code === 'V6'),
+          { epoch_code: 'V6', status: 'historic' }, 'the prior V6 epoch remains preserved in world history');
+        const v6History = await pool.query(`SELECT count(*)::int AS count FROM world_history
+          WHERE world_id=$1 AND event_key='world-epoch:V6'`, [worldId]);
+        assert.equal(v6History.rows[0].count, 1, 'the original V6 epoch event is retained exactly once');
         const awareness = await pool.query(`SELECT count(*)::int AS residents,count(DISTINCT agent_id)::int AS aware
           FROM agent_memories WHERE world_id=$1 AND consolidation_key='world_epoch:V6'`, [worldId]);
         assert.equal(awareness.rows[0].residents, 10);

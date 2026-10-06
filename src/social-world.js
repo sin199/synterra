@@ -384,7 +384,28 @@ function goalActionAffinity(category, action, candidate = {}, metadata = {}) {
 export function goalActionUtility(candidate, goals = []) {
   return (Array.isArray(goals) ? goals : []).reduce((sum, goal) => {
     if (goal?.status && goal.status !== 'active') return sum;
-    const affinity = goalActionAffinity(goal?.category, candidate?.action, candidate, goal?.metadata || {});
+    const metadata = goal?.metadata || {};
+    const grammar = Array.isArray(metadata.goalGrammar) ? metadata.goalGrammar : [];
+    const primitiveAffinity = grammar.reduce((best, entry) => {
+      const primitive = String(entry?.primitive || '').toLowerCase();
+      const action = candidate?.action;
+      const affinities = {
+        change_self: ['learn', 'goal_review'],
+        create: ['work', 'project_propose', 'capability_use'],
+        understand: ['learn', 'business_market_observe', 'capability_use'],
+        connect: ['socialize', 'cooperate', 'information_share', 'project_contribute'],
+        preserve: ['rest', 'eat', 'work'],
+        explore: ['learn', 'travel', 'business_market_observe', 'capability_use'],
+        transform: ['work', 'project_contribute', 'capability_use'],
+        reduce_dependency: ['learn', 'work', 'business_market_observe'],
+        increase_autonomy: ['learn', 'work', 'capability_use'],
+        help_goal: ['work', 'learn', 'cooperate', 'project_contribute'],
+        create_concept: ['learn', 'business_market_observe']
+      }[primitive] || [];
+      return Math.max(best, affinities.includes(action) ? 0.85 : 0);
+    }, 0);
+    const affinity = Math.max(primitiveAffinity,
+      goalActionAffinity(goal?.category, candidate?.action, candidate, metadata));
     const priority = clampFinite(goal?.priority, 0, 1, goal?.goalType === 'primary' ? 1 : 0.5);
     const scale = goal.goalType === 'primary' ? 26 : goal.goalType === 'secondary' ? 11 : 8;
     return sum + affinity * priority * scale;
@@ -424,7 +445,8 @@ export function recentMemoryUtility(agent, action, worldMinutes) {
       adjustment += 3 * decay;
     }
   }
-  return clampFinite(adjustment, -18, 8, 0);
+  const memoryEmphasis = clampFinite(agent.decisionPolicy?.memoryEmphasis, 0, 1, 0.5);
+  return clampFinite(adjustment * (0.5 + memoryEmphasis), -18, 8, 0);
 }
 
 export function deriveDominantRole(skills = {}, goal = 'BALANCED_LIFE') {

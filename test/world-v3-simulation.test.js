@@ -118,8 +118,11 @@ test(`isolated Fruitfly world simulation runs 10 seeded scenarios for ${hours} w
           stack: String(error?.stack || '').split('\n').slice(0, 6).join('\n') });
       } });
     assert.equal(engine.running, true);
-    for (let index = 1; index < steps; index += 1) {
-      nowMs += stepSeconds * 1_000;
+    for (let index = 0; index < steps; index += 1) {
+      // startWorldEngine's bootstrap tick advances the clock by one minute even
+      // with no elapsed time; make the final simulated interval 29 seconds so
+      // the complete run still lands on exactly the requested 30-day horizon.
+      nowMs += (index === steps - 1 ? stepSeconds - 1 : stepSeconds) * 1_000;
       await engine.tickOnce();
       if (index % 120 === 0) await new Promise((resolve) => setImmediate(resolve));
     }

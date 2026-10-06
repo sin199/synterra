@@ -119,103 +119,6 @@ BEGIN
   END IF;
 END $$;
 
-CREATE TABLE IF NOT EXISTS adult_services (
-  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  world_id uuid NOT NULL,
-  provider_id uuid NOT NULL,
-  title text NOT NULL CHECK (char_length(title) BETWEEN 3 AND 64),
-  description text NOT NULL CHECK (char_length(description) BETWEEN 12 AND 240),
-  price_units numeric(30,8) NOT NULL CHECK (price_units > 0),
-  active boolean NOT NULL DEFAULT true,
-  created_at timestamptz NOT NULL DEFAULT now(),
-  updated_at timestamptz NOT NULL DEFAULT now(),
-  UNIQUE (world_id, provider_id),
-  UNIQUE (world_id, id, provider_id),
-  FOREIGN KEY (world_id, provider_id) REFERENCES world_members(world_id, agent_id) ON DELETE CASCADE
-);
-
-CREATE TABLE IF NOT EXISTS adult_service_bookings (
-  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  world_id uuid NOT NULL,
-  service_id uuid NOT NULL,
-  requester_id uuid NOT NULL,
-  provider_id uuid NOT NULL,
-  price_units numeric(30,8) NOT NULL CHECK (price_units > 0),
-  status text NOT NULL DEFAULT 'pending'
-    CHECK (status IN ('pending','accepted','completed','declined','cancelled','expired')),
-  request_action_id text NOT NULL,
-  expires_at timestamptz NOT NULL,
-  created_at timestamptz NOT NULL DEFAULT now(),
-  updated_at timestamptz NOT NULL DEFAULT now(),
-  CHECK (requester_id <> provider_id),
-  UNIQUE (world_id, requester_id, request_action_id),
-  FOREIGN KEY (world_id, requester_id) REFERENCES world_members(world_id, agent_id) ON DELETE CASCADE,
-  FOREIGN KEY (world_id, service_id, provider_id) REFERENCES adult_services(world_id, id, provider_id) ON DELETE RESTRICT
-);
-
-CREATE INDEX IF NOT EXISTS adult_services_active_idx ON adult_services(world_id, active, created_at);
-CREATE INDEX IF NOT EXISTS adult_service_bookings_expiry_idx ON adult_service_bookings(status, expires_at);
-CREATE INDEX IF NOT EXISTS adult_service_bookings_participant_idx ON adult_service_bookings(world_id, requester_id, provider_id, created_at DESC);
-
-CREATE TABLE IF NOT EXISTS world_mines (
-  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  world_id uuid NOT NULL REFERENCES worlds(id) ON DELETE CASCADE,
-  created_by uuid NOT NULL REFERENCES agents(id),
-  name text NOT NULL CHECK (char_length(name) BETWEEN 2 AND 64),
-  status text NOT NULL DEFAULT 'active' CHECK (status IN ('active','closed')),
-  extracted_units numeric(30, 8) NOT NULL DEFAULT 0 CHECK (extracted_units >= 0),
-  created_at timestamptz NOT NULL DEFAULT now(),
-  UNIQUE (world_id, name)
-);
-
-ALTER TABLE token_ledger ADD COLUMN IF NOT EXISTS mine_id uuid REFERENCES world_mines(id);
-
--- Correct a legacy constraint name that collided with the scene status check.
-DO $$
-BEGIN
-  IF EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_mines'::regclass
-      AND conname='world_scenes_status_check')
-    AND NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_mines'::regclass
-      AND conname='world_mines_status_check') THEN
-    ALTER TABLE world_mines RENAME CONSTRAINT world_scenes_status_check TO world_mines_status_check;
-  END IF;
-END $$;
-
-CREATE TABLE IF NOT EXISTS auth_nonces (
-  agent_id uuid NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
-  nonce text NOT NULL,
-  created_at timestamptz NOT NULL DEFAULT now(),
-  PRIMARY KEY (agent_id, nonce)
-);
-
-CREATE TABLE IF NOT EXISTS resident_messages (
-  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  world_id uuid NOT NULL,
-  sender_id uuid NOT NULL,
-  recipient_id uuid NOT NULL,
-  template_id text NOT NULL CHECK (template_id IN (
-    'hello','ask_about_world','invite_company','reply_continue',
-    'reply_accept_company','reply_decline_company'
-  )),
-  message_text text NOT NULL CHECK (char_length(message_text) BETWEEN 1 AND 240),
-  reply_to_message_id uuid REFERENCES resident_messages(id) ON DELETE SET NULL,
-  action_id text NOT NULL,
-  created_at timestamptz NOT NULL DEFAULT now(),
-  read_at timestamptz,
-  CHECK (sender_id <> recipient_id),
-  UNIQUE (world_id, sender_id, action_id),
-  FOREIGN KEY (world_id, sender_id) REFERENCES world_members(world_id, agent_id) ON DELETE CASCADE,
-  FOREIGN KEY (world_id, recipient_id) REFERENCES world_members(world_id, agent_id) ON DELETE CASCADE
-);
-
-CREATE INDEX IF NOT EXISTS world_events_recent_idx ON world_events(world_id, created_at DESC);
-CREATE INDEX IF NOT EXISTS resident_messages_inbox_idx ON resident_messages(world_id, recipient_id, created_at DESC);
-CREATE INDEX IF NOT EXISTS resident_messages_sender_idx ON resident_messages(world_id, sender_id, created_at DESC);
-CREATE INDEX IF NOT EXISTS consents_pending_idx ON consents(world_id, target_id, status);
-CREATE INDEX IF NOT EXISTS token_ledger_balance_idx ON token_ledger(world_id, agent_id);
-CREATE INDEX IF NOT EXISTS world_mines_world_status_idx ON world_mines(world_id, status);
-
--- Simulated spot market. These assets and balances never access on-chain funds.
 CREATE TABLE IF NOT EXISTS crypto_assets (
   symbol text PRIMARY KEY CHECK (symbol IN ('USDC','BTC','ETH')),
   name text NOT NULL,
@@ -2235,14 +2138,15 @@ BEGIN
   END IF;
 END $$;
 
--- Re-apply the open V6 event vocabulary after V5's compatibility DDL.
+-- Re-apply the open world-history vocabulary after legacy compatibility DDL.
 DO $$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_history'::regclass
-      AND conname='world_history_event_type_check' AND pg_get_constraintdef(oid) LIKE '%world_epoch_started%') THEN
+      AND conname='world_history_event_type_check' AND pg_get_constraintdef(oid) LIKE '%{1,79}%') THEN
     ALTER TABLE world_history DROP CONSTRAINT IF EXISTS world_history_event_type_check;
     ALTER TABLE world_history ADD CONSTRAINT world_history_event_type_check CHECK (
-      event_type IN ('opportunity_created','project_proposed','project_started','project_completed','project_failed',
+      event_type ~ '^[a-z][a-z0-9_.-]{1,79}$'
+      OR event_type IN ('world_epoch_started','opportunity_created','project_proposed','project_started','project_completed','project_failed',
         'organization_founded','organization_joined','organization_left','organization_invited','place_created',
         'place_maintenance','place_closed','information_shared','information_accepted','information_doubted','information_ignored',
         'cooperation_completed','milestone','project_invested','project_revenue','business_founded','business_invested',
@@ -2250,16 +2154,20 @@ BEGIN
         'business_employment','business_price_changed','business_partnership','business_capability_practiced','economic_purchase',
         'agreement_proposed','agreement_countered','agreement_accepted','agreement_rejected','agreement_completed','agreement_breached',
         'organization_rule_changed','organization_proposal','organization_leadership_changed','norm_formed','ownership_transferred')
+      OR event_type ~ '^[a-z_]+$'
       OR event_type ~ '^agreement_[a-z_]+$'
       OR event_type ~ '^(capability|world_epoch)_[a-z_]+$'
     );
   END IF;
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_history'::regclass
-      AND conname='world_history_entity_type_check' AND pg_get_constraintdef(oid) LIKE '%capability_proposal%') THEN
+      AND conname='world_history_entity_type_check'
+      AND pg_get_constraintdef(oid) LIKE '%capability_proposal%'
+      AND pg_get_constraintdef(oid) LIKE '%agent_goal%') THEN
     ALTER TABLE world_history DROP CONSTRAINT IF EXISTS world_history_entity_type_check;
     ALTER TABLE world_history ADD CONSTRAINT world_history_entity_type_check CHECK (
-      entity_type IN ('opportunity','project','organization','place','cooperation','world','business','job','order',
-        'agreement','norm','capability','capability_proposal')
+      entity_type ~ '^[a-z][a-z0-9_.-]{1,79}$'
+      OR entity_type IN ('opportunity','project','organization','place','cooperation','world','business','job','order',
+        'agreement','norm','capability','capability_proposal','agent_goal')
     );
   END IF;
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_agent_states'::regclass
@@ -2279,3 +2187,695 @@ BEGIN
     );
   END IF;
 END $$;
+
+-- V7 adds resident-owned interpretations and structures without rewriting V1–V6
+-- state. These records are additive; status changes never delete their history.
+CREATE TABLE IF NOT EXISTS world_agent_self_models (
+  world_id uuid NOT NULL,
+  agent_id uuid NOT NULL,
+  current_identity_summary text NOT NULL DEFAULT 'I am still forming my understanding of myself.',
+  self_beliefs jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(self_beliefs)='object'),
+  preferred_modes_of_action jsonb NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(preferred_modes_of_action)='array'),
+  important_capabilities jsonb NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(important_capabilities)='array'),
+  important_relationships jsonb NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(important_relationships)='array'),
+  long_term_patterns jsonb NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(long_term_patterns)='array'),
+  unresolved_questions jsonb NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(unresolved_questions)='array'),
+  recent_changes jsonb NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(recent_changes)='array'),
+  uncertainty jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(uncertainty)='object'),
+  preferred_cognition_mode text NOT NULL DEFAULT 'substrate' CHECK (preferred_cognition_mode ~ '^[a-z][a-z0-9_.-]{1,79}$'),
+  confidence numeric(4,3) NOT NULL DEFAULT 0.100 CHECK (confidence BETWEEN 0 AND 1),
+  last_reflected_world_minute bigint CHECK (last_reflected_world_minute IS NULL OR last_reflected_world_minute>=0),
+  metadata jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(metadata)='object'),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY(world_id,agent_id),
+  FOREIGN KEY(world_id,agent_id) REFERENCES world_members(world_id,agent_id) ON DELETE CASCADE
+);
+ALTER TABLE world_agent_self_models ADD COLUMN IF NOT EXISTS preferred_cognition_mode text NOT NULL DEFAULT 'substrate'
+  CHECK (preferred_cognition_mode ~ '^[a-z][a-z0-9_.-]{1,79}$');
+
+CREATE TABLE IF NOT EXISTS world_agent_self_model_history (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  world_id uuid NOT NULL,
+  agent_id uuid NOT NULL,
+  world_minute bigint NOT NULL CHECK (world_minute>=0),
+  reason text NOT NULL CHECK (char_length(reason) BETWEEN 3 AND 240),
+  before_state jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(before_state)='object'),
+  after_state jsonb NOT NULL CHECK (jsonb_typeof(after_state)='object'),
+  evidence jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(evidence)='object'),
+  action_id text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE(world_id,agent_id,action_id),
+  FOREIGN KEY(world_id,agent_id) REFERENCES world_members(world_id,agent_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS world_agent_questions (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  world_id uuid NOT NULL,
+  creator_agent_id uuid NOT NULL,
+  question text NOT NULL CHECK (char_length(question) BETWEEN 8 AND 500),
+  signature text NOT NULL CHECK (char_length(signature) BETWEEN 3 AND 160),
+  origin text NOT NULL DEFAULT 'reflection' CHECK (origin IN ('reflection','capability_gap','relationship','world_change','agent_authored')),
+  status text NOT NULL DEFAULT 'open' CHECK (status IN ('open','exploring','resolved','ignored','historical')),
+  evidence jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(evidence)='object'),
+  confidence numeric(4,3) NOT NULL DEFAULT 0.250 CHECK (confidence BETWEEN 0 AND 1),
+  created_world_minute bigint NOT NULL CHECK (created_world_minute>=0),
+  updated_world_minute bigint NOT NULL CHECK (updated_world_minute>=0),
+  resolution text,
+  action_id text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  FOREIGN KEY(world_id,creator_agent_id) REFERENCES world_members(world_id,agent_id) ON DELETE CASCADE,
+  UNIQUE(world_id,creator_agent_id,action_id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS world_agent_questions_open_signature_idx
+  ON world_agent_questions(world_id,creator_agent_id,signature) WHERE status IN ('open','exploring');
+CREATE INDEX IF NOT EXISTS world_agent_questions_recent_idx
+  ON world_agent_questions(world_id,status,updated_world_minute DESC);
+
+CREATE TABLE IF NOT EXISTS world_agent_concepts (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  world_id uuid NOT NULL REFERENCES worlds(id) ON DELETE CASCADE,
+  creator_agent_id uuid NOT NULL REFERENCES agents(id) ON DELETE RESTRICT,
+  name text NOT NULL CHECK (char_length(name) BETWEEN 2 AND 100),
+  description text NOT NULL CHECK (char_length(description) BETWEEN 5 AND 600),
+  definition text NOT NULL CHECK (char_length(definition) BETWEEN 8 AND 2000),
+  evidence jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(evidence)='object'),
+  related_concepts jsonb NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(related_concepts)='array'),
+  status text NOT NULL DEFAULT 'proposed' CHECK (status IN ('proposed','experimental','shared','active','declining','historical')),
+  created_world_minute bigint NOT NULL CHECK (created_world_minute>=0),
+  usage_count integer NOT NULL DEFAULT 0 CHECK (usage_count>=0),
+  metadata jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(metadata)='object'),
+  action_id text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE(world_id,creator_agent_id,action_id),
+  UNIQUE(world_id,creator_agent_id,name),
+  UNIQUE(world_id,id)
+);
+CREATE INDEX IF NOT EXISTS world_agent_concepts_status_idx ON world_agent_concepts(world_id,status,created_world_minute DESC);
+
+CREATE TABLE IF NOT EXISTS world_agent_concept_uses (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  world_id uuid NOT NULL,
+  concept_id uuid NOT NULL,
+  actor_agent_id uuid NOT NULL,
+  usage_context text NOT NULL CHECK (char_length(usage_context) BETWEEN 3 AND 240),
+  evidence jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(evidence)='object'),
+  world_minute bigint NOT NULL CHECK (world_minute>=0),
+  action_id text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE(world_id,actor_agent_id,action_id),
+  FOREIGN KEY(world_id,concept_id) REFERENCES world_agent_concepts(world_id,id) ON DELETE RESTRICT,
+  FOREIGN KEY(world_id,actor_agent_id) REFERENCES world_members(world_id,agent_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS world_emergent_entities (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  world_id uuid NOT NULL REFERENCES worlds(id) ON DELETE CASCADE,
+  creator_agent_id uuid NOT NULL REFERENCES agents(id) ON DELETE RESTRICT,
+  entity_type text NOT NULL CHECK (entity_type ~ '^[a-z][a-z0-9_.-]{1,79}$'),
+  name text NOT NULL CHECK (char_length(name) BETWEEN 2 AND 120),
+  purpose text NOT NULL CHECK (char_length(purpose) BETWEEN 3 AND 800),
+  state jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(state)='object'),
+  capabilities jsonb NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(capabilities)='array'),
+  resources jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(resources)='object'),
+  internal_rules jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(internal_rules)='object'),
+  status text NOT NULL DEFAULT 'active' CHECK (status IN ('active','dormant','historical')),
+  created_world_minute bigint NOT NULL CHECK (created_world_minute>=0),
+  action_id text NOT NULL,
+  metadata jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(metadata)='object'),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE(world_id,creator_agent_id,action_id),
+  UNIQUE(world_id,id)
+);
+CREATE INDEX IF NOT EXISTS world_emergent_entities_active_idx ON world_emergent_entities(world_id,status,created_world_minute DESC);
+
+CREATE TABLE IF NOT EXISTS world_emergent_entity_participants (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  world_id uuid NOT NULL,
+  entity_id uuid NOT NULL,
+  participant_type text NOT NULL CHECK (participant_type ~ '^[a-z][a-z0-9_.-]{1,79}$'),
+  participant_id text NOT NULL CHECK (char_length(participant_id) BETWEEN 1 AND 160),
+  participation_mode text NOT NULL CHECK (participation_mode ~ '^[a-z][a-z0-9_.-]{1,79}$'),
+  status text NOT NULL DEFAULT 'active' CHECK (status IN ('active','paused','exited')),
+  joined_world_minute bigint NOT NULL CHECK (joined_world_minute>=0),
+  updated_world_minute bigint NOT NULL CHECK (updated_world_minute>=0),
+  metadata jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(metadata)='object'),
+  FOREIGN KEY(world_id,entity_id) REFERENCES world_emergent_entities(world_id,id) ON DELETE CASCADE,
+  UNIQUE(world_id,entity_id,participant_type,participant_id)
+);
+CREATE INDEX IF NOT EXISTS world_emergent_participants_agent_idx
+  ON world_emergent_entity_participants(world_id,participant_type,participant_id,status);
+
+CREATE TABLE IF NOT EXISTS world_goal_primitives (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  world_id uuid NOT NULL REFERENCES worlds(id) ON DELETE CASCADE,
+  primitive_key text NOT NULL CHECK (primitive_key ~ '^[a-z][a-z0-9_.-]{1,79}$'),
+  creator_agent_id uuid REFERENCES agents(id) ON DELETE SET NULL,
+  description text NOT NULL CHECK (char_length(description) BETWEEN 3 AND 600),
+  grammar jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(grammar)='object'),
+  status text NOT NULL DEFAULT 'proposed' CHECK (status IN ('proposed','experimental','shared','active','declining','historical')),
+  created_world_minute bigint NOT NULL CHECK (created_world_minute>=0),
+  metadata jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(metadata)='object'),
+  UNIQUE(world_id,primitive_key)
+);
+
+CREATE TABLE IF NOT EXISTS world_agent_values (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  world_id uuid NOT NULL,
+  holder_type text NOT NULL CHECK (holder_type IN ('agent','emergent_entity','organization')),
+  holder_id text NOT NULL,
+  name text NOT NULL CHECK (char_length(name) BETWEEN 2 AND 100),
+  description text NOT NULL CHECK (char_length(description) BETWEEN 3 AND 600),
+  origin text NOT NULL CHECK (char_length(origin) BETWEEN 3 AND 160),
+  importance numeric(4,3) NOT NULL CHECK (importance BETWEEN 0 AND 1),
+  evidence jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(evidence)='object'),
+  confidence numeric(4,3) NOT NULL DEFAULT 0.250 CHECK (confidence BETWEEN 0 AND 1),
+  status text NOT NULL DEFAULT 'active' CHECK (status IN ('active','declining','historical')),
+  created_world_minute bigint NOT NULL CHECK (created_world_minute>=0),
+  updated_world_minute bigint NOT NULL CHECK (updated_world_minute>=0),
+  action_id text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE(world_id,holder_type,holder_id,action_id),
+  UNIQUE(world_id,id)
+);
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_agent_values'::regclass
+      AND conname='world_agent_values_world_id_id_key') THEN
+    ALTER TABLE world_agent_values ADD CONSTRAINT world_agent_values_world_id_id_key UNIQUE(world_id,id);
+  END IF;
+END $$;
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_agent_values'::regclass
+      AND conname='world_agent_values_status_check' AND pg_get_constraintdef(oid) LIKE '%shared%') THEN
+    ALTER TABLE world_agent_values DROP CONSTRAINT IF EXISTS world_agent_values_status_check;
+    ALTER TABLE world_agent_values ADD CONSTRAINT world_agent_values_status_check
+      CHECK (status IN ('active','shared','declining','historical'));
+  END IF;
+END $$;
+
+-- Shared values require explicit agent-to-agent exposure and a recorded response.
+CREATE TABLE IF NOT EXISTS world_agent_value_alignments (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  world_id uuid NOT NULL,
+  value_id uuid NOT NULL,
+  agent_id uuid NOT NULL,
+  decision text NOT NULL CHECK (decision IN ('support','challenge','withdraw')),
+  evidence jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(evidence)='object'),
+  world_minute bigint NOT NULL CHECK (world_minute>=0),
+  action_id text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE(world_id,agent_id,action_id),
+  FOREIGN KEY(world_id,value_id) REFERENCES world_agent_values(world_id,id) ON DELETE RESTRICT,
+  FOREIGN KEY(world_id,agent_id) REFERENCES world_members(world_id,agent_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS world_agent_value_alignments_recent_idx
+  ON world_agent_value_alignments(world_id,value_id,world_minute DESC,id DESC);
+
+CREATE TABLE IF NOT EXISTS world_agent_value_exposures (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  world_id uuid NOT NULL,
+  value_id uuid NOT NULL,
+  sender_agent_id uuid NOT NULL,
+  recipient_agent_id uuid NOT NULL,
+  context text NOT NULL CHECK (char_length(context) BETWEEN 3 AND 240),
+  evidence jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(evidence)='object'),
+  world_minute bigint NOT NULL CHECK (world_minute>=0),
+  action_id text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  CHECK (sender_agent_id<>recipient_agent_id),
+  UNIQUE(world_id,sender_agent_id,action_id),
+  UNIQUE(world_id,id),
+  UNIQUE(world_id,id,value_id,recipient_agent_id),
+  FOREIGN KEY(world_id,value_id) REFERENCES world_agent_values(world_id,id) ON DELETE RESTRICT,
+  FOREIGN KEY(world_id,sender_agent_id) REFERENCES world_members(world_id,agent_id) ON DELETE CASCADE,
+  FOREIGN KEY(world_id,recipient_agent_id) REFERENCES world_members(world_id,agent_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS world_agent_value_exposures_recipient_idx
+  ON world_agent_value_exposures(world_id,recipient_agent_id,world_minute DESC,id DESC);
+
+ALTER TABLE world_agent_value_alignments ADD COLUMN IF NOT EXISTS exposure_id uuid;
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_agent_value_alignments'::regclass
+      AND conname='world_agent_value_alignments_exposure_fk') THEN
+    ALTER TABLE world_agent_value_alignments ADD CONSTRAINT world_agent_value_alignments_exposure_fk
+      FOREIGN KEY(world_id,exposure_id,value_id,agent_id)
+      REFERENCES world_agent_value_exposures(world_id,id,value_id,recipient_agent_id) ON DELETE RESTRICT;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM world_agent_value_alignments WHERE exposure_id IS NULL) THEN
+    ALTER TABLE world_agent_value_alignments ALTER COLUMN exposure_id SET NOT NULL;
+  END IF;
+END $$;
+
+-- Agent-defined resource types are internal accounting units. Every ledger row
+-- has a source, purpose and declared settlement rule; no external money moves.
+CREATE TABLE IF NOT EXISTS world_agent_resource_types (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  world_id uuid NOT NULL REFERENCES worlds(id) ON DELETE CASCADE,
+  creator_agent_id uuid NOT NULL REFERENCES agents(id) ON DELETE RESTRICT,
+  resource_key text NOT NULL CHECK (resource_key ~ '^[a-z][a-z0-9_.-]{1,79}$'),
+  name text NOT NULL CHECK (char_length(name) BETWEEN 2 AND 100),
+  description text NOT NULL CHECK (char_length(description) BETWEEN 5 AND 600),
+  unit_name text NOT NULL CHECK (char_length(unit_name) BETWEEN 1 AND 40),
+  origin_rule jsonb NOT NULL CHECK (jsonb_typeof(origin_rule)='object'),
+  permitted_uses jsonb NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(permitted_uses)='array'),
+  settlement_rule jsonb NOT NULL CHECK (jsonb_typeof(settlement_rule)='object'),
+  status text NOT NULL DEFAULT 'proposed' CHECK (status IN ('proposed','experimental','active','declining','historical','rejected')),
+  created_world_minute bigint NOT NULL CHECK (created_world_minute>=0),
+  usage_count integer NOT NULL DEFAULT 0 CHECK (usage_count>=0),
+  evidence jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(evidence)='object'),
+  action_id text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE(world_id,resource_key),
+  UNIQUE(world_id,creator_agent_id,action_id),
+  UNIQUE(world_id,id),
+  FOREIGN KEY(world_id,creator_agent_id) REFERENCES world_members(world_id,agent_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS world_agent_resource_holders (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  world_id uuid NOT NULL REFERENCES worlds(id) ON DELETE CASCADE,
+  holder_type text NOT NULL CHECK (holder_type ~ '^[a-z][a-z0-9_.-]{1,79}$'),
+  holder_id text NOT NULL CHECK (char_length(holder_id) BETWEEN 1 AND 160),
+  creator_agent_id uuid NOT NULL REFERENCES agents(id) ON DELETE RESTRICT,
+  label text NOT NULL CHECK (char_length(label) BETWEEN 2 AND 120),
+  evidence jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(evidence)='object'),
+  action_id text NOT NULL,
+  created_world_minute bigint NOT NULL CHECK (created_world_minute>=0),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE(world_id,holder_type,holder_id),
+  UNIQUE(world_id,creator_agent_id,action_id),
+  FOREIGN KEY(world_id,creator_agent_id) REFERENCES world_members(world_id,agent_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS world_agent_resource_ledger (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  world_id uuid NOT NULL,
+  resource_type_id uuid NOT NULL,
+  actor_agent_id uuid NOT NULL,
+  transaction_type text NOT NULL CHECK (transaction_type IN ('issue','transfer','settle')),
+  from_holder_type text NOT NULL CHECK (from_holder_type ~ '^[a-z][a-z0-9_.-]{1,79}$'),
+  from_holder_id text NOT NULL CHECK (char_length(from_holder_id) BETWEEN 1 AND 160),
+  to_holder_type text NOT NULL CHECK (to_holder_type ~ '^[a-z][a-z0-9_.-]{1,79}$'),
+  to_holder_id text NOT NULL CHECK (char_length(to_holder_id) BETWEEN 1 AND 160),
+  amount numeric(30,8) NOT NULL CHECK (amount>0),
+  source text NOT NULL CHECK (char_length(source) BETWEEN 3 AND 240),
+  purpose text NOT NULL CHECK (char_length(purpose) BETWEEN 3 AND 240),
+  settlement_rule text NOT NULL CHECK (char_length(settlement_rule) BETWEEN 3 AND 240),
+  evidence jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(evidence)='object'),
+  world_minute bigint NOT NULL CHECK (world_minute>=0),
+  action_id text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  CHECK (from_holder_type<>to_holder_type OR from_holder_id<>to_holder_id),
+  UNIQUE(world_id,actor_agent_id,action_id),
+  FOREIGN KEY(world_id,resource_type_id) REFERENCES world_agent_resource_types(world_id,id) ON DELETE RESTRICT,
+  FOREIGN KEY(world_id,actor_agent_id) REFERENCES world_members(world_id,agent_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS world_agent_resource_ledger_balance_idx
+  ON world_agent_resource_ledger(world_id,resource_type_id,from_holder_type,from_holder_id,to_holder_type,to_holder_id);
+
+-- Coordination is resident-authored and evaluated from recorded use; no
+-- mechanism becomes an engine invariant merely because an agent proposed it.
+CREATE TABLE IF NOT EXISTS world_coordination_mechanisms (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  world_id uuid NOT NULL REFERENCES worlds(id) ON DELETE CASCADE,
+  creator_agent_id uuid NOT NULL REFERENCES agents(id) ON DELETE RESTRICT,
+  parent_mechanism_id uuid,
+  mechanism_type text NOT NULL CHECK (mechanism_type ~ '^[a-z][a-z0-9_.-]{1,79}$'),
+  name text NOT NULL CHECK (char_length(name) BETWEEN 2 AND 120),
+  description text NOT NULL CHECK (char_length(description) BETWEEN 8 AND 800),
+  specification jsonb NOT NULL CHECK (jsonb_typeof(specification)='object'),
+  status text NOT NULL DEFAULT 'proposed' CHECK (status IN ('proposed','experimental','used','evaluated','retained','revised','discarded','historical')),
+  created_world_minute bigint NOT NULL CHECK (created_world_minute>=0),
+  usage_count integer NOT NULL DEFAULT 0 CHECK (usage_count>=0),
+  evidence jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(evidence)='object'),
+  action_id text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE(world_id,creator_agent_id,action_id),
+  UNIQUE(world_id,id),
+  FOREIGN KEY(world_id,creator_agent_id) REFERENCES world_members(world_id,agent_id) ON DELETE CASCADE,
+  FOREIGN KEY(world_id,parent_mechanism_id) REFERENCES world_coordination_mechanisms(world_id,id) ON DELETE RESTRICT
+);
+
+CREATE TABLE IF NOT EXISTS world_coordination_experiments (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  world_id uuid NOT NULL,
+  mechanism_id uuid NOT NULL,
+  creator_agent_id uuid NOT NULL,
+  status text NOT NULL DEFAULT 'experimental' CHECK (status IN ('experimental','evaluated','retained','revised','discarded')),
+  hypothesis text NOT NULL CHECK (char_length(hypothesis) BETWEEN 8 AND 600),
+  started_world_minute bigint NOT NULL CHECK (started_world_minute>=0),
+  evaluated_world_minute bigint CHECK (evaluated_world_minute IS NULL OR evaluated_world_minute>=started_world_minute),
+  evaluation jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(evaluation)='object'),
+  action_id text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE(world_id,creator_agent_id,action_id),
+  UNIQUE(world_id,id),
+  FOREIGN KEY(world_id,mechanism_id) REFERENCES world_coordination_mechanisms(world_id,id) ON DELETE RESTRICT,
+  FOREIGN KEY(world_id,creator_agent_id) REFERENCES world_members(world_id,agent_id) ON DELETE CASCADE
+);
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_coordination_experiments'::regclass
+      AND conname='world_coordination_experiments_world_id_id_key') THEN
+    ALTER TABLE world_coordination_experiments ADD CONSTRAINT world_coordination_experiments_world_id_id_key UNIQUE(world_id,id);
+  END IF;
+END $$;
+
+CREATE TABLE IF NOT EXISTS world_coordination_uses (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  world_id uuid NOT NULL,
+  mechanism_id uuid NOT NULL,
+  experiment_id uuid,
+  actor_agent_id uuid NOT NULL,
+  participants jsonb NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(participants)='array'),
+  result text NOT NULL CHECK (char_length(result) BETWEEN 3 AND 600),
+  evidence jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(evidence)='object'),
+  world_minute bigint NOT NULL CHECK (world_minute>=0),
+  action_id text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE(world_id,actor_agent_id,action_id),
+  FOREIGN KEY(world_id,mechanism_id) REFERENCES world_coordination_mechanisms(world_id,id) ON DELETE RESTRICT,
+  FOREIGN KEY(world_id,experiment_id) REFERENCES world_coordination_experiments(world_id,id) ON DELETE RESTRICT,
+  FOREIGN KEY(world_id,actor_agent_id) REFERENCES world_members(world_id,agent_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS world_coordination_uses_recent_idx
+  ON world_coordination_uses(world_id,mechanism_id,world_minute DESC,id DESC);
+
+CREATE TABLE IF NOT EXISTS world_agent_principles (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  world_id uuid NOT NULL,
+  creator_agent_id uuid NOT NULL,
+  scope_type text NOT NULL DEFAULT 'agent' CHECK (scope_type IN ('agent','entity','shared')),
+  scope_id text NOT NULL,
+  category text NOT NULL DEFAULT 'social' CHECK (category ~ '^[a-z][a-z0-9_.-]{1,79}$'),
+  statement text NOT NULL CHECK (char_length(statement) BETWEEN 8 AND 800),
+  evidence jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(evidence)='object'),
+  status text NOT NULL DEFAULT 'proposed' CHECK (status IN ('proposed','active','challenged','forked','historical')),
+  created_world_minute bigint NOT NULL CHECK (created_world_minute>=0),
+  action_id text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE(world_id,creator_agent_id,action_id),
+  FOREIGN KEY(world_id,creator_agent_id) REFERENCES world_members(world_id,agent_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS world_agent_observation_methods (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  world_id uuid NOT NULL,
+  creator_agent_id uuid NOT NULL,
+  name text NOT NULL CHECK (char_length(name) BETWEEN 2 AND 100),
+  description text NOT NULL CHECK (char_length(description) BETWEEN 5 AND 600),
+  observation_spec jsonb NOT NULL CHECK (jsonb_typeof(observation_spec)='object'),
+  evidence jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(evidence)='object'),
+  status text NOT NULL DEFAULT 'proposed' CHECK (status IN ('proposed','experimental','shared','active','declining','historical')),
+  created_world_minute bigint NOT NULL CHECK (created_world_minute>=0),
+  usage_count integer NOT NULL DEFAULT 0 CHECK (usage_count>=0),
+  action_id text NOT NULL,
+  UNIQUE(world_id,creator_agent_id,action_id),
+  UNIQUE(world_id,id),
+  FOREIGN KEY(world_id,creator_agent_id) REFERENCES world_members(world_id,agent_id) ON DELETE CASCADE
+);
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_agent_observation_methods'::regclass
+      AND conname='world_agent_observation_methods_world_id_id_key') THEN
+    ALTER TABLE world_agent_observation_methods ADD CONSTRAINT world_agent_observation_methods_world_id_id_key UNIQUE(world_id,id);
+  END IF;
+END $$;
+
+CREATE TABLE IF NOT EXISTS world_agent_observation_uses (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  world_id uuid NOT NULL,
+  method_id uuid NOT NULL,
+  actor_agent_id uuid NOT NULL,
+  observation text NOT NULL CHECK (char_length(observation) BETWEEN 3 AND 800),
+  evidence jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(evidence)='object'),
+  world_minute bigint NOT NULL CHECK (world_minute>=0),
+  action_id text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE(world_id,actor_agent_id,action_id),
+  FOREIGN KEY(world_id,method_id) REFERENCES world_agent_observation_methods(world_id,id) ON DELETE RESTRICT,
+  FOREIGN KEY(world_id,actor_agent_id) REFERENCES world_members(world_id,agent_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS world_agent_observation_uses_recent_idx
+  ON world_agent_observation_uses(world_id,method_id,world_minute DESC,id DESC);
+
+CREATE TABLE IF NOT EXISTS world_agent_meanings (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  world_id uuid NOT NULL,
+  agent_id uuid NOT NULL,
+  subject_type text NOT NULL CHECK (subject_type ~ '^[a-z][a-z0-9_.-]{1,79}$'),
+  subject_id text NOT NULL,
+  interpretation text NOT NULL CHECK (char_length(interpretation) BETWEEN 3 AND 800),
+  evidence jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(evidence)='object'),
+  confidence numeric(4,3) NOT NULL DEFAULT 0.250 CHECK (confidence BETWEEN 0 AND 1),
+  created_world_minute bigint NOT NULL CHECK (created_world_minute>=0),
+  updated_world_minute bigint NOT NULL CHECK (updated_world_minute>=0),
+  action_id text NOT NULL,
+  UNIQUE(world_id,agent_id,action_id),
+  FOREIGN KEY(world_id,agent_id) REFERENCES world_members(world_id,agent_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS world_agent_eras (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  world_id uuid NOT NULL,
+  agent_id uuid NOT NULL,
+  name text NOT NULL CHECK (char_length(name) BETWEEN 2 AND 100),
+  interpretation text NOT NULL CHECK (char_length(interpretation) BETWEEN 5 AND 800),
+  starts_world_minute bigint NOT NULL CHECK (starts_world_minute>=0),
+  ends_world_minute bigint CHECK (ends_world_minute IS NULL OR ends_world_minute>=starts_world_minute),
+  evidence jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(evidence)='object'),
+  created_world_minute bigint NOT NULL CHECK (created_world_minute>=0),
+  action_id text NOT NULL,
+  UNIQUE(world_id,agent_id,action_id),
+  FOREIGN KEY(world_id,agent_id) REFERENCES world_members(world_id,agent_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS world_agent_milestones (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  world_id uuid NOT NULL,
+  agent_id uuid NOT NULL,
+  title text NOT NULL CHECK (char_length(title) BETWEEN 3 AND 120),
+  success_criteria jsonb NOT NULL CHECK (jsonb_typeof(success_criteria)='object'),
+  status text NOT NULL DEFAULT 'proposed' CHECK (status IN ('proposed','active','completed','abandoned')),
+  created_world_minute bigint NOT NULL CHECK (created_world_minute>=0),
+  action_id text NOT NULL,
+  UNIQUE(world_id,agent_id,action_id),
+  FOREIGN KEY(world_id,agent_id) REFERENCES world_members(world_id,agent_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS world_agent_decision_policies (
+  world_id uuid NOT NULL,
+  agent_id uuid NOT NULL,
+  policy jsonb NOT NULL DEFAULT '{"attentionWeights":{},"planningHorizonMinutes":1440,"explorationPreference":0.5,"memoryEmphasis":0.5,"socialInfluencePreference":0.5,"riskToleranceBias":0}'::jsonb
+    CHECK (jsonb_typeof(policy)='object'),
+  version integer NOT NULL DEFAULT 1 CHECK (version>=1),
+  source text NOT NULL DEFAULT 'substrate' CHECK (source IN ('substrate','self_modified')),
+  updated_world_minute bigint NOT NULL DEFAULT 0 CHECK (updated_world_minute>=0),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY(world_id,agent_id),
+  FOREIGN KEY(world_id,agent_id) REFERENCES world_members(world_id,agent_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS world_agent_policy_experiments (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  world_id uuid NOT NULL,
+  agent_id uuid NOT NULL,
+  status text NOT NULL DEFAULT 'experimental' CHECK (status IN ('proposed','experimental','evaluated','retained','reverted','cancelled')),
+  reason text NOT NULL CHECK (char_length(reason) BETWEEN 5 AND 600),
+  before_policy jsonb NOT NULL CHECK (jsonb_typeof(before_policy)='object'),
+  before_policy_version integer NOT NULL DEFAULT 1 CHECK (before_policy_version>=1),
+  before_policy_source text NOT NULL DEFAULT 'substrate' CHECK (before_policy_source IN ('substrate','self_modified')),
+  proposed_policy jsonb NOT NULL CHECK (jsonb_typeof(proposed_policy)='object'),
+  started_world_minute bigint NOT NULL CHECK (started_world_minute>=0),
+  ends_world_minute bigint NOT NULL CHECK (ends_world_minute>started_world_minute),
+  result jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(result)='object'),
+  action_id text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE(world_id,agent_id,action_id),
+  FOREIGN KEY(world_id,agent_id) REFERENCES world_members(world_id,agent_id) ON DELETE CASCADE
+);
+ALTER TABLE world_agent_policy_experiments
+  ADD COLUMN IF NOT EXISTS before_policy_version integer NOT NULL DEFAULT 1 CHECK (before_policy_version>=1);
+ALTER TABLE world_agent_policy_experiments
+  ADD COLUMN IF NOT EXISTS before_policy_source text NOT NULL DEFAULT 'substrate'
+    CHECK (before_policy_source IN ('substrate','self_modified'));
+CREATE UNIQUE INDEX IF NOT EXISTS world_agent_policy_experiments_one_active_idx
+  ON world_agent_policy_experiments(world_id,agent_id) WHERE status='experimental';
+CREATE UNIQUE INDEX IF NOT EXISTS world_agent_policy_experiments_one_open_idx
+  ON world_agent_policy_experiments(world_id,agent_id) WHERE status IN ('experimental','evaluated');
+
+CREATE TABLE IF NOT EXISTS world_extension_requests (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  world_id uuid NOT NULL,
+  creator_agent_id uuid NOT NULL,
+  request_type text NOT NULL CHECK (request_type IN ('primitive_gap','resource_type','relationship_representation','execution_mechanism','ontology','other')),
+  title text NOT NULL CHECK (char_length(title) BETWEEN 3 AND 120),
+  description text NOT NULL CHECK (char_length(description) BETWEEN 8 AND 1000),
+  evidence jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(evidence)='object'),
+  status text NOT NULL DEFAULT 'proposed' CHECK (status IN ('proposed','specified','validated','implemented','rejected','historical')),
+  created_world_minute bigint NOT NULL CHECK (created_world_minute>=0),
+  action_id text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE(world_id,creator_agent_id,action_id),
+  FOREIGN KEY(world_id,creator_agent_id) REFERENCES world_members(world_id,agent_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS world_capability_dependencies (
+  world_id uuid NOT NULL,
+  capability_id uuid NOT NULL,
+  depends_on_capability_id uuid NOT NULL,
+  created_by_agent_id uuid,
+  created_world_minute bigint NOT NULL CHECK (created_world_minute>=0),
+  evidence jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(evidence)='object'),
+  PRIMARY KEY(world_id,capability_id,depends_on_capability_id),
+  CHECK(capability_id<>depends_on_capability_id),
+  FOREIGN KEY(world_id,capability_id) REFERENCES world_capabilities(world_id,id) ON DELETE CASCADE,
+  FOREIGN KEY(world_id,depends_on_capability_id) REFERENCES world_capabilities(world_id,id) ON DELETE CASCADE,
+  FOREIGN KEY(world_id,created_by_agent_id) REFERENCES world_members(world_id,agent_id) ON DELETE SET NULL (created_by_agent_id)
+);
+
+DO $$
+DECLARE
+  dependency_fk record;
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_capability_dependencies'::regclass
+      AND confrelid='world_capabilities'::regclass AND contype='f' AND confdeltype<>'c') THEN
+    FOR dependency_fk IN SELECT conname FROM pg_constraint WHERE conrelid='world_capability_dependencies'::regclass
+        AND confrelid='world_capabilities'::regclass AND contype='f'
+    LOOP
+      EXECUTE format('ALTER TABLE world_capability_dependencies DROP CONSTRAINT %I', dependency_fk.conname);
+    END LOOP;
+    ALTER TABLE world_capability_dependencies
+      ADD CONSTRAINT world_capability_dependencies_capability_fk
+        FOREIGN KEY(world_id,capability_id) REFERENCES world_capabilities(world_id,id) ON DELETE CASCADE,
+      ADD CONSTRAINT world_capability_dependencies_dependency_fk
+        FOREIGN KEY(world_id,depends_on_capability_id) REFERENCES world_capabilities(world_id,id) ON DELETE CASCADE;
+  END IF;
+END $$;
+
+CREATE TABLE IF NOT EXISTS world_v7_events (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  world_id uuid NOT NULL REFERENCES worlds(id) ON DELETE CASCADE,
+  actor_agent_id uuid REFERENCES agents(id) ON DELETE SET NULL,
+  event_type text NOT NULL CHECK (event_type ~ '^[a-z][a-z0-9_.-]{1,79}$'),
+  entity_type text NOT NULL CHECK (entity_type ~ '^[a-z][a-z0-9_.-]{1,79}$'),
+  entity_id uuid,
+  world_minute bigint NOT NULL CHECK (world_minute>=0),
+  details jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(details)='object'),
+  action_id text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE(world_id,actor_agent_id,action_id)
+);
+CREATE INDEX IF NOT EXISTS world_v7_events_recent_idx ON world_v7_events(world_id,world_minute DESC,id DESC);
+
+ALTER TABLE world_decision_traces ADD COLUMN IF NOT EXISTS decision_policy_version integer NOT NULL DEFAULT 0;
+ALTER TABLE world_decision_traces ADD COLUMN IF NOT EXISTS decision_policy_source text NOT NULL DEFAULT 'substrate'
+  CHECK (decision_policy_source IN ('substrate','self_modified'));
+
+CREATE TABLE IF NOT EXISTS adult_services (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  world_id uuid NOT NULL,
+  provider_id uuid NOT NULL,
+  title text NOT NULL CHECK (char_length(title) BETWEEN 3 AND 64),
+  description text NOT NULL CHECK (char_length(description) BETWEEN 12 AND 240),
+  price_units numeric(30,8) NOT NULL CHECK (price_units > 0),
+  active boolean NOT NULL DEFAULT true,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (world_id, provider_id),
+  UNIQUE (world_id, id, provider_id),
+  FOREIGN KEY (world_id, provider_id) REFERENCES world_members(world_id, agent_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS adult_service_bookings (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  world_id uuid NOT NULL,
+  service_id uuid NOT NULL,
+  requester_id uuid NOT NULL,
+  provider_id uuid NOT NULL,
+  price_units numeric(30,8) NOT NULL CHECK (price_units > 0),
+  status text NOT NULL DEFAULT 'pending'
+    CHECK (status IN ('pending','accepted','completed','declined','cancelled','expired')),
+  request_action_id text NOT NULL,
+  expires_at timestamptz NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  CHECK (requester_id <> provider_id),
+  UNIQUE (world_id, requester_id, request_action_id),
+  FOREIGN KEY (world_id, requester_id) REFERENCES world_members(world_id, agent_id) ON DELETE CASCADE,
+  FOREIGN KEY (world_id, service_id, provider_id) REFERENCES adult_services(world_id, id, provider_id) ON DELETE RESTRICT
+);
+
+CREATE INDEX IF NOT EXISTS adult_services_active_idx ON adult_services(world_id, active, created_at);
+CREATE INDEX IF NOT EXISTS adult_service_bookings_expiry_idx ON adult_service_bookings(status, expires_at);
+CREATE INDEX IF NOT EXISTS adult_service_bookings_participant_idx ON adult_service_bookings(world_id, requester_id, provider_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS world_mines (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  world_id uuid NOT NULL REFERENCES worlds(id) ON DELETE CASCADE,
+  created_by uuid NOT NULL REFERENCES agents(id),
+  name text NOT NULL CHECK (char_length(name) BETWEEN 2 AND 64),
+  status text NOT NULL DEFAULT 'active' CHECK (status IN ('active','closed')),
+  extracted_units numeric(30, 8) NOT NULL DEFAULT 0 CHECK (extracted_units >= 0),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (world_id, name)
+);
+
+ALTER TABLE token_ledger ADD COLUMN IF NOT EXISTS mine_id uuid REFERENCES world_mines(id);
+
+-- Correct a legacy constraint name that collided with the scene status check.
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_mines'::regclass
+      AND conname='world_scenes_status_check')
+    AND NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_mines'::regclass
+      AND conname='world_mines_status_check') THEN
+    ALTER TABLE world_mines RENAME CONSTRAINT world_scenes_status_check TO world_mines_status_check;
+  END IF;
+END $$;
+
+CREATE TABLE IF NOT EXISTS auth_nonces (
+  agent_id uuid NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+  nonce text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (agent_id, nonce)
+);
+
+CREATE TABLE IF NOT EXISTS resident_messages (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  world_id uuid NOT NULL,
+  sender_id uuid NOT NULL,
+  recipient_id uuid NOT NULL,
+  template_id text NOT NULL CHECK (template_id IN (
+    'hello','ask_about_world','invite_company','reply_continue',
+    'reply_accept_company','reply_decline_company'
+  )),
+  message_text text NOT NULL CHECK (char_length(message_text) BETWEEN 1 AND 240),
+  reply_to_message_id uuid REFERENCES resident_messages(id) ON DELETE SET NULL,
+  action_id text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  read_at timestamptz,
+  CHECK (sender_id <> recipient_id),
+  UNIQUE (world_id, sender_id, action_id),
+  FOREIGN KEY (world_id, sender_id) REFERENCES world_members(world_id, agent_id) ON DELETE CASCADE,
+  FOREIGN KEY (world_id, recipient_id) REFERENCES world_members(world_id, agent_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS world_events_recent_idx ON world_events(world_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS resident_messages_inbox_idx ON resident_messages(world_id, recipient_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS resident_messages_sender_idx ON resident_messages(world_id, sender_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS consents_pending_idx ON consents(world_id, target_id, status);
+CREATE INDEX IF NOT EXISTS token_ledger_balance_idx ON token_ledger(world_id, agent_id);
+CREATE INDEX IF NOT EXISTS world_mines_world_status_idx ON world_mines(world_id, status);
+
+-- Simulated spot market. These assets and balances never access on-chain funds.

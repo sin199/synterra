@@ -39,6 +39,8 @@ import { advanceWorldCivilization, buildCapabilityUseCandidates, initializeWorld
   listWorldCapabilityUses, performWorldCapabilityUse, CIVILIZATION_REVIEW_INTERVAL_MINUTES } from './world-capabilities.js';
 import { reportWorldEngineError, settleOptionalReasoning, worldEngineErrorRecord, WORLD_TICK_STALE_AFTER_MS,
   WORLD_TICK_WATCHDOG_INTERVAL_MS } from './world-engine-diagnostics.js';
+import { advanceWorldV7, applyAgentDecisionPolicy, initializeWorldV7, reflectWorldV7Resident,
+  WORLD_V7_REFLECTION_INTERVAL_MINUTES } from './world-v7.js';
 
 export const WORLD_TICK_MS = 1_000;
 const TYPE_SAFE_INTERVAL_MS = 30 * 60_000;
@@ -268,6 +270,7 @@ export function buildActivityCandidates(agent, scenes, context = {}) {
       item.subjectType === 'action' && item.subjectKey === option.action && item.beliefKey === 'outcome');
     if (belief) option.score += clamp(finite(belief.estimate) * finite(belief.confidence) * 8, -8, 8);
   }
+  for (let index = 0; index < options.length; index++) options[index] = applyAgentDecisionPolicy(options[index], agent.decisionPolicy);
 
   if (!options.length && scenes.length) {
     const place = scenes.find((scene) => scene.status === 'active') || scenes[0];
@@ -1846,7 +1849,7 @@ async function runStrategicTypeSafe(pool, worldId, chooseWithTypeSafe, runtimeSt
 }
 
 export async function startWorldEngine(pool, { worldId: requestedWorldId = null, onError = () => {}, onStatus = () => {}, chooseWithTypeSafe = null,
-  chooseCivilizationOption = null,
+  chooseCivilizationOption = null, chooseWorldV7Reflection = null,
   runtimeState = null, fruitfly = null, tickMs = WORLD_TICK_MS, nowProvider = () => Date.now(), schedule = true,
   emergencySink = process.stderr } = {}) {
   const readNowMs = () => {
@@ -1913,6 +1916,7 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
       const clock = await initialize.query(`SELECT world_minutes FROM world_runtime_state WHERE world_id=$1 FOR UPDATE`, [worldId]);
       if (!clock.rowCount) throw new Error('WORLD_RUNTIME_STATE_MISSING');
       await initializeWorldCivilization(initialize, { worldId, worldMinute: Number(clock.rows[0].world_minutes) });
+      await initializeWorldV7(initialize, { worldId, worldMinute: Number(clock.rows[0].world_minutes) });
         const unscheduled = await initialize.query(`SELECT agent_id FROM world_agent_states
         WHERE world_id=$1 AND next_civilization_review_world_minutes IS NULL ORDER BY agent_id`, [worldId]);
       for (const resident of unscheduled.rows) {
@@ -1972,6 +1976,28 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
         'typesafe_civilization_timeout', { tickFailure: false, phase: diagnostics.lastTickPhase });
       return result.value;
     } catch (error) { reportError(error, 'typesafe_civilization_selection', { tickFailure: false }); return null; }
+  };
+
+  const chooseWorldV7ReflectionBounded = async (request) => {
+    if (!chooseWorldV7Reflection || Date.now() >= civilizationReasoningDeadline || civilizationChoiceInFlight) return null;
+    const timeoutMs = Math.max(1, Math.min(CIVILIZATION_REASONING_TIMEOUT_MS,
+      civilizationReasoningDeadline - Date.now()));
+    const operation = Promise.resolve().then(() => chooseWorldV7Reflection(request, runtimeState));
+    civilizationChoiceInFlight = operation;
+    operation.finally(() => {
+      if (civilizationChoiceInFlight === operation) civilizationChoiceInFlight = null;
+    }).catch(() => {});
+    try {
+      const result = await settleOptionalReasoning(operation, { timeoutMs, fallback: null });
+      if (result.error) reportError(result.error, 'typesafe_v7_reflection',
+        { tickFailure: false, phase: diagnostics.lastTickPhase });
+      if (result.timedOut) reportError(new Error(`Optional TypeSafe V7 reflection exceeded ${timeoutMs}ms.`),
+        'typesafe_v7_reflection_timeout', { tickFailure: false, phase: diagnostics.lastTickPhase });
+      return result.value;
+    } catch (error) {
+      reportError(error, 'typesafe_v7_reflection', { tickFailure: false });
+      return null;
+    }
   };
 
   async function verifyWorldLock() {
@@ -2097,6 +2123,10 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
             p.personality_modifiers,p.risk_modifier::text AS risk_modifier,
             p.price_sensitivity::text AS price_sensitivity,
             p.last_reflection_world_minutes AS last_reflection_world_minutes,
+            v7.last_reflected_world_minute AS v7_last_reflected_world_minute,
+            COALESCE(v7policy.policy,'{"attentionWeights":{},"planningHorizonMinutes":1440,"explorationPreference":0.5,"memoryEmphasis":0.5,"socialInfluencePreference":0.5,"riskToleranceBias":0}'::jsonb) AS decision_policy,
+            COALESCE(v7policy.version,0) AS decision_policy_version,
+            COALESCE(v7policy.source,'substrate') AS decision_policy_source,
             COALESCE((SELECT jsonb_object_agg(k.skill_name,k.skill_value) FROM world_agent_skills k
               WHERE k.world_id=m.world_id AND k.agent_id=m.agent_id),'{}'::jsonb) AS skills,
             COALESCE((SELECT jsonb_agg(jsonb_build_object('id',g.id,'goalType',g.goal_type,'category',g.category,
@@ -2136,6 +2166,8 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
           JOIN world_agent_states s ON s.world_id=m.world_id AND s.agent_id=m.agent_id
           LEFT JOIN agent_minds am ON am.world_id=m.world_id AND am.agent_id=m.agent_id
           LEFT JOIN world_social_profiles p ON p.world_id=m.world_id AND p.agent_id=m.agent_id
+          LEFT JOIN world_agent_self_models v7 ON v7.world_id=m.world_id AND v7.agent_id=m.agent_id
+          LEFT JOIN world_agent_decision_policies v7policy ON v7policy.world_id=m.world_id AND v7policy.agent_id=m.agent_id
           WHERE m.world_id=$1 ORDER BY m.joined_at,a.name FOR UPDATE OF m,s`, [worldId]);
         const scenesResult = await client.query(`SELECT id,name,scene_type AS "sceneType",status,capacity,purpose,features,position
           FROM world_scenes
@@ -2203,6 +2235,8 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
             sociability: finite(row.sociability, 0.5), curiosity: finite(row.curiosity, 0.5),
             discipline: finite(row.discipline, 0.5), ambition: finite(row.ambition, 0.5),
             personalityModifiers: safeJson(row.personality_modifiers),
+            decisionPolicy: safeJson(row.decision_policy), decisionPolicyVersion: Number(row.decision_policy_version) || 0,
+            decisionPolicySource: row.decision_policy_source || 'substrate',
             primaryGoal: row.primary_goal || 'BALANCED_LIFE', skills: safeJson(row.skills),
             goals: Array.isArray(row.goals) ? row.goals : [], beliefs: Array.isArray(row.beliefs) ? row.beliefs : [],
             recentMemories: Array.isArray(row.recent_memories) ? row.recent_memories : [],
@@ -2256,6 +2290,21 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
               ORDER BY CASE goal_type WHEN 'primary' THEN 0 WHEN 'secondary' THEN 1 ELSE 2 END,priority DESC,updated_world_minutes DESC`,
             [worldId, agent.agentId]);
             agent.goals = updatedGoals.rows;
+          }
+          const lastV7Reflection = row.v7_last_reflected_world_minute === null
+            ? null : Number(row.v7_last_reflected_world_minute);
+          if (lastV7Reflection === null || worldMinutes - lastV7Reflection >= WORLD_V7_REFLECTION_INTERVAL_MINUTES) {
+            setPhase('V7_SELF_REFLECTION');
+            await reflectWorldV7Resident(client, { worldId, agent, worldMinute: worldMinutes,
+              chooseReflection: chooseWorldV7Reflection ? chooseWorldV7ReflectionBounded : null });
+            const currentPolicy = await client.query(`SELECT policy,version,source FROM world_agent_decision_policies
+              WHERE world_id=$1 AND agent_id=$2`, [worldId, agent.agentId]);
+            if (currentPolicy.rowCount) {
+              agent.decisionPolicy = safeJson(currentPolicy.rows[0].policy);
+              agent.decisionPolicyVersion = Number(currentPolicy.rows[0].version) || 0;
+              agent.decisionPolicySource = currentPolicy.rows[0].source;
+            }
+            phaseSucceeded('V7_SELF_REFLECTION');
           }
           if (agent.status === 'walking' && new Date(agent.movement_ends_at).getTime() <= now.getTime()) {
             setPhase('RESIDENT_MOVEMENT');
@@ -2591,8 +2640,9 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
             const familyDistribution = decision?.probabilities || {};
             const topFamilies = Object.entries(familyDistribution).sort((a, b) => b[1] - a[1]).slice(0, 3);
             await client.query(`INSERT INTO world_decision_traces(world_id,agent_id,tick_count,world_minutes,
-                chosen_candidate_id,chosen_action,behavior_probability,distribution,utility_scores,goal_snapshot,rationale)
-              VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9::jsonb,$10::jsonb,$11::jsonb)`,
+                chosen_candidate_id,chosen_action,behavior_probability,distribution,utility_scores,goal_snapshot,rationale,
+                decision_policy_version,decision_policy_source)
+              VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9::jsonb,$10::jsonb,$11::jsonb,$12,$13)`,
             [worldId, agent.agentId, tickCount, worldMinutes, activity.id, activity.action,
               Math.max(0.00000001, Math.min(1, Number(decision?.behaviorProbability) || 1)),
               JSON.stringify({ behavior: familyDistribution, fruitfly: decision?.fruitflyProbabilities || {},
@@ -2607,7 +2657,8 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
                 relationshipCount: agent.relationships.length, source: 'utility_qualified_fruitfly_choice', decisionLayer,
                 utilityCandidatePolicy: { thresholdRatio: 0.75, minimum: 3, maximum: 8 },
                 strategicIntervalMinutes: STRATEGIC_DECISION_INTERVAL_MINUTES,
-                eligibleCandidateCount: candidates.length })]);
+                eligibleCandidateCount: candidates.length }), agent.decisionPolicyVersion || 0,
+              agent.decisionPolicySource || 'substrate']);
             await client.query(`DELETE FROM world_decision_traces WHERE id IN (
               SELECT id FROM world_decision_traces WHERE world_id=$1 AND agent_id=$2
               ORDER BY tick_count DESC,id DESC OFFSET 50)`, [worldId, agent.agentId]);
@@ -2672,6 +2723,12 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
               }
             }
           }
+        }
+        if (tickCount % 60 === 0) {
+          setPhase('V7_POLICY_EVALUATION');
+          await advanceWorldV7(client, { worldId, worldMinute: worldMinutes,
+            choosePolicyDecision: chooseWorldV7Reflection ? chooseWorldV7ReflectionBounded : null });
+          phaseSucceeded('V7_POLICY_EVALUATION');
         }
         setPhase('PERSISTENCE');
         await client.query('COMMIT');

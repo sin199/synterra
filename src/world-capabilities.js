@@ -4,10 +4,13 @@ import { parsePositiveUnits } from './crypto-market.js';
 import { actionIdentifier, boundedNumber, jsonObject, requireWorldMember, requiredText, worldError, writeWorldHistory } from './world-domain.js';
 import { contributeOrganizationEffort } from './world-organizations.js';
 import { contributeToProject } from './world-projects.js';
+import { capabilityGraphDepth, recordWorldCapabilityDependencies } from './world-v7.js';
 
 export const CIVILIZATION_REVIEW_INTERVAL_MINUTES = 7 * 1_440;
 export const EXPERIMENT_DURATION_MINUTES = 14 * 1_440;
 export const CAPABILITY_PROPOSAL_LIFETIME_MINUTES = 30 * 1_440;
+export const CAPABILITY_GAP_MIN_OBSERVATIONS = 2;
+export const CAPABILITY_GAP_MIN_AGE_MINUTES = 1_440;
 const MAX_SPEC_BYTES = 16_000;
 const MAX_COMPOSITION_DEPTH = 5;
 const MAX_EXPERIMENT_PARTICIPANTS = 8;
@@ -270,14 +273,17 @@ export async function initializeWorldCivilization(client, { worldId, worldMinute
   const firstStart = existing.rowCount === 0;
   const startMinute = firstStart ? Math.max(0, Math.trunc(Number(worldMinute) || 0))
     : Number(existing.rows[0].startedWorldMinute);
-  await client.query(`UPDATE world_epochs SET status='historic' WHERE world_id=$1 AND status='active' AND epoch_code<>'V6'`, [worldId]);
+  const newerEpoch = await client.query(`SELECT 1 FROM world_epochs WHERE world_id=$1 AND status='active'
+    AND substring(epoch_code from '^V([0-9]+)')::int>6 LIMIT 1`, [worldId]);
+  await client.query(`UPDATE world_epochs SET status='historic' WHERE world_id=$1 AND status='active'
+    AND substring(epoch_code from '^V([0-9]+)')::int<6`, [worldId]);
   const epochResult = await client.query(`INSERT INTO world_epochs(world_id,epoch_code,name,status,started_world_minute,description,metadata)
-    VALUES($1,'V6','Agent-Built Civilization','active',$2,
+    VALUES($1,'V6','Agent-Built Civilization',$3,$2,
       'Residents can propose, evaluate, experiment with, and evolve world capabilities.',
       '{"source":"civilization_upgrade"}'::jsonb)
-    ON CONFLICT(world_id,epoch_code) DO UPDATE SET status='active'
+    ON CONFLICT(world_id,epoch_code) DO UPDATE SET status=CASE WHEN $3='active' THEN 'active' ELSE world_epochs.status END
     RETURNING id,epoch_code AS code,name,status,started_world_minute AS "startedWorldMinute",started_at AS "startedAt",description`,
-  [worldId, startMinute]);
+  [worldId, startMinute, newerEpoch.rowCount ? 'historic' : 'active']);
   const epoch = epochResult.rows[0];
   await seedWorldCapabilityRegistry(client, worldId);
   if (firstStart) {
@@ -406,9 +412,22 @@ async function noteGapForResident(client, { worldId, agent, gap, worldMinute }) 
 }
 
 async function primitiveMap(client, worldId) {
-  const rows = await client.query(`SELECT id,capability_key AS "capabilityKey",category,name,specification
-    FROM world_capabilities WHERE world_id=$1 AND status='active' ORDER BY capability_key`, [worldId]);
-  return new Map(rows.rows.map((row) => [row.capabilityKey, { ...row, specification: jsonValue(row.specification) }]));
+  const [rows, dependencies] = await Promise.all([
+    client.query(`SELECT capability.id,capability.capability_key AS "capabilityKey",capability.category,capability.name,
+        capability.specification,capability.status,capability.creator_type AS "creatorType",
+        COALESCE((SELECT count(*)::int FROM world_capability_uses usage
+          WHERE usage.world_id=capability.world_id AND usage.capability_id=capability.id AND usage.success),0) AS "successfulUses",
+        COALESCE((SELECT max(usage.world_minute) FROM world_capability_uses usage
+          WHERE usage.world_id=capability.world_id AND usage.capability_id=capability.id AND usage.success),0) AS "lastSuccessfulUse"
+      FROM world_capabilities capability WHERE capability.world_id=$1 AND capability.status='active'
+      ORDER BY capability.capability_key`, [worldId]),
+    client.query(`SELECT capability_id AS "capabilityId",depends_on_capability_id AS "dependsOnCapabilityId"
+      FROM world_capability_dependencies WHERE world_id=$1`, [worldId])
+  ]);
+  const depths = new Map(capabilityGraphDepth(rows.rows.map((row) => ({ id: row.id, name: row.name,
+    creatorType: row.creatorType })), dependencies.rows).map((item) => [item.id, item.depth]));
+  return new Map(rows.rows.map((row) => [row.capabilityKey, { ...row,
+    compositionDepth: depths.get(row.id) || 0, specification: jsonValue(row.specification) }]));
 }
 
 function makeCapabilityDrafts(gap, activeCapabilities, agent) {
@@ -457,10 +476,65 @@ function makeCapabilityDrafts(gap, activeCapabilities, agent) {
           participants: { minimum: minParticipants, maximum: minParticipants },
           experiment: { maximumParticipants: 8 },
           durationWorldMinutes: Math.min(240, 10 + components.length * 5), scope: { type: 'resident_set' },
-          risks: ['The declared effects may not reduce the original problem; resident experience must be measured.'] } });
+      risks: ['The declared effects may not reduce the original problem; resident experience must be measured.'] } });
     }
   }
-  return drafts.slice(0, 32);
+  const priorCapabilities = [...activeCapabilities.values()].filter((item) => item.creatorType === 'resident'
+    && Number(item.successfulUses) > 0 && Number(item.compositionDepth) < MAX_COMPOSITION_DEPTH
+    && jsonValue(item.specification).kind === 'composition'
+    && jsonValue(item.specification).scope?.type === 'resident_set'
+    && !jsonValue(item.specification).costs?.some((cost) => cost.resource === 'simulated_usdc'))
+    .sort((left, right) => Number(right.successfulUses) - Number(left.successfulUses)
+      || Number(right.lastSuccessfulUse) - Number(left.lastSuccessfulUse)
+      || String(left.capabilityKey).localeCompare(String(right.capabilityKey))).slice(0, 1);
+  for (const prior of priorCapabilities) {
+    const priorSpec = jsonValue(prior.specification);
+    const priorComponentIds = new Set((priorSpec.composition || []).map((item) => item.capabilityId));
+    for (const component of componentPool) {
+      if (priorComponentIds.has(component.id)) continue;
+      const primitiveId = component.capabilityKey.slice('primitive:'.length);
+      const skill = primitiveId === 'resident.skill_gain' ? skillNames[0] : null;
+      const parameters = primitiveId === 'resident.skill_gain' ? { target: 'actor', skill, amount: 1 }
+        : primitiveId === 'resident.knowledge_gain' ? { target: 'actor', amount: 2 }
+          : { target: 'partner', trust: 0.5, familiarity: 0.5 };
+      const composition = [{ capabilityId: prior.id, parameters: {} }, { capabilityId: component.id, parameters }];
+      const parentNeedsPartner = Boolean(priorSpec.requirements?.partnerRequired)
+        || Number(priorSpec.participants?.minimum || 1) > 1;
+      const needsPartner = parentNeedsPartner || primitiveId === 'relationship.adjust';
+      const minimumParticipants = Math.max(Number(priorSpec.participants?.minimum || 1), needsPartner ? 2 : 1);
+      const parentCosts = Array.isArray(priorSpec.costs) ? priorSpec.costs : [];
+      const energyCost = parentCosts.filter((cost) => cost.resource === 'energy')
+        .reduce((sum, cost) => sum + Number(cost.amount || 0), 0) + 1;
+      const foodCost = parentCosts.filter((cost) => cost.resource === 'food')
+        .reduce((sum, cost) => sum + Number(cost.amount || 0), 0) + 1;
+      const topic = String(gap.category).split('.').at(-1).replaceAll('_', ' ');
+      const effectLabel = `${prior.name} + ${component.name}`;
+      const suffix = createHash('sha256').update(`${gap.id}:${JSON.stringify(composition)}`).digest('hex').slice(0, 14);
+      drafts.unshift({ id: `draft:${suffix}`, name: `${topic}: ${effectLabel}`.slice(0, 120),
+        category: `${gap.category}.capability`, problemStatement: gap.problemStatement,
+        expectedBenefit: `Extend a previously successful resident-created capability with ${component.name} for the observed ${topic} gap; the combined effect remains to be measured.`,
+        expectedCost: { energy: energyCost, food: foodCost, simulatedUsdc: 0 },
+        requiredResources: { participants: minimumParticipants, energy: energyCost, food: foodCost,
+          componentCapabilities: composition.map((entry) => entry.capabilityId) },
+        affectedSystems: [String(gap.category).split('.')[0], prior.category, component.category],
+        specification: { schemaVersion: 1, kind: 'composition', composition, steps: [],
+          requirements: { minEnergy: Math.max(20, Number(priorSpec.requirements?.minEnergy) || 20),
+            minFood: Math.max(8, Number(priorSpec.requirements?.minFood) || 8),
+            partnerRequired: needsPartner, skills: { ...(priorSpec.requirements?.skills || {}) } },
+          costs: [{ resource: 'energy', amount: energyCost }, { resource: 'food', amount: foodCost }],
+          participants: { minimum: minimumParticipants, maximum: Math.max(minimumParticipants,
+            Number(priorSpec.participants?.maximum) || minimumParticipants) },
+          experiment: { maximumParticipants: 8 }, durationWorldMinutes: Math.max(10,
+            Number(priorSpec.durationWorldMinutes) || 10), scope: { type: 'resident_set' },
+          risks: [...(priorSpec.risks || []).slice(0, 6),
+            'The combined effects may not address the new gap; both components remain independently traceable.'] } });
+    }
+  }
+  const secondOrderDrafts = drafts.filter((draft) => draft.specification.composition
+    .some((item) => priorCapabilities.some((capability) => capability.id === item.capabilityId)));
+  const primitiveDrafts = drafts.filter((draft) => !draft.specification.composition
+    .some((item) => priorCapabilities.some((capability) => capability.id === item.capabilityId)));
+  return [...secondOrderDrafts, ...primitiveDrafts].slice(0, 32);
 }
 
 async function recordCapabilityProposal(client, { worldId, agentId, gap, actionId: rawActionId, draft, worldMinute,
@@ -761,6 +835,10 @@ async function startExperiment(client, proposal, worldMinute) {
   if (!capabilityId) capabilityId = (await client.query(`SELECT id FROM world_capabilities
     WHERE world_id=$1 AND capability_key=$2 AND version=$3`, [proposal.world_id, capabilityKey, version])).rows[0]?.id;
   if (!capabilityId) return null;
+  await recordWorldCapabilityDependencies(client, { worldId: proposal.world_id, capabilityId,
+    dependencyCapabilityIds: [...spec.composition.map((item) => item.capabilityId), parentRow?.id].filter(Boolean),
+    createdByAgentId: proposal.creator_agent_id, worldMinute,
+    evidence: { source: 'agent_created_capability_composition', proposalId: proposal.id } });
   const experimentResult = await client.query(`INSERT INTO world_capability_experiments(id,world_id,proposal_id,capability_id,
       scope_type,scope_id,participant_agent_ids,status,started_world_minute,ends_world_minute,evidence)
     VALUES($1,$2,$3,$4,$5,$6,$7::jsonb,'running',$8,$9,$10::jsonb) RETURNING id`,
@@ -1126,8 +1204,8 @@ export async function advanceWorldCivilization(client, { worldId, agent, worldMi
   const primitives = await primitiveMap(client, worldId);
   onPhase('RESIDENT_CAPABILITY_REVIEW');
   for (const gap of gaps) {
-    if (!residentRelevantToGap(agent, gap) || Number(gap.observationCount) < 2
-        || Number(worldMinute) - Number(gap.firstObservedWorldMinute) < 1_440) continue;
+    if (!residentRelevantToGap(agent, gap) || Number(gap.observationCount) < CAPABILITY_GAP_MIN_OBSERVATIONS
+        || Number(worldMinute) - Number(gap.firstObservedWorldMinute) < CAPABILITY_GAP_MIN_AGE_MINUTES) continue;
     const existing = await client.query(`SELECT 1 FROM world_capability_proposals WHERE world_id=$1 AND gap_id=$2
       AND creator_agent_id=$3 LIMIT 1`, [worldId, gap.id, agent.agentId]);
     if (existing.rowCount) continue;

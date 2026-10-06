@@ -166,6 +166,9 @@ test('recent simulated trading loss reduces Exchange utility temporarily', () =>
   assert.ok(after.score < before.score);
   assert.equal(recentMemoryUtility({ recentMemories: [{ memoryType: 'failure', worldMinutes: 200,
     metadata: { asset: 'BTC', realizedPnlUsd: -40 } }] }, 'trade', 1_000), 0);
+  const learningMemory = [{ memoryType: 'learning', worldMinutes: 1_000, metadata: { action: 'learn' } }];
+  assert.equal(recentMemoryUtility({ recentMemories: learningMemory, decisionPolicy: { memoryEmphasis: 0 } }, 'learn', 1_000), 1);
+  assert.equal(recentMemoryUtility({ recentMemories: learningMemory, decisionPolicy: { memoryEmphasis: 1 } }, 'learn', 1_000), 3);
 });
 
 test('personal history changes Utility eligibility instead of weighting Fruitfly choice', () => {

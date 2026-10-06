@@ -24,7 +24,26 @@ const opportunityList = document.querySelector('#world-opportunity-list');
 const projectList = document.querySelector('#world-project-list');
 const organizationList = document.querySelector('#world-organization-list');
 const institutionsList = document.querySelector('#world-institutions-list');
+const worldV6LifecycleSummary = document.querySelector('#world-v6-lifecycle-summary');
+const worldV6LifecycleSnapshot = document.querySelector('#world-v6-lifecycle-snapshot');
+const worldV6LifecycleStats = document.querySelector('#world-v6-lifecycle-stats');
+const worldV6LifecycleGapsList = document.querySelector('#world-v6-lifecycle-gaps-list');
+const worldV6LifecycleIntegrityList = document.querySelector('#world-v6-lifecycle-integrity-list');
 const worldEpochSummary = document.querySelector('#world-epoch-summary');
+const worldV7Summary = document.querySelector('#world-v7-summary');
+const worldV7Stats = document.querySelector('#world-v7-stats');
+const worldV7QuestionsList = document.querySelector('#world-v7-questions-list');
+const worldV7ConceptsList = document.querySelector('#world-v7-concepts-list');
+const worldV7EntitiesList = document.querySelector('#world-v7-entities-list');
+const worldV7PolicyList = document.querySelector('#world-v7-policy-list');
+const worldV7ExtensionsList = document.querySelector('#world-v7-extensions-list');
+const worldV7GenealogyList = document.querySelector('#world-v7-genealogy-list');
+const worldV7InterpretationsList = document.querySelector('#world-v7-interpretations-list');
+const worldV7ResourcesList = document.querySelector('#world-v7-resources-list');
+const worldV7ResourceLedgerList = document.querySelector('#world-v7-resource-ledger-list');
+const worldV7CoordinationList = document.querySelector('#world-v7-coordination-list');
+const worldV7CoordinationUsesList = document.querySelector('#world-v7-coordination-uses-list');
+const worldV7ObservationUsesList = document.querySelector('#world-v7-observation-uses-list');
 const worldCapabilityCounts = document.querySelector('#world-capability-counts');
 const capabilityActiveList = document.querySelector('#world-capability-active-list');
 const capabilityExperimentalList = document.querySelector('#world-capability-experimental-list');
@@ -409,6 +428,82 @@ function renderAgentPanel(agent, detail = selectedResidentDetail) {
   planning.append(planningHeading, planningList);
   card.append(planning);
 
+  const v7 = detail?.v7;
+  const selfSection = document.createElement('section');
+  selfSection.className = 'agent-social-section';
+  const selfHeading = document.createElement('h4');
+  selfHeading.textContent = 'V7 · 自我模型与开放问题';
+  const selfList = document.createElement('ul');
+  selfList.className = 'agent-memory-list';
+  if (v7?.selfModel) {
+    const identity = document.createElement('li');
+    identity.textContent = `${v7.selfModel.identitySummary} · 信心 ${Math.round(Number(v7.selfModel.confidence || 0) * 100)}% · 认知偏好 ${v7.selfModel.preferredCognitionMode || 'substrate'}`;
+    selfList.append(identity);
+    for (const question of (v7.questions || []).slice(0, 4)) {
+      const item = document.createElement('li');
+      item.textContent = `问题 · ${question.status} · ${question.question}`;
+      selfList.append(item);
+    }
+    for (const concept of (v7.concepts || []).slice(0, 3)) {
+      const item = document.createElement('li');
+      item.textContent = `概念 · ${concept.name} · ${concept.status} · 使用 ${displayCount(concept.usageCount)} 次`;
+      selfList.append(item);
+    }
+    for (const experiment of (v7.policyExperiments || []).slice(0, 3)) {
+      const item = document.createElement('li');
+      item.textContent = `策略实验 · ${experiment.status} · ${experiment.reason} · ${experiment.result?.decision || '等待评估'}`;
+      selfList.append(item);
+    }
+    for (const value of (v7.values || []).slice(0, 3)) {
+      const item = document.createElement('li');
+      item.textContent = `价值 · ${value.name} · 重要性 ${Math.round(Number(value.importance || 0) * 100)}% · ${value.description}`;
+      selfList.append(item);
+    }
+    for (const request of (v7.extensionRequests || []).slice(0, 2)) {
+      const item = document.createElement('li');
+      item.textContent = `扩展请求 · ${request.status} · ${request.title}`;
+      selfList.append(item);
+    }
+    for (const method of (v7.observationMethods || []).slice(0, 2)) {
+      const item = document.createElement('li');
+      item.textContent = `观察方式 · ${method.status} · ${method.name}`;
+      selfList.append(item);
+    }
+    for (const observation of (v7.observationUses || []).slice(0, 2)) {
+      const item = document.createElement('li');
+      item.textContent = `观察记录 · ${observation.methodName} · ${observation.observation}`;
+      selfList.append(item);
+    }
+    for (const entity of (v7.emergentEntities || []).slice(0, 3)) {
+      const item = document.createElement('li');
+      item.textContent = `涌现实体 · ${entity.entityType} · ${entity.name} · ${entity.participationMode || '发起者'} (${entity.participationStatus || entity.status})`;
+      selfList.append(item);
+    }
+    for (const mechanism of (v7.coordination || []).slice(0, 2)) {
+      const item = document.createElement('li');
+      item.textContent = `协调机制 · ${mechanism.mechanismType} · ${mechanism.status} · 使用 ${displayCount(mechanism.usageCount)} 次`;
+      selfList.append(item);
+    }
+    for (const resource of (v7.resources || []).slice(0, 2)) {
+      const item = document.createElement('li');
+      item.textContent = `自创资源 · ${resource.resourceKey} · ${resource.status} · 使用 ${displayCount(resource.usageCount)} 次`;
+      selfList.append(item);
+    }
+    for (const capability of [...(v7.capabilitiesCreated || []).slice(0, 3), ...(v7.capabilitiesUsed || []).slice(0, 3)]) {
+      const item = document.createElement('li');
+      item.textContent = `${v7.capabilitiesCreated?.some((created) => created.id === capability.id) ? '我创建' : '我使用'}的能力 · ${capability.name} · ${capability.creatorType || capability.status}`;
+      selfList.append(item);
+    }
+  }
+  if (!selfList.children.length) {
+    const item = document.createElement('li');
+    item.className = 'agent-social-empty';
+    item.textContent = detail ? '尚无 V7 自我反思记录；稳定或暂不改变也是有效状态' : '正在读取居民的自我模型…';
+    selfList.append(item);
+  }
+  selfSection.append(selfHeading, selfList);
+  card.append(selfSection);
+
   const personality = document.createElement('section');
   personality.className = 'agent-social-section';
   const personalityHeading = document.createElement('h4');
@@ -649,6 +744,7 @@ function renderWorldEvolution() {
   if (!evolution) return;
   const dashboard = evolution.dashboard || {};
   const recovery = evolution.economy?.recovery || {};
+  const v6Lifecycle = evolution.v6Lifecycle || {};
   evolutionStats?.replaceChildren();
   for (const [label, value] of [
     ['居民', displayCount(dashboard.residents)], ['地点', displayCount(dashboard.places)],
@@ -731,12 +827,137 @@ function renderWorldEvolution() {
       detail: `${statusLabels[item.status] || item.status} · 范围 ${item.scopeType} · 世界分钟 ${displayCount(item.startedWorldMinute)}` }));
   renderEvolutionList(institutionsList, [...institutionRows, ...organizationCapabilityExperiments],
     '还没有形成制度互动。', (item) => item.detail);
+  const v6Counts = v6Lifecycle.counts || {};
+  const proposalReviews = v6Lifecycle.reviews?.proposal || {};
+  const experimentReviews = v6Lifecycle.reviews?.experiment || {};
+  const v6Usage = v6Lifecycle.usage || {};
+  const observerSnapshot = v6Lifecycle.observerSnapshot;
+  if (worldV6LifecycleSummary) worldV6LifecycleSummary.textContent =
+    `第 ${displayCount(v6Lifecycle.worldMinute)} 世界分钟 · V6/V7 记录并列读取；ignore / retain_current_approach 按有效自主 no-action 记录。`;
+  if (worldV6LifecycleSnapshot) worldV6LifecycleSnapshot.textContent = observerSnapshot?.latestSnapshotAt
+    ? `快照 ${new Date(observerSnapshot.latestSnapshotAt).toLocaleString()} · 分钟 ${displayCount(observerSnapshot.latestWorldMinute)} · ${displayCount(observerSnapshot.snapshotCount)} 条`
+    : '持续观察快照初始化中';
+  worldV6LifecycleStats?.replaceChildren();
+  for (const [label, value] of [
+    ['能力缺口 · 成熟 / 未成熟', `${displayCount(v6Counts.matureGaps)} / ${displayCount(v6Counts.immatureGaps)}`],
+    ['累计观察', displayCount(v6Counts.observationCount)],
+    ['候选决策周期 / 提案', `${displayCount(v6Counts.candidateCycles)} / ${displayCount(v6Counts.proposals)}`],
+    ['有效 no-action', displayCount(v6Counts.validNoAction)],
+    ['评议 · 支持 / 反对 / 忽略 / 修订', `${displayCount(proposalReviews.support + experimentReviews.support)} / ${displayCount(proposalReviews.oppose + experimentReviews.oppose)} / ${displayCount(proposalReviews.ignore + experimentReviews.ignore)} / ${displayCount(proposalReviews.revision + experimentReviews.revision)}`],
+    ['实验 · 待实验 / 运行 / 完成 / 失败 / 已评估', `${displayCount(v6Lifecycle.experiments?.lifecycleCounts?.proposed)} / ${displayCount(v6Lifecycle.experiments?.lifecycleCounts?.running)} / ${displayCount(v6Lifecycle.experiments?.lifecycleCounts?.completed)} / ${displayCount(v6Lifecycle.experiments?.lifecycleCounts?.failed)} / ${displayCount(v6Lifecycle.experiments?.lifecycleCounts?.evaluated)}`],
+    ['采纳能力 / 后续使用', `${displayCount(v6Counts.adoptedCapabilities)} / ${displayCount(v6Usage.postAdoptionUses)}`],
+    ['实验使用 · 参与者 / 其他居民', `${displayCount(v6Usage.experimentParticipantUses)} / ${displayCount(v6Usage.experimentNonParticipantUses)}`],
+    ['能力依赖深度 / 二阶能力 (V6 / V7)', `${displayCount(v6Lifecycle.genealogy?.maximumDepth)} / ${displayCount(v6Lifecycle.genealogy?.secondOrderCapabilities)} / ${displayCount(v6Lifecycle.genealogy?.v7SecondOrderCapabilities)}`],
+    ['Observer 发现', displayCount(v6Lifecycle.integrity?.findings?.length)]
+  ]) {
+    const item = document.createElement('div');
+    item.className = 'world-evolution-stat';
+    const amount = document.createElement('strong');
+    amount.textContent = value;
+    const name = document.createElement('span');
+    name.textContent = label;
+    item.append(amount, name);
+    worldV6LifecycleStats?.append(item);
+  }
+  const v6FunnelByGap = new Map((v6Lifecycle.proposalFunnel || []).map((item) => [item.gapId, item]));
+  const blockerLabels = { needs_repeated_observation: '等待重复观察', minimum_world_age_not_reached: '未到年龄门槛',
+    gap_status_stale: '缺口已过期', no_resident_awareness_recorded: '没有居民知情记录',
+    no_decision_event_recorded: '没有决策事件', selected_candidate_without_proposal: '选择候选后未生成提案' };
+  const v6GapRows = (v6Lifecycle.gaps || []).slice(0, 12).map((gap) => {
+    const funnel = v6FunnelByGap.get(gap.id) || {};
+    const status = gap.status === 'stale' ? '历史缺口' : gap.mature ? '成熟' : '未成熟';
+    const blockers = (funnel.blockers || []).map((blocker) => blockerLabels[blocker] || blocker);
+    return { title: `${status} · ${gap.gapKey || gap.id}`,
+      detail: `${gap.problemStatement} · 观察 ${displayCount(gap.observationCount)} 次 · 居民知情 ${displayCount(gap.awareResidentCount)} / 组织 ${displayCount(gap.awareOrganizationCount)} · 候选周期 ${displayCount(funnel.candidateCycles)} · 提案 ${displayCount(funnel.proposals?.length)} · 有效 no-action ${displayCount(funnel.validNoAction)}${blockers.length ? ` · 观察到的阻塞：${blockers.join('、')}` : ''}` };
+  });
+  renderEvolutionList(worldV6LifecycleGapsList, v6GapRows, '当前没有 V6 能力缺口记录。', (item) => item.detail);
+  const integrityLabels = { NO_RESIDENT_AWARENESS_RECORDED: '成熟缺口没有居民知情记录',
+    NO_DECISION_EVENT_RECORDED: '成熟缺口没有决策事件',
+    SELECTED_CANDIDATE_WITHOUT_PROPOSAL: '选择候选后没有对应提案',
+    PROPOSAL_PAST_EXPIRY_WITHOUT_NEXT_STATE: '提案过期后仍停在原状态',
+    EXPERIMENT_PAST_WINDOW_UNEVALUATED: '实验超过评估窗口仍未评估',
+    ADOPTED_CAPABILITY_WITHOUT_POST_ADOPTION_USE: '已采纳能力尚无采纳后的使用记录',
+    INVALID_CAPABILITY_DEPENDENCY_REFERENCE: '能力依赖引用缺失',
+    CAPABILITY_DEPENDENCY_CYCLE: '能力依赖图存在循环',
+    DUPLICATE_TERMINAL_LIFECYCLE_TRANSITION: '检测到重复终态事件' };
+  const v6IntegrityRows = (v6Lifecycle.integrity?.findings || []).slice(0, 20).map((finding) => ({
+    title: integrityLabels[finding.code] || finding.code,
+    detail: `${finding.entityType} ${finding.entityId || ''} · 只读发现；不会自动修复或推进生命周期。`
+  }));
+  renderEvolutionList(worldV6LifecycleIntegrityList, v6IntegrityRows,
+    '目前没有生命周期完整性发现。', (item) => item.detail);
   const epoch = capabilityWorld.epoch;
   if (worldEpochSummary) worldEpochSummary.textContent = epoch
     ? `${epoch.code} · ${epoch.name} · 第 ${Math.max(1, Math.floor(Number(epoch.startedWorldMinute || 0) / 1_440) + 1)} 世界日开始`
     : '尚未记录世界时代';
   const capabilityCounts = capabilityWorld.counts || {};
   if (worldCapabilityCounts) worldCapabilityCounts.textContent = `有效 ${displayCount(capabilityCounts.active)} · 实验 ${displayCount(capabilityCounts.experimental)} · 提案 ${displayCount(capabilityCounts.proposals)} · 弃用 ${displayCount(capabilityCounts.deprecated)} · 缺口 ${displayCount(capabilityCounts.open_gaps)}`;
+  const v7 = evolution.v7 || {};
+  const v7Counts = v7.counts || {};
+  const autonomy = v7.metrics || {};
+  if (worldV7Summary) worldV7Summary.textContent = `居民自述与自创结构独立保存；自创能力使用 ${Math.round((Number(autonomy.agentCreatedActionUsageRatio) || 0) * 100)}% · 依赖深度 ${displayCount(autonomy.capabilityDependencyDepth)} · 二阶能力 ${displayCount(autonomy.secondOrderCapabilities)}`;
+  worldV7Stats?.replaceChildren();
+  for (const [label, value] of [
+    ['Self model', displayCount(v7Counts.selfModels)], ['开放问题', displayCount(v7Counts.openQuestions)],
+    ['自创目标', displayCount(v7Counts.selfGeneratedGoals)], ['概念', displayCount(v7Counts.concepts)],
+    ['涌现实体', displayCount(v7Counts.emergentEntities)], ['策略实验', displayCount(v7Counts.policyExperiments)],
+    ['扩展请求', displayCount(v7Counts.extensionRequests)],
+    ['自创能力占比', `${Math.round((Number(autonomy.agentCreatedCapabilityRatio) || 0) * 100)}%`],
+    ['自创行动使用占比', `${Math.round((Number(autonomy.agentCreatedActionUsageRatio) || 0) * 100)}%`],
+    ['自生成目标占比', `${Math.round((Number(autonomy.agentGeneratedGoalRatio) || 0) * 100)}%`],
+    ['自修改策略使用占比', `${Math.round((Number(autonomy.selfModifiedPolicyUsage) || 0) * 100)}%`],
+    ['协调机制实验', displayCount(v7Counts.coordinationExperiments)],
+    ['协调机制使用', displayCount(v7Counts.coordinationUses)],
+    ['资源账本记录', displayCount(v7Counts.resourceLedgerEntries)],
+    ['实际观察记录', displayCount(v7Counts.observationMethodUses)],
+    ['共享价值', displayCount(v7Counts.sharedValues)],
+    ['Agent 自创资源占比', `${Math.round((Number(autonomy.agentCreatedResourceTypeRatio) || 0) * 100)}%`],
+    ['开发者种子依赖占比', `${Math.round((Number(autonomy.developerSeededDependencyRatio) || 0) * 100)}%`]
+  ]) {
+    const item = document.createElement('div');
+    item.className = 'world-evolution-stat';
+    const amount = document.createElement('strong');
+    amount.textContent = value;
+    const name = document.createElement('span');
+    name.textContent = label;
+    item.append(amount, name);
+    worldV7Stats?.append(item);
+  }
+  renderEvolutionList(worldV7QuestionsList, v7.questions, '居民目前没有记录开放问题。', (item) =>
+    `${item.creatorName || '居民'} · ${item.status} · 信心 ${Math.round(Number(item.confidence || 0) * 100)}% · ${item.question}`);
+  renderEvolutionList(worldV7ConceptsList, v7.concepts, '居民目前没有提出新概念。', (item) =>
+    `${item.status} · ${item.creatorName || '居民'} · 使用 ${displayCount(item.usageCount)} 次 · ${item.definition}`);
+  renderEvolutionList(worldV7EntitiesList, v7.entities, '居民目前没有创建涌现实体。', (item) => {
+    const active = (item.participants || []).filter((participant) => participant.status === 'active').length;
+    const modes = (item.participants || []).map((participant) => participant.mode).filter(Boolean).join('、');
+    return `${item.entityType} · ${item.status} · ${active} 个参与者 · ${modes || '尚无参与方式'} · ${item.purpose}`;
+  });
+  renderEvolutionList(worldV7PolicyList, v7.policyExperiments, '居民目前没有策略实验。', (item) =>
+    `${item.status} · ${item.reason} · ${item.result?.decision || '等待证据'}`);
+  renderEvolutionList(worldV7ResourcesList, v7.resourceTypes, '居民目前没有提出新的内部资源。', (item) =>
+    `${item.resourceKey} · ${item.status} · ${item.usageCount} 次账本使用 · 用途 ${Array.isArray(item.permittedUses) ? item.permittedUses.join('、') : '未列出'}`);
+  renderEvolutionList(worldV7ResourceLedgerList, v7.resourceLedger, '内部资源尚无来源、用途和结算记录。', (item) =>
+    `${item.transactionType} ${item.amount} · ${item.source} · ${item.purpose} · ${item.fromHolderType} → ${item.toHolderType}`);
+  renderEvolutionList(worldV7CoordinationList, v7.coordinationMechanisms, '居民尚未提出新的协调机制。', (item) => {
+    const experiment = (item.experiments || []).at(-1);
+    return `${item.mechanismType} · ${item.status} · 使用 ${displayCount(item.usageCount)} 次 · ${experiment?.status || '未实验'}${experiment?.evaluation?.decision ? ` · ${experiment.evaluation.decision}` : ''} · ${item.description}`;
+  });
+  renderEvolutionList(worldV7CoordinationUsesList, v7.coordinationUses, '新协调机制尚无实际使用记录。', (item) =>
+    `${item.mechanismName} · ${item.result} · ${Array.isArray(item.participants) ? item.participants.length : 0} 个参与者`);
+  renderEvolutionList(worldV7ObservationUsesList, v7.observationUses, '居民自创观察方式尚无使用记录。', (item) =>
+    `${item.methodName} · ${item.observation}`);
+  renderEvolutionList(worldV7ExtensionsList, v7.extensionRequests, '居民目前没有请求扩展世界表达能力。', (item) =>
+    `${item.requestType} · ${item.status} · ${item.description}`);
+  renderEvolutionList(worldV7GenealogyList, v7.genealogy, '能力依赖图等待居民创建组合能力。', (item) =>
+    `深度 ${displayCount(item.depth)} · ${item.creatorType === 'system' ? '基础层' : 'Agent 创建'} · 依赖 ${displayCount(item.dependencies?.length)} 项`);
+  const v7Interpretations = [
+    ...(v7.values || []).map((item) => ({ title: `价值 · ${item.name}`, detail: `${item.holderType} · 重要性 ${Math.round(Number(item.importance || 0) * 100)}% · ${item.description}` })),
+    ...(v7.principles || []).map((item) => ({ title: `原则 · ${item.category}`, detail: `${item.scopeType} · ${item.status} · ${item.statement}` })),
+    ...(v7.observationMethods || []).map((item) => ({ title: `观察方式 · ${item.name}`, detail: `${item.status} · ${item.description}` })),
+    ...(v7.meanings || []).map((item) => ({ title: `意义 · ${item.subjectType}`, detail: item.interpretation })),
+    ...(v7.eras || []).map((item) => ({ title: `居民时代 · ${item.name}`, detail: item.interpretation }))
+  ];
+  renderEvolutionList(worldV7InterpretationsList, v7Interpretations, '还没有形成居民自述的价值、原则或观察方式。', (item) => item.detail);
   renderEvolutionList(capabilityActiveList, (capabilityWorld.capabilities || []).filter((item) => item.status === 'active').slice(0, 8),
     '当前没有登记有效能力。', (item) => `v${item.version} · ${item.category} · 使用 ${displayCount(item.usageCount)} 次${item.creatorType === 'system' ? ' · 基础能力' : ' · 居民创建'}`);
   renderEvolutionList(capabilityExperimentalList, (capabilityWorld.capabilities || []).filter((item) => item.status === 'experimental').slice(0, 6),
