@@ -1034,7 +1034,16 @@ async function advanceOrganizationCapabilityCycles(client, { worldId, gaps, prim
       [worldId, gap.id, organizationId, Math.max(0, Number(worldMinute) - CAPABILITY_PROPOSAL_LIFETIME_MINUTES)]);
       if (priorProposal.rowCount) continue;
 
-      const organizationHistory = await client.query(`SELECT event_type AS "eventType",world_minute AS "worldMinute",details
+      const organizationHistory = await client.query(`SELECT event_type AS "eventType",world_minute AS "worldMinute",
+          CASE WHEN event_type='organization_capability_innovation_considered' THEN jsonb_build_object(
+            'decision',details->>'decision','selectedOption',details->>'selectedOption',
+            'voterCount',coalesce(details->'voterCount','0'::jsonb),
+            'voteCount',CASE WHEN jsonb_typeof(details->'votes')='array' THEN jsonb_array_length(details->'votes') ELSE 0 END)
+          ELSE jsonb_build_object('status',details->>'status','uses',details->'uses',
+            'distinctResidents',details->'distinctResidents','successes',details->'successes',
+            'failures',details->'failures','successRate',details->'successRate',
+            'sideEffectUses',details->'sideEffectUses','adoptionScore',details->'adoptionScore')
+          END AS summary
         FROM world_capability_events WHERE world_id=$1 AND details->>'organizationId'=$2
           AND event_type IN ('organization_capability_innovation_considered','organization_capability_experiment_evaluated')
         ORDER BY world_minute DESC,id DESC LIMIT 6`, [worldId, organizationId]);
@@ -1105,11 +1114,17 @@ async function advanceOrganizationCapabilityCycles(client, { worldId, gaps, prim
   return proposalsCreated;
 }
 
-export async function advanceWorldCivilization(client, { worldId, agent, worldMinute, chooseWithTypeSafe = null }) {
+export async function advanceWorldCivilization(client, { worldId, agent, worldMinute, chooseWithTypeSafe = null,
+  onPhase = () => {} }) {
+  onPhase('CAPABILITY_PROPOSAL_EXPIRY');
   await expireStalledCapabilityProposals(client, { worldId, worldMinute });
+  onPhase('CAPABILITY_GAP_OBSERVATION');
   const gaps = await observeWorldCapabilityGaps(client, { worldId, worldMinute });
+  onPhase('CAPABILITY_GAP_AWARENESS');
   for (const gap of gaps) await noteGapForResident(client, { worldId, agent, gap, worldMinute });
+  onPhase('CAPABILITY_REGISTRY_READ');
   const primitives = await primitiveMap(client, worldId);
+  onPhase('RESIDENT_CAPABILITY_REVIEW');
   for (const gap of gaps) {
     if (!residentRelevantToGap(agent, gap) || Number(gap.observationCount) < 2
         || Number(worldMinute) - Number(gap.firstObservedWorldMinute) < 1_440) continue;
@@ -1144,11 +1159,16 @@ export async function advanceWorldCivilization(client, { worldId, agent, worldMi
     await recordCapabilityProposal(client, { worldId, agentId: agent.agentId, gap, draft,
       actionId: `civil-proposal:${gap.id.slice(0, 8)}:${agent.agentId.slice(0, 8)}:${draft.id.slice(-14)}`, worldMinute });
   }
+  onPhase('ORGANIZATION_CAPABILITY_REVIEW');
   const organizationProposals = await advanceOrganizationCapabilityCycles(client, { worldId, gaps, primitives,
     worldMinute, chooseWithTypeSafe });
+  onPhase('CAPABILITY_EXPERIENCE_REVIEW');
   await reviewExperiences(client, { worldId, agent, worldMinute, chooseWithTypeSafe });
+  onPhase('CAPABILITY_PROPOSAL_REVIEW');
   await reviewOpenProposals(client, { worldId, agent, worldMinute, chooseWithTypeSafe });
+  onPhase('CAPABILITY_EXPERIMENT_START');
   const experiments = await startReadyExperiments(client, worldId, worldMinute);
+  onPhase('CAPABILITY_EXPERIMENT_EVALUATION');
   const outcomes = await evaluateWorldCapabilityExperiments(client, { worldId, worldMinute });
   return { gapsObserved: gaps.length, proposalsCreated: organizationProposals,
     experimentsStarted: experiments.length, experimentsEvaluated: outcomes.length };

@@ -15,6 +15,7 @@ import { loadState, STATE_DIR } from './agent-runtime/client.js';
 import { createFruitflyRuntime } from './agent-runtime/fruitfly.js';
 import { chooseCivilizationOption, chooseWithTypeSafe } from './agent-runtime/typesafe.js';
 import { startWorldEngine, worldClock } from './world-engine.js';
+import { buildWorldLiveness, reportWorldEngineError } from './world-engine-diagnostics.js';
 import { createWorldOpportunity, decideWorldOpportunity, listAvailableOpportunities } from './world-opportunities.js';
 import { proposeWorldProject, decideProjectMembership, contributeToProject, listWorldProjects } from './world-projects.js';
 import { foundWorldOrganization, inviteWorldOrganization, decideOrganizationMembership,
@@ -35,7 +36,7 @@ import { ensureEconomicAccount, getEconomicAccount } from './economic-ledger.js'
 
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const SITE_ROOT = path.join(ROOT, 'site');
-const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+const pool = new Pool({ connectionString: process.env.DATABASE_URL, connectionTimeoutMillis: 5_000 });
 const app = Fastify({ logger: false, bodyLimit: 1_000_000 });
 const challenges = new Map();
 let worldEngine = { running: false, reason: 'starting' };
@@ -62,6 +63,12 @@ app.addContentTypeParser('application/json', { parseAs: 'buffer' }, (request, bo
 
 function fail(reply, status, error, detail) {
   return reply.code(status).send({ error, ...(detail ? { detail } : {}) });
+}
+function logWorldEngineError(error, stage, record) {
+  const level = app.log?.level;
+  if (!level || level === 'silent' || typeof app.log?.error !== 'function') return false;
+  app.log.error({ stage, worldEngine: record }, 'world engine error');
+  return true;
 }
 function validUuid(value) { return typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value); }
 function requiredString(value, min, max) { return typeof value === 'string' && value.trim().length >= min && value.trim().length <= max; }
@@ -215,7 +222,27 @@ app.get('/world3d.js', async (_request, reply) => {
   return readFile(path.join(SITE_ROOT, 'world3d.js'));
 });
 
-app.get('/health', async () => ({ ok: true, service: 'synterra', chainId: CHAIN_ID }));
+app.get('/health', async () => {
+  const engine = worldEngine.getLiveness?.() || { running: worldEngine.running,
+    worldId: worldEngine.worldId || null, worldLockOwned: Boolean(worldEngine.worldLockOwned), schedulerRunning: false };
+  try {
+    const result = await pool.query({
+      text: `SELECT now() AS database_time,w.id AS world_id,rs.world_minutes,rs.tick_count,rs.last_tick_at
+        FROM worlds w LEFT JOIN world_runtime_state rs ON rs.world_id=w.id
+        WHERE w.open=true AND ($1::uuid IS NULL OR w.id=$1)
+        ORDER BY w.created_at DESC LIMIT 1`,
+      values: [worldEngine.worldId || null],
+      query_timeout: 5_000
+    });
+    const row = result.rows[0] || null;
+    return { service: 'synterra', chainId: CHAIN_ID,
+      ...buildWorldLiveness({ databaseHealthy: true, runtime: row,
+        engine, checkedAt: row?.database_time || new Date() }) };
+  } catch {
+    return { service: 'synterra', chainId: CHAIN_ID,
+      ...buildWorldLiveness({ databaseHealthy: false, runtime: null, engine, checkedAt: new Date() }) };
+  }
+});
 
 app.get('/public/stats', async (_request, reply) => {
   reply.header('Cache-Control', 'public, max-age=30');
@@ -2162,11 +2189,11 @@ try {
       if (status.typeSafe) app.log.info(status, 'bounded TypeSafe goal selection');
       else if (status.reason === 'another_server_owns_world_loop') app.log.warn(status, 'world engine already active elsewhere');
     },
-    onError: (error, stage) => app.log.error({ stage, err: error }, 'world engine iteration failed')
+    onError: logWorldEngineError
   });
 } catch (error) {
   worldEngine = { running: false, reason: 'startup_failed' };
-  app.log.error({ err: error }, 'world engine could not start');
+  reportWorldEngineError({ error, stage: 'startup', worldId: null, onError: logWorldEngineError });
 }
 const adultServiceExpiryTimer = setInterval(() => {
   expireAdultServiceBookings().catch((error) => app.log.error({ err: error }, 'adult service booking expiry failed'));

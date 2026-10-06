@@ -303,6 +303,12 @@ test('organization capability proposals follow the organization governance mode 
       VALUES($1,$2,$3,19,27360,'member_observed_shortage','{"source":"world_shortage"}'::jsonb),
         ($1,$2,$4,19,27360,'member_observed_shortage','{"source":"world_shortage"}'::jsonb)`,
     [worldId, gap.id, founderId, memberId]);
+    await pool.query(`INSERT INTO world_capability_events(world_id,actor_agent_id,gap_id,event_type,event_key,world_minute,details)
+      VALUES($1,$2,$3,'organization_capability_innovation_considered','v6-legacy-nested-history-fixture',29000,
+        jsonb_build_object('organizationId',$4::text,'decision','retain_current_approach','selectedOption','ignore',
+          'voterCount',2,'votes','[]'::jsonb,'priorInnovationOutcomes',
+          jsonb_build_array(jsonb_build_object('legacyMarker','must not be copied into a later event'))))`,
+    [worldId, founderId, gap.id, organizationId]);
 
     const chooser = async (request) => ({ choice: { id: request.options.find((option) => option.id !== 'ignore').id }, confidence: 0.99 });
     const observer = { agentId: observerId, goal: 'balanced', primaryGoal: 'BALANCED_LIFE', currentGoal: 'Keep life steady.',
@@ -319,12 +325,18 @@ test('organization capability proposals follow the organization governance mode 
     assert.ok([founderId, memberId].includes(proposal.rows[0].creatorAgentId), 'a real active member sponsors the proposal');
     assert.equal(proposal.rows[0].specification.kind, 'composition');
     const decision = await pool.query(`SELECT details FROM world_capability_events WHERE world_id=$1
-      AND event_type='organization_capability_innovation_considered' AND details->>'organizationId'=$2`,
+      AND event_type='organization_capability_innovation_considered' AND details->>'organizationId'=$2
+      ORDER BY world_minute DESC,id DESC LIMIT 1`,
     [worldId, organizationId]);
     assert.equal(decision.rowCount, 1);
     assert.equal(decision.rows[0].details.governanceMode, 'member_vote');
     assert.equal(decision.rows[0].details.voterCount, 2);
     assert.ok(decision.rows[0].details.votes.every((vote) => vote.optionId !== 'ignore'));
+    assert.equal(decision.rows[0].details.priorInnovationOutcomes.length, 1);
+    assert.equal(decision.rows[0].details.priorInnovationOutcomes[0].summary.selectedOption, 'ignore');
+    assert.equal(decision.rows[0].details.priorInnovationOutcomes[0].summary.voteCount, 0);
+    assert.equal(JSON.stringify(decision.rows[0].details).includes('legacyMarker'), false,
+      'a prior event’s nested history must not be copied recursively into the new event');
   } finally {
     await cleanupSeed(pool, worldId, agentIds);
     await pool.end();

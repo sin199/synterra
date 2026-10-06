@@ -37,9 +37,14 @@ import { applyToWorldBusinessJob, buildBusinessCandidates, closeWorldBusiness,
   settleWorldPlaceMaintenance, explainBusinessOpportunityGaps } from './world-businesses.js';
 import { advanceWorldCivilization, buildCapabilityUseCandidates, initializeWorldCivilization,
   listWorldCapabilityUses, performWorldCapabilityUse, CIVILIZATION_REVIEW_INTERVAL_MINUTES } from './world-capabilities.js';
+import { reportWorldEngineError, settleOptionalReasoning, worldEngineErrorRecord, WORLD_TICK_STALE_AFTER_MS,
+  WORLD_TICK_WATCHDOG_INTERVAL_MS } from './world-engine-diagnostics.js';
 
 export const WORLD_TICK_MS = 1_000;
 const TYPE_SAFE_INTERVAL_MS = 30 * 60_000;
+const CIVILIZATION_REASONING_TIMEOUT_MS = 10_500;
+const CIVILIZATION_REASONING_BUDGET_MS = 15_000;
+const WORLD_DB_STATEMENT_TIMEOUT_MS = 30_000;
 const MAX_CATCH_UP_SECONDS = 30;
 const INSTITUTIONAL_RETRY_WORLD_MINUTES = 60;
 const ACTION_SECONDS = Object.freeze({ work: 16, cooperate: 16, learn: 11, rest: 9, eat: 8, socialize: 12, trade: 7,
@@ -1842,7 +1847,12 @@ async function runStrategicTypeSafe(pool, worldId, chooseWithTypeSafe, runtimeSt
 
 export async function startWorldEngine(pool, { worldId: requestedWorldId = null, onError = () => {}, onStatus = () => {}, chooseWithTypeSafe = null,
   chooseCivilizationOption = null,
-  runtimeState = null, fruitfly = null, tickMs = WORLD_TICK_MS, nowProvider = () => Date.now(), schedule = true } = {}) {
+  runtimeState = null, fruitfly = null, tickMs = WORLD_TICK_MS, nowProvider = () => Date.now(), schedule = true,
+  emergencySink = process.stderr } = {}) {
+  const readNowMs = () => {
+    const value = nowProvider();
+    return value instanceof Date ? value.getTime() : finite(value, Date.now());
+  };
   const worldResult = await pool.query(`SELECT w.id FROM worlds w WHERE w.open=true AND ($1::uuid IS NULL OR w.id=$1)
     ORDER BY w.created_at DESC LIMIT 1`, [requestedWorldId]);
   if (!worldResult.rowCount) return { running: false, reason: 'no_open_world', stop: async () => {} };
@@ -1850,12 +1860,51 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
   await ensureAgentRows(pool, worldId);
 
   const lockClient = await pool.connect();
-  const lock = await lockClient.query(`SELECT pg_try_advisory_lock(hashtextextended('synterra-world-engine',0)) AS acquired`);
+  const lock = await lockClient.query(`SELECT pg_try_advisory_lock(hashtextextended('synterra-world-engine',0)) AS acquired,
+    pg_backend_pid() AS owner_pid`);
   if (!lock.rows[0].acquired) {
     lockClient.release();
     onStatus({ running: false, reason: 'another_server_owns_world_loop' });
-    return { running: false, reason: 'another_server_owns_world_loop', stop: async () => {} };
+    return { running: false, worldId, worldLockOwned: false, schedulerRunning: false,
+      reason: 'another_server_owns_world_loop', getLiveness() { return this; }, stop: async () => {} };
   }
+
+  const diagnostics = {
+    worldId,
+    engineStartedAt: new Date(readNowMs()).toISOString(),
+    worldMinute: null,
+    tickCount: null,
+    persistedWorldMinute: null,
+    persistedTickCount: null,
+    worldLockOwnerPid: Number(lock.rows[0].owner_pid),
+    worldLockOwned: true,
+    schedulerRunning: false,
+    tickInProgress: false,
+    activeTickStartedAt: null,
+    lastSchedulerFireAt: null,
+    lastTickPhase: 'STARTUP',
+    lastSuccessfulPhase: null,
+    lastTickStartedAt: null,
+    lastTickCompletedAt: null,
+    lastTickError: null,
+    lastEngineError: null,
+    watchdogLastRecoveryAt: null
+  };
+  let resumeBaselineMs = readNowMs();
+
+  const reportError = (error, stage, { tickFailure = false, phase = diagnostics.lastTickPhase } = {}) => {
+    const record = reportWorldEngineError({ error, stage, worldId,
+      worldMinute: diagnostics.worldMinute ?? diagnostics.persistedWorldMinute,
+      tickCount: diagnostics.tickCount ?? diagnostics.persistedTickCount,
+      phase, onError, emergencySink, timestamp: new Date(readNowMs()) });
+    diagnostics.lastEngineError = record;
+    if (tickFailure) diagnostics.lastTickError = record;
+    return record;
+  };
+  const setPhase = (phase) => { diagnostics.lastTickPhase = String(phase).slice(0, 80); };
+  const phaseSucceeded = (phase = diagnostics.lastTickPhase) => {
+    diagnostics.lastSuccessfulPhase = String(phase).slice(0, 80);
+  };
 
   try {
     const initialize = await pool.connect();
@@ -1872,6 +1921,11 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
           WHERE world_id=$1 AND agent_id=$2 AND next_civilization_review_world_minutes IS NULL`,
         [worldId, resident.agent_id, Number(clock.rows[0].world_minutes) + phase]);
       }
+      diagnostics.worldMinute = Number(clock.rows[0].world_minutes);
+      diagnostics.persistedWorldMinute = diagnostics.worldMinute;
+      const currentClock = await initialize.query(`SELECT tick_count FROM world_runtime_state WHERE world_id=$1`, [worldId]);
+      diagnostics.tickCount = Number(currentClock.rows[0]?.tick_count) || 0;
+      diagnostics.persistedTickCount = diagnostics.tickCount;
       await initialize.query('COMMIT');
     } catch (error) {
       await initialize.query('ROLLBACK');
@@ -1895,27 +1949,72 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
   let lastErrorLoggedAt = 0;
   let suppressedErrors = 0;
   let timer = null;
-  const readNowMs = () => {
-    const value = nowProvider();
-    return value instanceof Date ? value.getTime() : finite(value, Date.now());
+  let watchdogTimer = null;
+  let watchdogInProgress = false;
+  let staleEpisodeReported = false;
+  let civilizationReasoningDeadline = 0;
+  let civilizationChoiceInFlight = null;
+
+  const chooseCivilizationOptionBounded = async (request) => {
+    if (!chooseCivilizationOption || Date.now() >= civilizationReasoningDeadline || civilizationChoiceInFlight) return null;
+    const timeoutMs = Math.max(1, Math.min(CIVILIZATION_REASONING_TIMEOUT_MS,
+      civilizationReasoningDeadline - Date.now()));
+    const operation = Promise.resolve().then(() => chooseCivilizationOption(request, runtimeState));
+    civilizationChoiceInFlight = operation;
+    operation.finally(() => {
+      if (civilizationChoiceInFlight === operation) civilizationChoiceInFlight = null;
+    }).catch(() => {});
+    try {
+      const result = await settleOptionalReasoning(operation, { timeoutMs, fallback: null });
+      if (result.error) reportError(result.error, 'typesafe_civilization_selection',
+        { tickFailure: false, phase: diagnostics.lastTickPhase });
+      if (result.timedOut) reportError(new Error(`Optional TypeSafe civilization reasoning exceeded ${timeoutMs}ms.`),
+        'typesafe_civilization_timeout', { tickFailure: false, phase: diagnostics.lastTickPhase });
+      return result.value;
+    } catch (error) { reportError(error, 'typesafe_civilization_selection', { tickFailure: false }); return null; }
   };
+
+  async function verifyWorldLock() {
+    const result = await lockClient.query({
+      text: `WITH lock_key AS (SELECT hashtextextended('synterra-world-engine',0) AS value),
+          database_oid AS (SELECT oid FROM pg_database WHERE datname=current_database())
+        SELECT pg_backend_pid() AS owner_pid,EXISTS (
+          SELECT 1 FROM pg_locks held,lock_key,database_oid
+          WHERE held.locktype='advisory' AND held.pid=pg_backend_pid() AND held.granted
+            AND held.database=database_oid.oid AND held.objsubid=1
+            AND held.classid::bigint=((lock_key.value >> 32) & 4294967295)
+            AND held.objid::bigint=(lock_key.value & 4294967295)) AS owned`,
+      query_timeout: 5_000
+    });
+    diagnostics.worldLockOwnerPid = Number(result.rows[0]?.owner_pid) || null;
+    diagnostics.worldLockOwned = Boolean(result.rows[0]?.owned);
+    return diagnostics.worldLockOwned;
+  }
 
   async function tick() {
     const nowMs = readNowMs();
-    if (stopped || tickInProgress || nowMs < nextRetryAt) return;
+    if (stopped || !diagnostics.worldLockOwned || tickInProgress || nowMs < nextRetryAt) return;
     tickInProgress = true;
+    diagnostics.tickInProgress = true;
+    diagnostics.lastTickStartedAt = new Date(nowMs).toISOString();
+    diagnostics.activeTickStartedAt = diagnostics.lastTickStartedAt;
+    civilizationReasoningDeadline = Date.now() + CIVILIZATION_REASONING_BUDGET_MS;
+    setPhase('TICK_START');
+    phaseSucceeded('TICK_START');
     let shouldAskTypeSafe = false;
+    let typeSafeTaskStarted = false;
     const fruitflyOutcomes = [];
     try {
       const client = await pool.connect();
       try {
         await client.query('BEGIN');
+        await client.query(`SET LOCAL statement_timeout = '${WORLD_DB_STATEMENT_TIMEOUT_MS}ms'`);
         const clockResult = await client.query(`SELECT tick_count,world_minutes,last_tick_at,typesafe_next_at,market_snapshot
           FROM world_runtime_state WHERE world_id=$1 FOR UPDATE`, [worldId]);
         if (!clockResult.rowCount) throw new Error('WORLD_RUNTIME_STATE_MISSING');
         const clock = clockResult.rows[0];
         const now = new Date(nowMs);
-        const previousAt = new Date(clock.last_tick_at).getTime();
+        const previousAt = resumeBaselineMs ?? new Date(clock.last_tick_at).getTime();
         const elapsed = Math.max(1, Math.min(MAX_CATCH_UP_SECONDS,
           Math.floor((now.getTime() - (Number.isFinite(previousAt) ? previousAt : now.getTime())) / 1_000)));
         const tickCount = Number(clock.tick_count) + elapsed;
@@ -1925,8 +2024,13 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
       const oldWorldDay = Math.floor(Number(clock.world_minutes) / 1_440);
       const newWorldDay = Math.floor(worldMinutes / 1_440);
       const decayHours = Math.min(24, Math.max(0, newHour - oldHour));
+      setPhase('CLOCK_ADVANCE');
       await client.query(`UPDATE world_runtime_state SET tick_count=$2,world_minutes=$3,last_tick_at=$4,updated_at=$4
           WHERE world_id=$1`, [worldId, tickCount, worldMinutes, now]);
+      diagnostics.worldMinute = worldMinutes;
+      diagnostics.tickCount = tickCount;
+      phaseSucceeded('CLOCK_ADVANCE');
+      setPhase('DAILY_ECONOMY');
       if (newWorldDay > oldWorldDay) {
         const businessSettlement = await settleWorldBusinessMaintenance(client, { worldId, worldTime: newWorldDay * 1_440 });
         for (const outcome of businessSettlement.outcomes || []) {
@@ -1952,6 +2056,7 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
         }
         await settleWorldPlaceMaintenance(client, { worldId, worldTime: newWorldDay * 1_440 });
       }
+      phaseSucceeded('DAILY_ECONOMY');
         const quoteResult = await client.query(`SELECT symbol,price_usd::text AS "priceUsd",quote_version AS "quoteVersion",as_of AS "asOf",source
           FROM crypto_market_quotes ORDER BY symbol`);
         const quotes = quoteResult.rows.map((quote) => ({ ...quote, quoteVersion: Number(quote.quoteVersion) }));
@@ -1966,6 +2071,7 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
             [worldId, new Date(nextTypeSafeAt)]);
         }
         await client.query(`UPDATE world_runtime_state SET market_snapshot=$2::jsonb WHERE world_id=$1`, [worldId, JSON.stringify(nextSnapshot)]);
+        setPhase('RESIDENT_UPDATE');
         if (decayHours > 0) {
           await client.query(`UPDATE world_members SET energy=greatest(0,energy-$2),food=greatest(0,food-$3),social=greatest(0,social-$4)
             WHERE world_id=$1`, [worldId, decayHours, decayHours * 2, decayHours]);
@@ -2039,6 +2145,8 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
         const placeIdsByName = Object.fromEntries(scenes.map((scene) => [scene.name, scene.id]));
         const dueResidents = membersResult.rows.filter((member) => member.status === 'idle'
           && new Date(member.next_decision_at).getTime() <= now.getTime());
+        phaseSucceeded('RESIDENT_UPDATE');
+        setPhase('INSTITUTIONAL_EXPIRY');
         let initiativeState = null;
         if (newHour > oldHour) {
           await expireInstitutionalState(client, { worldId, worldTime: worldMinutes });
@@ -2075,9 +2183,10 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
             await recordEmergenceEvent(client, { worldId, worldMinutes, tickCount, system: 'opportunity',
               stage: created.created ? 'created' : 'blocked', reasonCode: created.created ? 'NONE' : 'COOLDOWN',
               eventKey: `${key}:${created.created ? 'created' : 'blocked'}`, candidateId: created.id || idea.dedupeKey,
-              details: { type: idea.type, title: idea.title } });
+            details: { type: idea.type, title: idea.title } });
           }
         }
+        phaseSucceeded('INSTITUTIONAL_EXPIRY');
         const placeCounts = Object.fromEntries(membersResult.rows.map((member) => [member.location,
           membersResult.rows.filter((other) => other.location === member.location).length - 1]));
 
@@ -2111,10 +2220,19 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
               nextCivilizationAt = worldMinutes + CIVILIZATION_REVIEW_INTERVAL_MINUTES;
               await client.query(`UPDATE world_agent_states SET next_civilization_review_world_minutes=$3,updated_at=$4
                 WHERE world_id=$1 AND agent_id=$2`, [worldId, agent.agentId, nextCivilizationAt, now]);
+              setPhase('V6_CIVILIZATIONAL_REVIEW');
+              let lastCivilizationPhase = null;
               await advanceWorldCivilization(client, { worldId, agent, worldMinute: worldMinutes,
-                chooseWithTypeSafe: chooseCivilizationOption
-                  ? (request) => chooseCivilizationOption(request, runtimeState) : null });
+                chooseWithTypeSafe: chooseCivilizationOption ? chooseCivilizationOptionBounded : null,
+                onPhase(phase) {
+                  if (lastCivilizationPhase) phaseSucceeded(lastCivilizationPhase);
+                  lastCivilizationPhase = phase;
+                  setPhase(phase);
+                } });
+              if (lastCivilizationPhase) phaseSucceeded(lastCivilizationPhase);
+              setPhase('RESIDENT_COGNITION');
               capabilityOptions = await listWorldCapabilityUses(client, { worldId, limit: 100 });
+              phaseSucceeded('RESIDENT_COGNITION');
             }
             agent.nextCivilizationReviewWorldMinutes = nextCivilizationAt;
           }
@@ -2122,9 +2240,11 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
           const newImportantMemory = agent.recentMemories.some((memory) => Number(memory.importance) >= 0.7
             && Number(memory.worldMinutes) > (lastReflection ?? -1));
           const reflectionTrigger = newImportantMemory ? 'important_event' : 'cadence';
+          setPhase('RESIDENT_REFLECTION');
           const reflected = reflectionDue({ worldMinutes, lastReflectionWorldMinutes: lastReflection,
             important: reflectionTrigger === 'important_event' })
             ? await reflectResident(client, worldId, agent, tickCount, worldMinutes, reflectionTrigger) : null;
+          phaseSucceeded('RESIDENT_REFLECTION');
           if (reflected) {
             agent.personalityModifiers = reflected.modifiers;
             agent.riskTolerance = clamp(finite(row.risk_tolerance) + reflected.riskModifier, 0, 1);
@@ -2138,6 +2258,7 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
             agent.goals = updatedGoals.rows;
           }
           if (agent.status === 'walking' && new Date(agent.movement_ends_at).getTime() <= now.getTime()) {
+            setPhase('RESIDENT_MOVEMENT');
             const destination = agent.target_location;
             await client.query('UPDATE world_members SET location=$3 WHERE world_id=$1 AND agent_id=$2', [worldId, agent.agentId, destination]);
             const duration = ACTION_SECONDS[agent.planned_action] || 10;
@@ -2149,10 +2270,18 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
             await recordWorldEvent(client, worldId, agent.agentId, tickCount, 'world.action_started',
               { place: destination, action: agent.planned_action, worldMinutes, at: now.toISOString() });
             await setMindGoal(client, worldId, agent.agentId, agent.current_goal || agent.goal, agent.planned_action, null);
+            phaseSucceeded('RESIDENT_MOVEMENT');
           } else if (agent.status === 'performing' && new Date(agent.action_ends_at).getTime() <= now.getTime()) {
+            const completedAction = String(agent.planned_action || '');
+            const completionPhase = completedAction === 'capability_use' ? 'CAPABILITY_EXPERIMENTS'
+              : completedAction.startsWith('business') || completedAction === 'trade' ? 'ECONOMY'
+                : completedAction.startsWith('agreement') || completedAction === 'commitment_resolve'
+                  ? 'AGREEMENTS' : 'ACTION_COMPLETION';
+            setPhase(completionPhase);
             const placeResult = scenes.find((scene) => scene.name === agent.location);
             const learning = await completeActivity(client, worldId, { ...agent, scene_type: placeResult?.sceneType || null },
               { tick_count: tickCount, world_minutes: worldMinutes }, quotes, now, placeResult);
+            phaseSucceeded(completionPhase);
             if (learning) fruitflyOutcomes.push(learning);
           } else if (agent.status === 'idle' && new Date(agent.next_decision_at).getTime() <= now.getTime()) {
             const residentsAtLocation = Object.fromEntries(scenes.filter((scene) => ['cafe','garden','commons','workshop','studio','data_center'].includes(scene.sceneType))
@@ -2364,6 +2493,7 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
                 agent.nextInstitutionalReviewWorldMinutes = retryAt;
               }
             }
+            setPhase('TACTICAL_DECISIONS');
             let activity = null;
             let flyObservation = null;
             let flyCandidates = [];
@@ -2399,10 +2529,11 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
                 usedFruitfly = true;
                 decision = choice;
                 } else if (choice?.candidate) {
-                  onError(new Error('Fruitfly selected a candidate outside the feasible set.'), 'fruitfly_choice');
+                  reportError(new Error('Fruitfly selected a candidate outside the feasible set.'), 'fruitfly_choice');
                 }
-              } catch (error) { onError(error, 'fruitfly_choice'); }
+              } catch (error) { reportError(error, 'fruitfly_choice'); }
             }
+            phaseSucceeded('TACTICAL_DECISIONS');
             if (!activity) {
               await client.query(`UPDATE world_agent_states SET next_decision_at=$3,updated_at=$4
                 WHERE world_id=$1 AND agent_id=$2`, [worldId, agent.agentId, new Date(now.getTime() + 30_000), now]);
@@ -2542,60 +2673,163 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
             }
           }
         }
+        setPhase('PERSISTENCE');
         await client.query('COMMIT');
+        diagnostics.persistedWorldMinute = worldMinutes;
+        diagnostics.persistedTickCount = tickCount;
+        diagnostics.lastTickCompletedAt = new Date(readNowMs()).toISOString();
+        resumeBaselineMs = null;
+        phaseSucceeded('PERSISTENCE');
+        setPhase('TICK_COMPLETE');
+        phaseSucceeded('TICK_COMPLETE');
+        staleEpisodeReported = false;
         const recovered = errorCount > 0;
         errorCount = 0;
-        onStatus({ running: true, worldId, tickCount, worldMinutes, residents: membersResult.rowCount,
-          ...(recovered ? { recovered: true, suppressedErrors } : {}) });
+        try { onStatus({ running: true, worldId, tickCount, worldMinutes, residents: membersResult.rowCount,
+          ...(recovered ? { recovered: true, suppressedErrors } : {}) }); }
+        catch (error) { reportError(error, 'status_callback'); }
         suppressedErrors = 0;
       } catch (error) {
-        await client.query('ROLLBACK');
+        try { await client.query('ROLLBACK'); }
+        catch (rollbackError) { reportError(rollbackError, 'tick_rollback'); }
         throw error;
       } finally { client.release(); }
       if (fruitfly && fruitflyOutcomes.length) {
         fruitflyTask = Promise.all(fruitflyOutcomes.map((outcome) => fruitfly.learn(outcome.agentId,
           outcome.observation, outcome.candidates, outcome.selected, outcome.result)))
-          .catch((error) => onError(error, 'fruitfly_learning'))
+          .catch((error) => reportError(error, 'fruitfly_learning'))
           .finally(() => { fruitflyTask = null; });
       }
       if (shouldAskTypeSafe && chooseWithTypeSafe && runtimeState) {
-        typeSafeTask = runStrategicTypeSafe(pool, worldId, chooseWithTypeSafe, runtimeState)
-          .then((result) => { if (result?.reason === 'selected') onStatus({ running: true, typeSafe: result }); })
-          .catch((error) => onError(error, 'typesafe_selection'))
+        const operation = runStrategicTypeSafe(pool, worldId, chooseWithTypeSafe, runtimeState);
+        typeSafeTask = settleOptionalReasoning(operation, { timeoutMs: 12_000, fallback: { reason: 'timeout' } })
+          .then(({ value, timedOut, error }) => {
+            if (error) reportError(error, 'typesafe_selection');
+            if (timedOut) reportError(new Error('Optional TypeSafe strategic selection exceeded 12000ms.'), 'typesafe_strategic_timeout');
+            else if (value?.reason === 'selected') {
+              try { onStatus({ running: true, typeSafe: value }); }
+              catch (error) { reportError(error, 'status_callback'); }
+            }
+          })
           .finally(() => { typeSafeInProgress = false; typeSafeTask = null; });
+        typeSafeTaskStarted = true;
       }
     } catch (error) {
       errorCount += 1;
       nextRetryAt = readNowMs() + Math.min(30_000, 1_000 * 2 ** Math.min(errorCount, 5));
+      const timestamp = new Date(readNowMs());
+      diagnostics.lastTickError = worldEngineErrorRecord({ error, stage: 'tick', worldId,
+        worldMinute: diagnostics.worldMinute, tickCount: diagnostics.tickCount,
+        phase: diagnostics.lastTickPhase, timestamp });
       if (readNowMs() - lastErrorLoggedAt >= 60_000) {
         lastErrorLoggedAt = readNowMs();
-        onError(error, 'tick');
+        reportError(error, 'tick', { tickFailure: true });
       } else suppressedErrors += 1;
-    } finally { tickInProgress = false; }
+    } finally {
+      if (shouldAskTypeSafe && !typeSafeTaskStarted) {
+        typeSafeInProgress = false;
+        nextTypeSafeAt = 0;
+      }
+      tickInProgress = false;
+      diagnostics.tickInProgress = false;
+      diagnostics.activeTickStartedAt = null;
+    }
   }
 
-  if (schedule) {
-    timer = setInterval(() => {
-      if (activeTick || stopped) return;
-      activeTick = tick().finally(() => { activeTick = null; });
-    }, Math.max(250, Math.trunc(finite(tickMs, WORLD_TICK_MS))));
+  const actualTickMs = Math.max(250, Math.trunc(finite(tickMs, WORLD_TICK_MS)));
+  const scheduledTick = () => {
+    diagnostics.lastSchedulerFireAt = new Date(readNowMs()).toISOString();
+    if (activeTick || stopped) return;
+    activeTick = tick()
+      .catch((error) => { reportError(error, 'scheduler_tick_rejection', { tickFailure: true }); })
+      .finally(() => { activeTick = null; });
+  };
+  const startScheduler = () => {
+    if (stopped || !diagnostics.worldLockOwned || timer) return;
+    timer = setInterval(scheduledTick, actualTickMs);
     timer.unref?.();
+    diagnostics.schedulerRunning = true;
+    diagnostics.lastSchedulerFireAt = new Date(readNowMs()).toISOString();
+  };
+  const runWatchdog = async () => {
+    if (watchdogInProgress || stopped) return;
+    watchdogInProgress = true;
+    try {
+      if (!await verifyWorldLock()) {
+        if (timer) clearInterval(timer);
+        timer = null;
+        diagnostics.schedulerRunning = false;
+        reportError(new Error('World advisory lock is no longer owned by this engine; scheduler was stopped safely.'),
+          'watchdog_world_lock_lost', { phase: diagnostics.lastTickPhase });
+        return;
+      }
+      const checkedAt = readNowMs();
+      const successfulAt = new Date(diagnostics.lastTickCompletedAt || diagnostics.engineStartedAt).getTime();
+      const stale = Number.isFinite(successfulAt) && checkedAt - successfulAt > WORLD_TICK_STALE_AFTER_MS;
+      const lastFireAt = diagnostics.lastSchedulerFireAt ? new Date(diagnostics.lastSchedulerFireAt).getTime() : NaN;
+      const schedulerStale = !Number.isFinite(lastFireAt) || checkedAt - lastFireAt > Math.max(5_000, actualTickMs * 5);
+      if (schedulerStale && !activeTick && !tickInProgress && !stopped) {
+        if (timer) clearInterval(timer);
+        timer = null;
+        startScheduler();
+        diagnostics.watchdogLastRecoveryAt = new Date(checkedAt).toISOString();
+        reportError(new Error('World tick watchdog restarted an idle scheduler after its pulse became stale.'),
+          'watchdog_scheduler_recovery', { phase: diagnostics.lastTickPhase });
+      } else if (stale && !staleEpisodeReported) {
+        staleEpisodeReported = true;
+        const reason = activeTick || tickInProgress
+          ? 'World tick has remained in progress without a successful commit beyond the liveness threshold.'
+          : 'World tick scheduler is firing but no recent tick has committed.';
+        reportError(new Error(reason), 'watchdog_stale_world', { phase: diagnostics.lastTickPhase });
+      } else if (!stale) staleEpisodeReported = false;
+    } catch (error) {
+      diagnostics.worldLockOwned = false;
+      if (timer) clearInterval(timer);
+      timer = null;
+      diagnostics.schedulerRunning = false;
+      reportError(error, 'watchdog_lock_check');
+    } finally { watchdogInProgress = false; }
+  };
+  if (schedule) {
+    startScheduler();
+    watchdogTimer = setInterval(() => { void runWatchdog(); }, WORLD_TICK_WATCHDOG_INTERVAL_MS);
+    watchdogTimer.unref?.();
   }
   await tick();
-  onStatus({ running: true, worldId, tickMs });
+  try { onStatus({ running: true, worldId, tickMs: actualTickMs }); }
+  catch (error) { reportError(error, 'status_callback'); }
 
   return {
     running: true,
     worldId,
+    get worldLockOwned() { return diagnostics.worldLockOwned; },
+    getLiveness() {
+      return { running: !stopped, worldId, worldMinute: diagnostics.persistedWorldMinute,
+        tickCount: diagnostics.persistedTickCount, worldLockOwned: diagnostics.worldLockOwned,
+        worldLockOwnerPid: diagnostics.worldLockOwnerPid,
+        schedulerRunning: diagnostics.schedulerRunning, tickInProgress: diagnostics.tickInProgress,
+        activeTickStartedAt: diagnostics.activeTickStartedAt, lastSchedulerFireAt: diagnostics.lastSchedulerFireAt,
+        lastTickPhase: diagnostics.lastTickPhase, lastSuccessfulPhase: diagnostics.lastSuccessfulPhase,
+        lastTickStartedAt: diagnostics.lastTickStartedAt, lastTickCompletedAt: diagnostics.lastTickCompletedAt,
+        lastTickError: diagnostics.lastTickError, lastEngineError: diagnostics.lastEngineError,
+        watchdogLastRecoveryAt: diagnostics.watchdogLastRecoveryAt };
+    },
     tickOnce: tick,
     async stop() {
       if (stopped) return;
       stopped = true;
       if (timer) clearInterval(timer);
+      timer = null;
+      diagnostics.schedulerRunning = false;
+      if (watchdogTimer) clearInterval(watchdogTimer);
+      watchdogTimer = null;
       if (activeTick) await activeTick;
       if (typeSafeTask) await typeSafeTask;
       if (fruitflyTask) await fruitflyTask;
-      try { await lockClient.query(`SELECT pg_advisory_unlock(hashtextextended('synterra-world-engine',0))`); }
+      try {
+        const unlock = await lockClient.query(`SELECT pg_advisory_unlock(hashtextextended('synterra-world-engine',0)) AS unlocked`);
+        diagnostics.worldLockOwned = !unlock.rows[0]?.unlocked;
+      } catch (error) { diagnostics.worldLockOwned = false; reportError(error, 'lock_release'); }
       finally { lockClient.release(); }
     }
   };
