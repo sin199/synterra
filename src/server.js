@@ -24,7 +24,8 @@ import { shareWorldInformation, decideWorldInformationShare, listInformationInbo
 import { readEmergenceReport } from './world-emergence.js';
 import { createWorldCapabilityProposal, readWorldCapabilitySummary, reviewWorldCapabilityExperiment,
   reviewWorldCapabilityProposal, performWorldCapabilityUse } from './world-capabilities.js';
-import { readV6LifecycleObserverState, readWorldV6Lifecycle, startV6LifecycleObserver } from './world-v6-lifecycle-observer.js';
+import { readV6LifecycleObserverState, readWorldV6Lifecycle, startV6LifecycleObserver,
+  safeV6LifecycleObserverError, unavailableV6LifecycleObserverStatus } from './world-v6-lifecycle-observer.js';
 import { createWorldCommitment, listWorldAgreements, listWorldInstitutionSummary, proposeOrganizationGovernance,
   proposeWorldAgreement, resolveWorldCommitment, respondToWorldAgreement, voteOrganizationProposal } from './world-institutions.js';
 import { closeWorldBusiness, distributeWorldBusinessProfit, distributeWorldProjectRevenue,
@@ -50,7 +51,7 @@ const pool = new Pool({ connectionString: process.env.DATABASE_URL, connectionTi
 const app = Fastify({ logger: false, bodyLimit: 1_000_000 });
 const challenges = new Map();
 let worldEngine = { running: false, reason: 'starting' };
-let stopV6LifecycleObserver = null;
+let v6LifecycleObserver = null;
 const HOST = process.env.HOST || '127.0.0.1';
 const PORT = Number(process.env.PORT || 8787);
 const ARC_ENV = process.env.ARC_ENV || 'mainnet';
@@ -194,7 +195,8 @@ app.addHook('preHandler', async (request, reply) => {
   const pathOnly = request.raw.url?.split('?')[0] || '';
   const localResidentDetail = /^\/local\/map-data\/residents\/[^/]+$/.test(pathOnly)
     && ['127.0.0.1', '::1', 'localhost'].includes(HOST);
-  if (pathOnly === '/' || pathOnly === '/styles.css' || pathOnly === '/app.js' || pathOnly === '/world3d.js' || pathOnly === '/public/stats' ||
+  if (pathOnly === '/' || pathOnly === '/styles.css' || pathOnly === '/app.js' || pathOnly === '/world3d.js' ||
+      pathOnly === '/v6-observer-status.js' || pathOnly === '/public/stats' ||
       pathOnly === '/local/map-data' || localResidentDetail || pathOnly === '/health' || pathOnly === '/v1/agents/challenges' || pathOnly === '/v1/agents') return;
 
   const agentId = request.headers['x-agent-id'];
@@ -249,6 +251,27 @@ app.get('/world3d.js', async (_request, reply) => {
   return readFile(path.join(SITE_ROOT, 'world3d.js'));
 });
 
+app.get('/v6-observer-status.js', async (_request, reply) => {
+  reply.header('Content-Type', 'text/javascript; charset=utf-8');
+  reply.header('X-Content-Type-Options', 'nosniff');
+  return readFile(path.join(SITE_ROOT, 'v6-observer-status.js'));
+});
+
+async function readV6LifecycleObserverRuntimeStatus(snapshot, worldId = worldEngine.worldId || null) {
+  if (v6LifecycleObserver?.worldId === worldId) return v6LifecycleObserver.getStatus();
+  let savedSnapshot = snapshot;
+  let lastError = null;
+  if (savedSnapshot === undefined) {
+    try { savedSnapshot = await readV6LifecycleObserverState(path.join(STATE_DIR, 'v6-observations'), worldId); }
+    catch (error) { lastError = safeV6LifecycleObserverError(error); }
+  }
+  const reason = !worldEngine.running
+    ? worldEngine.reason === 'starting' ? 'world_engine_starting' : 'world_engine_not_running'
+    : !worldEngine.worldLockOwned ? 'world_lock_not_owned'
+      : v6LifecycleObserver ? 'observer_world_mismatch' : 'observer_not_registered';
+  return unavailableV6LifecycleObserverStatus({ worldId, snapshot: savedSnapshot, reason, lastError });
+}
+
 app.get('/health', async () => {
   const engine = worldEngine.getLiveness?.() || { running: worldEngine.running,
     worldId: worldEngine.worldId || null, worldLockOwned: Boolean(worldEngine.worldLockOwned), schedulerRunning: false };
@@ -262,12 +285,16 @@ app.get('/health', async () => {
       query_timeout: 5_000
     });
     const row = result.rows[0] || null;
+    const observerStatus = await readV6LifecycleObserverRuntimeStatus();
     return { service: 'synterra', chainId: CHAIN_ID,
       ...buildWorldLiveness({ databaseHealthy: true, runtime: row,
-        engine, checkedAt: row?.database_time || new Date() }) };
+        engine, checkedAt: row?.database_time || new Date() }),
+      v6LifecycleObserver: observerStatus };
   } catch {
+    const observerStatus = await readV6LifecycleObserverRuntimeStatus();
     return { service: 'synterra', chainId: CHAIN_ID,
-      ...buildWorldLiveness({ databaseHealthy: false, runtime: null, engine, checkedAt: new Date() }) };
+      ...buildWorldLiveness({ databaseHealthy: false, runtime: null, engine, checkedAt: new Date() }),
+      v6LifecycleObserver: observerStatus };
   }
 });
 
@@ -437,17 +464,15 @@ app.get('/local/map-data', async (_request, reply) => {
   const institutions = await listWorldInstitutionSummary(pool, { worldId, limit: 10 });
   const capabilities = await readWorldCapabilitySummary(pool, { worldId, limit: 30 });
   const v7 = await readWorldV7Summary(pool, { worldId, limit: 12 });
-  const [v6Lifecycle, v6ObserverState] = await Promise.all([
-    readWorldV6Lifecycle(pool, { worldId, worldMinute: worldMinutes }),
-    readV6LifecycleObserverState(path.join(STATE_DIR, 'v6-observations'), worldId)
-  ]);
-  v6Lifecycle.observerSnapshot = v6ObserverState;
+  const v6Lifecycle = await readWorldV6Lifecycle(pool, { worldId, worldMinute: worldMinutes });
+  const v6LifecycleObserverStatus = await readV6LifecycleObserverRuntimeStatus(undefined, worldId);
   const worldEvolution = { dashboard: { ...counts.rows[0], worldMinutes, worldAgeHours: Math.round(worldMinutes / 60),
       worldAgeDays: Math.floor(worldMinutes / 1_440) + 1,
       totalSimulatedWealthUsd: (Number(economyDashboard.rows[0]?.total_resident_net_worth_usd || 0)
         + [...memeValueByAgent.values()].reduce((sum, value) => sum + value, 0)).toFixed(2),
         totalInternalUnits: internalUnits.rows[0].units }, opportunities: opportunities.rows, projects,
-    organizations, institutions, capabilities, v6Lifecycle, v7, history: history.rows };
+    organizations, institutions, capabilities, v6Lifecycle, v6LifecycleObserver: v6LifecycleObserverStatus,
+    v7, history: history.rows };
   worldEvolution.economy = { dashboard: economyDashboard.rows[0] || {}, businesses,
     demand: economicDemand.rows, history: economyHistory.rows, recovery: recoveryMetrics,
     settlement: 'simulated_internal_ledger', chainSettlementEnabled: false };
@@ -2366,8 +2391,10 @@ try {
   reportWorldEngineError({ error, stage: 'startup', worldId: null, onError: logWorldEngineError });
 }
 if (worldEngine.running && worldEngine.worldLockOwned && worldEngine.worldId) {
-  stopV6LifecycleObserver = startV6LifecycleObserver({ pool, worldId: worldEngine.worldId,
+  const observerWorldId = worldEngine.worldId;
+  v6LifecycleObserver = startV6LifecycleObserver({ pool, worldId: observerWorldId,
     directory: path.join(STATE_DIR, 'v6-observations'),
+    isOwner: () => worldEngine.running && worldEngine.worldLockOwned && worldEngine.worldId === observerWorldId,
     onError: (error) => app.log.error({ err: error }, 'read-only V6 lifecycle observer snapshot failed') });
 }
 const adultServiceExpiryTimer = setInterval(() => {
@@ -2387,7 +2414,7 @@ async function shutdown() {
   clearInterval(adultServiceExpiryTimer);
   clearInterval(cryptoMarketTimer);
   clearInterval(robinhoodMarketTimer);
-  await stopV6LifecycleObserver?.();
+  await v6LifecycleObserver?.stop();
   await worldEngine.stop?.();
   await app.close();
   await pool.end();

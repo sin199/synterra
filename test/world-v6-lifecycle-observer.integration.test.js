@@ -119,8 +119,16 @@ test('V6 lifecycle observer reports natural no-action, funnel state, usage, and 
       VALUES($1,$2,'capability.created','capability',2200,'{}'::jsonb,'observer-v7-capability-event')`, [worldId, agents[1]]);
     const before = await pool.query(`SELECT (SELECT world_minutes FROM world_runtime_state WHERE world_id=$1) AS minute,
         (SELECT count(*)::int FROM world_capability_gaps WHERE world_id=$1) AS gaps,
+        (SELECT count(*)::int FROM world_capability_observations WHERE world_id=$1) AS observations,
         (SELECT count(*)::int FROM world_capability_proposals WHERE world_id=$1) AS proposals,
-        (SELECT count(*)::int FROM world_capability_events WHERE world_id=$1) AS events`, [worldId]);
+        (SELECT count(*)::int FROM world_capability_reviews WHERE world_id=$1) AS reviews,
+        (SELECT count(*)::int FROM world_capability_experiments WHERE world_id=$1) AS experiments,
+        (SELECT count(*)::int FROM world_capability_uses WHERE world_id=$1) AS uses,
+        (SELECT count(*)::int FROM world_capability_events WHERE world_id=$1) AS events,
+        (SELECT count(*)::int FROM world_capabilities WHERE world_id=$1) AS capabilities,
+        (SELECT count(*)::int FROM world_capability_dependencies WHERE world_id=$1) AS dependencies,
+        (SELECT count(*)::int FROM world_v7_events WHERE world_id=$1) AS v7_events,
+        (SELECT count(*)::int FROM world_history WHERE world_id=$1) AS history`, [worldId]);
 
     // The engine prunes decision traces; lifecycle events remain authoritative.
     await pool.query('DELETE FROM world_decision_traces WHERE world_id=$1', [worldId]);
@@ -160,12 +168,21 @@ test('V6 lifecycle observer reports natural no-action, funnel state, usage, and 
     const state = await captureV6LifecycleSnapshot(pool, { worldId, directory: snapshotDirectory,
       now: new Date('2026-10-06T10:00:00.000Z') });
     assert.equal(state.latestWorldMinute, 3_000);
+    assert.equal(state.latestFindingCount, result.integrity.findings.length);
     const persisted = JSON.parse(await readFile(path.join(snapshotDirectory, 'v6-lifecycle-observer.json'), 'utf8'));
     assert.equal(persisted.snapshots.length, 1);
     const after = await pool.query(`SELECT (SELECT world_minutes FROM world_runtime_state WHERE world_id=$1) AS minute,
         (SELECT count(*)::int FROM world_capability_gaps WHERE world_id=$1) AS gaps,
+        (SELECT count(*)::int FROM world_capability_observations WHERE world_id=$1) AS observations,
         (SELECT count(*)::int FROM world_capability_proposals WHERE world_id=$1) AS proposals,
-        (SELECT count(*)::int FROM world_capability_events WHERE world_id=$1) AS events`, [worldId]);
+        (SELECT count(*)::int FROM world_capability_reviews WHERE world_id=$1) AS reviews,
+        (SELECT count(*)::int FROM world_capability_experiments WHERE world_id=$1) AS experiments,
+        (SELECT count(*)::int FROM world_capability_uses WHERE world_id=$1) AS uses,
+        (SELECT count(*)::int FROM world_capability_events WHERE world_id=$1) AS events,
+        (SELECT count(*)::int FROM world_capabilities WHERE world_id=$1) AS capabilities,
+        (SELECT count(*)::int FROM world_capability_dependencies WHERE world_id=$1) AS dependencies,
+        (SELECT count(*)::int FROM world_v7_events WHERE world_id=$1) AS v7_events,
+        (SELECT count(*)::int FROM world_history WHERE world_id=$1) AS history`, [worldId]);
     assert.deepEqual(after.rows[0], before.rows[0], 'observer queries and file snapshots do not mutate lifecycle source tables or world time');
   } finally {
     await pool.query('DELETE FROM worlds WHERE id=$1', [worldId]).catch(() => {});

@@ -1,4 +1,5 @@
 import { createWorld3D } from './world3d.js';
+import { formatV6LifecycleObserverStatus } from './v6-observer-status.js';
 
 const worldCount = document.querySelector('#world-count');
 const residentCount = document.querySelector('#resident-count');
@@ -25,7 +26,7 @@ const projectList = document.querySelector('#world-project-list');
 const organizationList = document.querySelector('#world-organization-list');
 const institutionsList = document.querySelector('#world-institutions-list');
 const worldV6LifecycleSummary = document.querySelector('#world-v6-lifecycle-summary');
-const worldV6LifecycleSnapshot = document.querySelector('#world-v6-lifecycle-snapshot');
+const worldV6LifecycleObserverStatus = document.querySelector('#world-v6-lifecycle-observer-status');
 const worldV6LifecycleStats = document.querySelector('#world-v6-lifecycle-stats');
 const worldV6LifecycleGapsList = document.querySelector('#world-v6-lifecycle-gaps-list');
 const worldV6LifecycleIntegrityList = document.querySelector('#world-v6-lifecycle-integrity-list');
@@ -831,12 +832,14 @@ function renderWorldEvolution() {
   const proposalReviews = v6Lifecycle.reviews?.proposal || {};
   const experimentReviews = v6Lifecycle.reviews?.experiment || {};
   const v6Usage = v6Lifecycle.usage || {};
-  const observerSnapshot = v6Lifecycle.observerSnapshot;
+  const observerStatus = evolution.v6LifecycleObserver;
   if (worldV6LifecycleSummary) worldV6LifecycleSummary.textContent =
     `第 ${displayCount(v6Lifecycle.worldMinute)} 世界分钟 · V6/V7 记录并列读取；ignore / retain_current_approach 按有效自主 no-action 记录。`;
-  if (worldV6LifecycleSnapshot) worldV6LifecycleSnapshot.textContent = observerSnapshot?.latestSnapshotAt
-    ? `快照 ${new Date(observerSnapshot.latestSnapshotAt).toLocaleString()} · 分钟 ${displayCount(observerSnapshot.latestWorldMinute)} · ${displayCount(observerSnapshot.snapshotCount)} 条`
-    : '持续观察快照初始化中';
+  if (worldV6LifecycleObserverStatus) {
+    worldV6LifecycleObserverStatus.textContent = formatV6LifecycleObserverStatus(observerStatus);
+    worldV6LifecycleObserverStatus.dataset.state = !observerStatus ? 'unreported'
+      : observerStatus.available && observerStatus.running ? observerStatus.lastError ? 'degraded' : 'running' : 'unavailable';
+  }
   worldV6LifecycleStats?.replaceChildren();
   for (const [label, value] of [
     ['能力缺口 · 成熟 / 未成熟', `${displayCount(v6Counts.matureGaps)} / ${displayCount(v6Counts.immatureGaps)}`],

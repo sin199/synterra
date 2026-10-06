@@ -174,6 +174,11 @@
 .capability-epoch h4{margin-bottom:5px}
 .capability-epoch p{margin:0;color:#879380;font:8px/1.55 var(--mono)}
 .capability-epoch>span{flex:0 0 auto;color:#b6c29f;font:8px/1.5 var(--mono);text-align:right}
+#world-v6-lifecycle-observer-status{max-width:min(70%,720px);white-space:normal;overflow-wrap:anywhere}
+#world-v6-lifecycle-observer-status[data-state="running"]{color:#80c990}
+#world-v6-lifecycle-observer-status[data-state="degraded"]{color:#e5b565}
+#world-v6-lifecycle-observer-status[data-state="unavailable"]{color:#e58a83}
+#world-v6-lifecycle-observer-status[data-state="unreported"]{color:#b6c29f}
 .capability-evolution-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
 .capability-evolution-grid section{min-width:0;padding-top:10px;border-top:1px solid rgba(224,238,211,.08)}
 .capability-evolution-grid h5{margin:0 0 8px;color:#a7b39f;font:500 9px var(--display)}
@@ -183,4 +188,4 @@
 .capability-evolution-grid li span{color:#879380;font:8px/1.5 var(--mono);overflow-wrap:anywhere}
 .world-evolution-empty{grid-column:1/-1;margin:0;padding:9px 0;color:#798574;font-size:10px;line-height:1.6}
 .emergence-audit-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin-top:10px}
-@media(max-width:620px){.world-evolution{padding:16px}.evolution-heading{align-items:flex-start;flex-direction:column;gap:8px}.evolution-heading>span{text-align:left}.world-evolution-stats{grid-template-columns:repeat(2,minmax(0,1fr))}.world-evolution-grid,.emergence-audit-grid,.capability-evolution-grid{grid-template-columns:1fr}.world-evolution-stat{padding:11px}.capability-epoch{flex-direction:column}.capability-epoch>span{text-align:left}}
+@media(max-width:620px){.world-evolution{padding:16px}.evolution-heading{align-items:flex-start;flex-direction:column;gap:8px}.evolution-heading>span{text-align:left}.world-evolution-stats{grid-template-columns:repeat(2,minmax(0,1fr))}.world-evolution-grid,.emergence-audit-grid,.capability-evolution-grid{grid-template-columns:1fr}.world-evolution-stat{padding:11px}.capability-epoch{flex-direction:column}.capability-epoch>span{text-align:left}#world-v6-lifecycle-observer-status{max-width:100%}}

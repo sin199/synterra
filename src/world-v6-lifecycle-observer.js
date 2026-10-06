@@ -6,6 +6,8 @@ import { capabilityGraphDepth } from './world-v7.js';
 export const V6_LIFECYCLE_OBSERVER_INTERVAL_MS = 15 * 60_000;
 export const V6_LIFECYCLE_OBSERVER_SNAPSHOT_LIMIT = 96;
 
+let activeV6LifecycleObserver = null;
+
 function maturityForGap(gap, worldMinute) {
   const blockers = [];
   const observations = Number(gap.observationCount) || 0;
@@ -56,6 +58,7 @@ function compactSnapshot(summary, cursor, observedAt) {
       evaluatedExperiments: summary.experiments?.lifecycleCounts?.evaluated ?? 0,
       adoptedCapabilities: summary.counts.adoptedCapabilities,
       capabilityUses: summary.counts.capabilityUses,
+      integrityFindings: summary.integrity?.findings?.length ?? 0,
       dependencyDepth: summary.genealogy.maximumDepth,
       secondOrderCapabilities: summary.genealogy.secondOrderCapabilities
     }
@@ -432,17 +435,21 @@ export async function persistV6LifecycleSnapshot(directory, snapshot) {
     if (error.code !== 'ENOENT') throw error;
   }
   const previous = state.snapshots.at(-1) || null;
-  const sameCursor = previous && previous.cursor?.capabilityEventId === snapshot.cursor?.capabilityEventId
-    && previous.cursor?.v7EventCreatedAt === snapshot.cursor?.v7EventCreatedAt;
   const sameWorldMinute = previous?.worldMinute === snapshot.worldMinute;
-  if (!sameCursor || !sameWorldMinute) {
+  if (!sameWorldMinute) {
     const compact = compactSnapshot(snapshot.summary, snapshot.cursor, snapshot.observedAt);
     compact.deltaFromPrevious = numericDelta(compact.counts, previous?.counts);
     state.snapshots.push(compact);
     state.snapshots = state.snapshots.slice(-V6_LIFECYCLE_OBSERVER_SNAPSHOT_LIMIT);
-    state.latestSnapshotAt = snapshot.observedAt;
-    state.latestWorldMinute = snapshot.worldMinute;
+  } else if (previous) {
+    const priorDistinct = state.snapshots.at(-2) || null;
+    const compact = compactSnapshot(snapshot.summary, snapshot.cursor, snapshot.observedAt);
+    compact.deltaFromPrevious = numericDelta(compact.counts, priorDistinct?.counts);
+    state.snapshots[state.snapshots.length - 1] = compact;
   }
+  state.latestSnapshotAt = snapshot.observedAt;
+  state.latestWorldMinute = snapshot.worldMinute;
+  state.latestFindingCount = snapshot.summary.integrity?.findings?.length ?? 0;
   state.lastPollAt = snapshot.observedAt;
   state.lastObservationCursor = snapshot.cursor;
   const temporaryPath = `${statePath}.${process.pid}.tmp`;
@@ -451,7 +458,8 @@ export async function persistV6LifecycleSnapshot(directory, snapshot) {
   await rename(temporaryPath, statePath);
   await chmod(statePath, 0o600);
   return { lastPollAt: state.lastPollAt, latestSnapshotAt: state.latestSnapshotAt || null,
-    latestWorldMinute: state.latestWorldMinute ?? null, snapshotCount: state.snapshots.length,
+    latestWorldMinute: state.latestWorldMinute ?? null, latestFindingCount: state.latestFindingCount ?? null,
+    snapshotCount: state.snapshots.length,
     cursor: state.lastObservationCursor };
 }
 
@@ -461,11 +469,29 @@ export async function readV6LifecycleObserverState(directory, worldId) {
     if (state.schemaVersion !== 1 || state.worldId !== worldId || !Array.isArray(state.snapshots)) return null;
     return { lastPollAt: state.lastPollAt || null, latestSnapshotAt: state.latestSnapshotAt || null,
       latestWorldMinute: state.latestWorldMinute ?? null, snapshotCount: state.snapshots.length,
+      latestFindingCount: state.latestFindingCount ?? state.snapshots.at(-1)?.counts?.integrityFindings ?? null,
       lastObservationCursor: state.lastObservationCursor || null };
   } catch (error) {
     if (error.code === 'ENOENT') return null;
     throw error;
   }
+}
+
+export function unavailableV6LifecycleObserverStatus({ intervalMs = V6_LIFECYCLE_OBSERVER_INTERVAL_MS,
+  worldId = null, snapshot = null, reason = 'observer_not_registered', lastError = null } = {}) {
+  return {
+    available: false,
+    running: false,
+    worldId,
+    mode: 'read_only',
+    sourceOfTruth: 'database',
+    samplingIntervalMinutes: Math.max(60_000, intervalMs) / 60_000,
+    lastSampleAt: snapshot?.lastPollAt || snapshot?.latestSnapshotAt || null,
+    lastSampleWorldMinute: snapshot?.latestWorldMinute ?? null,
+    lastFindingCount: snapshot?.latestFindingCount ?? null,
+    lastError,
+    reason
+  };
 }
 
 export async function captureV6LifecycleSnapshot(pool, { worldId, directory, now = new Date() }) {
@@ -491,23 +517,133 @@ export async function captureV6LifecycleSnapshot(pool, { worldId, directory, now
   return persistV6LifecycleSnapshot(directory, { worldId, worldMinute: summary.worldMinute, summary, cursor, observedAt });
 }
 
+export function safeV6LifecycleObserverError(error) {
+  const code = String(error?.code || '').replace(/[^A-Za-z0-9_.-]/g, '').slice(0, 64);
+  let message = String(error?.message || error || 'unknown_error').replace(/[\r\n\t]/g, ' ');
+  for (const secret of [process.env.DATABASE_URL, process.env.TYPESAFE_API_KEY].filter(Boolean)) {
+    message = message.replaceAll(secret, '[redacted]');
+  }
+  message = message.replace(/postgres(?:ql)?:\/\/[^\s"'<>]+/gi, '[redacted database URL]')
+    .replace(/([?&](?:password|token|api_key)=)[^&\s]+/gi, '$1[redacted]').slice(0, 160);
+  return code ? `${code}: ${message}` : message;
+}
+
 export function startV6LifecycleObserver({ pool, worldId, directory, intervalMs = V6_LIFECYCLE_OBSERVER_INTERVAL_MS,
-  onError = () => {} }) {
+  onError = () => {}, captureSnapshot = captureV6LifecycleSnapshot, readState = readV6LifecycleObserverState,
+  schedule = setInterval, unschedule = clearInterval, isOwner = () => true }) {
+  if (activeV6LifecycleObserver) {
+    if (activeV6LifecycleObserver.worldId === worldId && activeV6LifecycleObserver.directory === directory) {
+      return activeV6LifecycleObserver;
+    }
+    throw new Error('V6_OBSERVER_ALREADY_REGISTERED');
+  }
+
   let stopped = false;
   let inFlight = null;
+  let timer = null;
+  let stateLoaded = false;
+  const status = {
+    available: true,
+    running: true,
+    worldId,
+    mode: 'read_only',
+    sourceOfTruth: 'database',
+    samplingIntervalMinutes: Math.max(60_000, intervalMs) / 60_000,
+    lastSampleAt: null,
+    lastSampleWorldMinute: null,
+    lastFindingCount: null,
+    lastError: null,
+    reason: null
+  };
+
+  const controller = {
+    worldId,
+    directory,
+    getStatus() {
+      verifyOwnership();
+      return { ...status, available: !stopped && status.available, running: !stopped && timer !== null };
+    },
+    async stop() {
+      if (!stopped) {
+        stopped = true;
+        status.reason ||= 'stopped';
+        if (timer !== null) unschedule(timer);
+        timer = null;
+      }
+      if (inFlight) await inFlight;
+      if (activeV6LifecycleObserver === controller) activeV6LifecycleObserver = null;
+    }
+  };
+  activeV6LifecycleObserver = controller;
+
+  function stopForUnavailableOwner(reason) {
+    stopped = true;
+    status.available = false;
+    status.running = false;
+    status.reason = reason;
+    if (timer !== null) unschedule(timer);
+    timer = null;
+    if (!inFlight && activeV6LifecycleObserver === controller) activeV6LifecycleObserver = null;
+  }
+
+  function verifyOwnership() {
+    if (stopped) return false;
+    try {
+      if (isOwner()) return true;
+      stopForUnavailableOwner('world_lock_not_owned');
+    } catch (error) {
+      status.lastError = safeV6LifecycleObserverError(error);
+      stopForUnavailableOwner('world_ownership_check_failed');
+    }
+    return false;
+  }
+
   const run = async () => {
-    if (stopped || inFlight) return inFlight;
-    inFlight = captureV6LifecycleSnapshot(pool, { worldId, directory })
-      .catch((error) => { onError(error); return null; })
-      .finally(() => { inFlight = null; });
+    if (!verifyOwnership() || inFlight) return inFlight;
+    inFlight = (async () => {
+      if (!stateLoaded) {
+        const savedState = await readState(directory, worldId);
+        stateLoaded = true;
+        if (savedState) {
+          status.lastSampleAt = savedState.lastPollAt || savedState.latestSnapshotAt || null;
+          status.lastSampleWorldMinute = savedState.latestWorldMinute ?? null;
+          status.lastFindingCount = savedState.latestFindingCount ?? null;
+        }
+      }
+      const sample = await captureSnapshot(pool, { worldId, directory });
+      status.lastSampleAt = sample.lastPollAt || sample.latestSnapshotAt || null;
+      status.lastSampleWorldMinute = sample.latestWorldMinute ?? null;
+      status.lastFindingCount = sample.latestFindingCount ?? null;
+      if (!verifyOwnership()) return sample;
+      status.lastError = null;
+      status.reason = null;
+      return sample;
+    })()
+      .catch((error) => {
+        status.lastError = safeV6LifecycleObserverError(error);
+        status.reason = 'last_sample_failed';
+        try { onError(error); } catch {}
+        return null;
+      })
+      .finally(() => {
+        inFlight = null;
+        if (stopped && activeV6LifecycleObserver === controller) activeV6LifecycleObserver = null;
+      });
     return inFlight;
   };
-  const timer = setInterval(() => { void run(); }, Math.max(60_000, intervalMs));
-  timer.unref();
-  void run();
-  return async () => {
-    stopped = true;
-    clearInterval(timer);
-    if (inFlight) await inFlight;
-  };
+  try {
+    timer = schedule(() => { void run(); }, Math.max(60_000, Number(intervalMs) || V6_LIFECYCLE_OBSERVER_INTERVAL_MS));
+    if (timer === null || timer === undefined) throw new Error('V6_OBSERVER_SCHEDULER_NOT_REGISTERED');
+    timer?.unref?.();
+    void run();
+  } catch (error) {
+    if (timer !== null && timer !== undefined) unschedule(timer);
+    timer = null;
+    status.available = false;
+    status.running = false;
+    status.lastError = safeV6LifecycleObserverError(error);
+    status.reason = 'scheduler_registration_failed';
+    try { onError(error); } catch {}
+  }
+  return controller;
 }
