@@ -524,6 +524,7 @@ app.get('/local/map-data', async (_request, reply) => {
   const capabilities = await readWorldCapabilitySummary(pool, { worldId, limit: 30 });
   const v7 = await readWorldV7Summary(pool, { worldId, limit: 12 });
   const v6Lifecycle = await readWorldV6Lifecycle(pool, { worldId, worldMinute: worldMinutes });
+  /* SLIM_V6 */ if (Array.isArray(v6Lifecycle?.proposalFunnel)) v6Lifecycle.proposalFunnel = v6Lifecycle.proposalFunnel.map(({ decisionEvents, proposals, ...rest }) => ({ ...rest, decisionEventCount: decisionEvents?.length || 0, proposals: (proposals || []).map((p) => ({ id: p.id })) }));
   const v6LifecycleObserverStatus = await readV6LifecycleObserverRuntimeStatus(undefined, worldId);
   const publicArcObserverStatus = arcPublicStatus();
   const worldEvolution = { dashboard: { ...counts.rows[0], worldMinutes, worldAgeHours: Math.round(worldMinutes / 60),
