@@ -976,7 +976,9 @@ CREATE TABLE IF NOT EXISTS world_history (
 DO $$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_history'::regclass
-      AND conname='world_history_event_type_check' AND pg_get_constraintdef(oid) LIKE '%project_proposed%') THEN
+      AND conname='world_history_event_type_check' AND pg_get_constraintdef(oid) LIKE '%project_proposed%')
+      AND NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_history'::regclass
+        AND conname='world_history_event_type_check' AND pg_get_constraintdef(oid) LIKE '%{1,79}%') THEN
     ALTER TABLE world_history DROP CONSTRAINT IF EXISTS world_history_event_type_check;
     ALTER TABLE world_history ADD CONSTRAINT world_history_event_type_check
       CHECK (event_type IN ('opportunity_created','project_proposed','project_started','project_completed','project_failed',
@@ -1678,7 +1680,9 @@ DO $$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_history'::regclass
       AND conname='world_history_event_type_check'
-      AND pg_get_constraintdef(oid) LIKE '%world_epoch_started%') THEN
+      AND pg_get_constraintdef(oid) LIKE '%world_epoch_started%')
+      AND NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_history'::regclass
+        AND conname='world_history_event_type_check' AND pg_get_constraintdef(oid) LIKE '%{1,79}%') THEN
     ALTER TABLE world_history DROP CONSTRAINT IF EXISTS world_history_event_type_check;
     ALTER TABLE world_history ADD CONSTRAINT world_history_event_type_check CHECK (
       event_type IN ('opportunity_created','project_proposed','project_started','project_completed','project_failed',
@@ -1695,7 +1699,9 @@ BEGIN
   END IF;
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_history'::regclass
       AND conname='world_history_entity_type_check'
-      AND pg_get_constraintdef(oid) LIKE '%capability_proposal%') THEN
+      AND pg_get_constraintdef(oid) LIKE '%capability_proposal%')
+      AND NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_history'::regclass
+        AND conname='world_history_entity_type_check' AND pg_get_constraintdef(oid) LIKE '%{1,79}%') THEN
     ALTER TABLE world_history DROP CONSTRAINT IF EXISTS world_history_entity_type_check;
     ALTER TABLE world_history ADD CONSTRAINT world_history_entity_type_check CHECK (
       entity_type IN ('opportunity','project','organization','place','cooperation','world','business','job','order','agreement','norm',
@@ -1725,7 +1731,9 @@ END $$;
 DO $$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_history'::regclass
-      AND conname='world_history_event_type_check' AND pg_get_constraintdef(oid) LIKE '%world_epoch_started%') THEN
+      AND conname='world_history_event_type_check' AND pg_get_constraintdef(oid) LIKE '%world_epoch_started%')
+      AND NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_history'::regclass
+        AND conname='world_history_event_type_check' AND pg_get_constraintdef(oid) LIKE '%{1,79}%') THEN
     ALTER TABLE world_history DROP CONSTRAINT IF EXISTS world_history_event_type_check;
     ALTER TABLE world_history ADD CONSTRAINT world_history_event_type_check CHECK (
       event_type IN ('opportunity_created','project_proposed','project_started','project_completed','project_failed',
@@ -1741,7 +1749,9 @@ BEGIN
     );
   END IF;
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_history'::regclass
-      AND conname='world_history_entity_type_check' AND pg_get_constraintdef(oid) LIKE '%capability_proposal%') THEN
+      AND conname='world_history_entity_type_check' AND pg_get_constraintdef(oid) LIKE '%capability_proposal%')
+      AND NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_history'::regclass
+        AND conname='world_history_entity_type_check' AND pg_get_constraintdef(oid) LIKE '%{1,79}%') THEN
     ALTER TABLE world_history DROP CONSTRAINT IF EXISTS world_history_entity_type_check;
     ALTER TABLE world_history ADD CONSTRAINT world_history_entity_type_check CHECK (
       entity_type IN ('opportunity','project','organization','place','cooperation','world','business','job','order',
@@ -1831,7 +1841,9 @@ BEGIN
       AND pg_get_constraintdef(oid) LIKE '%place_closed%'
       AND pg_get_constraintdef(oid) LIKE '%project_invested%'
       AND pg_get_constraintdef(oid) LIKE '%project_revenue%'
-      AND pg_get_constraintdef(oid) LIKE '%business_profit%') THEN
+      AND pg_get_constraintdef(oid) LIKE '%business_profit%')
+      AND NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_history'::regclass
+        AND conname='world_history_event_type_check' AND pg_get_constraintdef(oid) LIKE '%{1,79}%') THEN
     ALTER TABLE world_history DROP CONSTRAINT IF EXISTS world_history_event_type_check;
     ALTER TABLE world_history ADD CONSTRAINT world_history_event_type_check CHECK (event_type IN (
       'opportunity_created','project_proposed','project_started','project_completed','project_failed',
@@ -1843,7 +1855,9 @@ BEGIN
       'business_closed','business_employment','business_price_changed','business_partnership','business_capability_practiced','economic_purchase'));
   END IF;
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_history'::regclass
-      AND conname='world_history_entity_type_check' AND pg_get_constraintdef(oid) LIKE '%business%') THEN
+      AND conname='world_history_entity_type_check' AND pg_get_constraintdef(oid) LIKE '%business%')
+      AND NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_history'::regclass
+        AND conname='world_history_entity_type_check' AND pg_get_constraintdef(oid) LIKE '%{1,79}%') THEN
     ALTER TABLE world_history DROP CONSTRAINT IF EXISTS world_history_entity_type_check;
     ALTER TABLE world_history ADD CONSTRAINT world_history_entity_type_check
       CHECK (entity_type IN ('opportunity','project','organization','place','cooperation','world','business','job','order'));
@@ -2099,7 +2113,9 @@ BEGIN
       AND pg_get_constraintdef(oid) LIKE '%agreement_rejected%' AND pg_get_constraintdef(oid) LIKE '%norm_formed%'
       AND pg_get_constraintdef(oid) LIKE '%ownership_transferred%'
       AND pg_get_constraintdef(oid) LIKE '%business_reopened%'
-      AND pg_get_constraintdef(oid) LIKE '%[a-z_]+$%') THEN
+      AND pg_get_constraintdef(oid) LIKE '%[a-z_]+$%')
+      AND NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_history'::regclass
+        AND conname='world_history_event_type_check' AND pg_get_constraintdef(oid) LIKE '%{1,79}%') THEN
     ALTER TABLE world_history DROP CONSTRAINT IF EXISTS world_history_event_type_check;
     ALTER TABLE world_history ADD CONSTRAINT world_history_event_type_check CHECK (event_type IN (
       'opportunity_created','project_proposed','project_started','project_completed','project_failed',
@@ -2114,7 +2130,9 @@ BEGIN
   END IF;
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_history'::regclass
       AND conname='world_history_entity_type_check' AND pg_get_constraintdef(oid) LIKE '%agreement%'
-      AND pg_get_constraintdef(oid) LIKE '%norm%') THEN
+      AND pg_get_constraintdef(oid) LIKE '%norm%')
+      AND NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='world_history'::regclass
+        AND conname='world_history_entity_type_check' AND pg_get_constraintdef(oid) LIKE '%{1,79}%') THEN
     ALTER TABLE world_history DROP CONSTRAINT IF EXISTS world_history_entity_type_check;
     ALTER TABLE world_history ADD CONSTRAINT world_history_entity_type_check
       CHECK (entity_type IN ('opportunity','project','organization','place','cooperation','world','business','job','order','agreement','norm'));

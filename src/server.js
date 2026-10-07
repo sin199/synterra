@@ -21,10 +21,17 @@ import { buildWorldLiveness, reportWorldEngineError } from './world-engine-diagn
 import { arcNetworkConfig } from './arc/config.js';
 import { ArcRpcClient } from './arc/rpc.js';
 import { enqueueArcAgentEconomicAction } from './arc/agent-economic-action.js';
-import { loadConfiguredArcSigner } from './arc/signer-loader.js';
+import { loadConfiguredArcInfrastructureSigner, loadConfiguredArcSigner } from './arc/signer-loader.js';
 import { startArcSettlementOutboxWorker } from './arc/settlement-worker.js';
+import { startArcAgentTokenIssuanceWorker } from './arc/token-issuance-worker.js';
 import { startArcReadOnlyObserver } from './arc/observer.js';
 import { summarizeArcObserverHealth } from './arc/status.js';
+import { createWorldTokenIssuanceIntent, updateWorldTokenIssuanceSpecification,
+  respondToWorldTokenIssuance, confirmWorldTokenIssuance, nominateWorldTokenIssuer,
+  decideWorldTokenIssuerCandidate, listWorldTokenIssuance,
+  decideWorldAgentTokenAcceptance, recordWorldAgentTokenUse, readWorldAgentTokenSummary } from './world-token-issuance.js';
+import { AGENT_TOKEN_HUMAN_SUPPLY, AGENT_TOKEN_PILOT_GENERATION,
+  AGENT_TOKEN_PILOT_MAX_CREATIONS } from './arc/token-issuance.js';
 import { createWorldOpportunity, decideWorldOpportunity, listAvailableOpportunities } from './world-opportunities.js';
 import { proposeWorldProject, decideProjectMembership, contributeToProject, listWorldProjects } from './world-projects.js';
 import { foundWorldOrganization, inviteWorldOrganization, decideOrganizationMembership,
@@ -63,9 +70,12 @@ let worldEngine = { running: false, reason: 'starting' };
 let v6LifecycleObserver = null;
 let arcObserver = null;
 let arcSigner = null;
+let arcInfrastructureSigner = null;
 let arcSignerSetupError = null;
 let arcSettlementWorker = null;
+let arcAgentTokenIssuanceWorker = null;
 let arcSchemaReady = false;
+let arcTokenSchemaReady = false;
 let arcSetupReason = 'arc_schema_migration_required';
 const HOST = process.env.HOST || '127.0.0.1';
 const PORT = Number(process.env.PORT || 8787);
@@ -335,7 +345,10 @@ app.get('/health', async () => {
       arcObserver: arcObserverStatus,
       arcSettlementWorker: arcSettlementWorker?.getStatus() || { available: true, running: false,
         mode: 'mainnet_write_gated', providerName: arcSigner?.providerName || null,
-        reason: arcSignerSetupError || 'mainnet_write_gate_closed' } };
+        reason: arcSignerSetupError || 'mainnet_write_gate_closed' },
+      arcAgentTokenIssuanceWorker: arcAgentTokenIssuanceWorker?.getStatus() || {
+        available: arcTokenSchemaReady, running: false, mode: 'read_only_reconciliation',
+        writesEnabled: false, reason: arcTokenSchemaReady ? 'worker_not_registered' : 'arc_token_issuance_migration_required' } };
   } catch {
     const observerStatus = await readV6LifecycleObserverRuntimeStatus();
     const arcObserverStatus = arcPublicStatus();
@@ -347,7 +360,10 @@ app.get('/health', async () => {
       arcObserver: arcObserverStatus,
       arcSettlementWorker: arcSettlementWorker?.getStatus() || { available: true, running: false,
         mode: 'mainnet_write_gated', providerName: arcSigner?.providerName || null,
-        reason: arcSignerSetupError || 'mainnet_write_gate_closed' } };
+        reason: arcSignerSetupError || 'mainnet_write_gate_closed' },
+      arcAgentTokenIssuanceWorker: arcAgentTokenIssuanceWorker?.getStatus() || {
+        available: arcTokenSchemaReady, running: false, mode: 'read_only_reconciliation',
+        writesEnabled: false, reason: arcTokenSchemaReady ? 'worker_not_registered' : 'arc_token_issuance_migration_required' } };
   }
 });
 
@@ -527,6 +543,16 @@ app.get('/local/map-data', async (_request, reply) => {
   /* SLIM_V6 */ if (Array.isArray(v6Lifecycle?.proposalFunnel)) v6Lifecycle.proposalFunnel = v6Lifecycle.proposalFunnel.map(({ decisionEvents, proposals, ...rest }) => ({ ...rest, decisionEventCount: decisionEvents?.length || 0, proposals: (proposals || []).map((p) => ({ id: p.id })) }));
   const v6LifecycleObserverStatus = await readV6LifecycleObserverRuntimeStatus(undefined, worldId);
   const publicArcObserverStatus = arcPublicStatus();
+  const agentTokenIssuance = arcTokenSchemaReady
+    ? { available: true, ...await readWorldAgentTokenSummary(pool, { worldId }),
+      intents: await listWorldTokenIssuance(pool, { worldId, limit: 12 }) }
+    : { available: false, reason: 'arc_token_issuance_migration_required', counts: null,
+      tokens: [], intents: [], createdTokenCount: 0 };
+  agentTokenIssuance.mode = 'agent_decided';
+  agentTokenIssuance.writesEnabled = ARC_CONFIG.writesEnabled;
+  agentTokenIssuance.fixedHumanSupply = AGENT_TOKEN_HUMAN_SUPPLY;
+  agentTokenIssuance.currentPilotLimit = AGENT_TOKEN_PILOT_MAX_CREATIONS;
+  agentTokenIssuance.pilotGeneration = AGENT_TOKEN_PILOT_GENERATION;
   const worldEvolution = { dashboard: { ...counts.rows[0], worldMinutes, worldAgeHours: Math.round(worldMinutes / 60),
       worldAgeDays: Math.floor(worldMinutes / 1_440) + 1,
       totalSimulatedWealthUsd: (Number(economyDashboard.rows[0]?.total_resident_net_worth_usd || 0)
@@ -538,6 +564,13 @@ app.get('/local/map-data', async (_request, reply) => {
     arcSettlementWorker: arcSettlementWorker?.getStatus() || { available: true, running: false,
       mode: 'mainnet_write_gated', providerName: arcSigner?.providerName || null,
       reason: arcSignerSetupError || 'mainnet_write_gate_closed' },
+    arcAgentTokenIssuanceWorker: arcAgentTokenIssuanceWorker?.getStatus() || {
+      available: arcTokenSchemaReady, running: false, mode: 'read_only_reconciliation',
+      writesEnabled: false, reason: arcTokenSchemaReady ? 'worker_not_registered' : 'arc_token_issuance_migration_required' },
+    agentTokenIssuance: { ...agentTokenIssuance,
+      worker: arcAgentTokenIssuanceWorker?.getStatus() || { available: arcTokenSchemaReady,
+        running: false, mode: 'read_only_reconciliation', writesEnabled: false,
+        reason: arcTokenSchemaReady ? 'worker_not_registered' : 'arc_token_issuance_migration_required' } },
     v7, history: history.rows };
   worldEvolution.economy = { dashboard: economyDashboard.rows[0] || {}, businesses,
     demand: economicDemand.rows, history: economyHistory.rows, recovery: recoveryMetrics,
@@ -1095,6 +1128,8 @@ app.get('/v1/worlds/:worldId/observe', async (request, reply) => {
         AND b.status IN ('pending','accepted') ORDER BY b.created_at DESC LIMIT 20`, [worldId, request.agentId])
   ]);
   const self = me.rows[0];
+  const tokenIssuanceIntents = arcTokenSchemaReady
+    ? await listWorldTokenIssuance(pool, { worldId, limit: 30 }) : [];
   const [trading, risk, recentCryptoOrders, robinhoodPaper] = await Promise.all([
     accountSnapshot(pool, worldId, request.agentId, cryptoQuotes),
     pool.query(`SELECT starting_usdc::text AS "startingUsdc",max_order_nav_bps AS "maxOrderNavBps",
@@ -1111,6 +1146,10 @@ app.get('/v1/worlds/:worldId/observe', async (request, reply) => {
       internalUnitsAreOnChain: false },
     self: { agentId: request.agentId, role: self.role, energy: self.energy, food: self.food, social: self.social, location: self.location, internalTokenUnits: balance.rows[0].units },
     members: members.rows, events: events.rows, consents: consents.rows, mines: mines.rows, scenes: scenes.rows, mind: mind.rows[0] || null,
+    agentTokenIssuance: { available: arcTokenSchemaReady, mode: 'agent_decided', currentPilotLimit: AGENT_TOKEN_PILOT_MAX_CREATIONS,
+      pilotGeneration: AGENT_TOKEN_PILOT_GENERATION, fixedHumanSupply: AGENT_TOKEN_HUMAN_SUPPLY,
+      decimalsRange: [0, 18], writesEnabled: ARC_CONFIG.writesEnabled,
+      intents: tokenIssuanceIntents },
     adultServices: adultServices.rows,
     adultServiceBookings: adultServiceBookings.rows,
     market: { quotes: cryptoQuotes, simulated: true, robinhood: robinhoodMarket },
@@ -2224,6 +2263,130 @@ app.post('/v1/worlds/:worldId/policy-experiments/:experimentId/decision', async 
     { ...input, experimentId: request.params.experimentId })));
 app.post('/v1/worlds/:worldId/extension-requests', async (request, reply) =>
   runWorldV7Action(request, reply, createWorldExtensionRequest));
+app.get('/v1/worlds/:worldId/token-issuance', async (request, reply) => {
+  const { worldId } = request.params;
+  if (!validUuid(worldId)) return fail(reply, 400, 'WORLD_ID_INVALID');
+  await assertMember(pool, worldId, request.agentId);
+  if (!arcTokenSchemaReady) return fail(reply, 503, 'ARC_TOKEN_ISSUANCE_MIGRATION_REQUIRED');
+  return { tokenIssuance: await listWorldTokenIssuance(pool, { worldId,
+    limit: Math.min(100, Math.max(1, Number(request.query.limit) || 30)) }) };
+});
+app.post('/v1/worlds/:worldId/token-issuance/intents', async (request, reply) => {
+  const { worldId } = request.params;
+  const body = request.body || {};
+  if (!validUuid(worldId) || Object.hasOwn(body, 'issuerAgentId')) return fail(reply, 400, 'TOKEN_ISSUER_SELECTION_REQUIRES_AGENT_INTERACTION');
+  if (!arcTokenSchemaReady) return fail(reply, 503, 'ARC_TOKEN_ISSUANCE_MIGRATION_REQUIRED');
+  const actionId = requireActionId(body);
+  const result = await transaction(async (client) => {
+    await assertMember(client, worldId, request.agentId, true);
+    return createWorldTokenIssuanceIntent(client, { worldId, agentId: request.agentId,
+      specification: body.specification || {}, actionId,
+      worldMinute: await readWorldMinutes(client, worldId) });
+  });
+  return reply.code(result.created ? 201 : 200).send(result);
+});
+app.patch('/v1/worlds/:worldId/token-issuance/intents/:intentId/specification', async (request, reply) => {
+  const { worldId, intentId } = request.params;
+  const body = request.body || {};
+  if (!validUuid(worldId) || !validUuid(intentId)) return fail(reply, 400, 'TOKEN_ISSUANCE_ID_INVALID');
+  if (Object.hasOwn(body, 'issuerAgentId')) return fail(reply, 400, 'TOKEN_ISSUER_SELECTION_REQUIRES_AGENT_INTERACTION');
+  if (!arcTokenSchemaReady) return fail(reply, 503, 'ARC_TOKEN_ISSUANCE_MIGRATION_REQUIRED');
+  const actionId = requireActionId(body);
+  const result = await transaction(async (client) => {
+    await assertMember(client, worldId, request.agentId, true);
+    return updateWorldTokenIssuanceSpecification(client, { worldId, agentId: request.agentId, intentId,
+      specification: body.specification, actionId,
+      worldMinute: await readWorldMinutes(client, worldId) });
+  });
+  return reply.send(result);
+});
+app.post('/v1/worlds/:worldId/token-issuance/intents/:intentId/issuer-candidates', async (request, reply) => {
+  const { worldId, intentId } = request.params;
+  const body = request.body || {};
+  if (!validUuid(worldId) || !validUuid(intentId) || !validUuid(body.candidateAgentId)) {
+    return fail(reply, 400, 'TOKEN_ISSUER_CANDIDATE_INVALID');
+  }
+  if (!arcTokenSchemaReady) return fail(reply, 503, 'ARC_TOKEN_ISSUANCE_MIGRATION_REQUIRED');
+  const actionId = requireActionId(body);
+  const result = await transaction(async (client) => {
+    await assertMember(client, worldId, request.agentId, true);
+    return nominateWorldTokenIssuer(client, { worldId, agentId: request.agentId, intentId,
+      candidateAgentId: body.candidateAgentId, nominationReason: body.nominationReason ?? null,
+      actionId, worldMinute: await readWorldMinutes(client, worldId) });
+  });
+  return reply.code(result.idempotent ? 200 : 201).send(result);
+});
+app.post('/v1/worlds/:worldId/token-issuance/intents/:intentId/issuer-candidates/:candidateAgentId/decision', async (request, reply) => {
+  const { worldId, intentId, candidateAgentId } = request.params;
+  const body = request.body || {};
+  if (!validUuid(worldId) || !validUuid(intentId) || !validUuid(candidateAgentId)) {
+    return fail(reply, 400, 'TOKEN_ISSUER_CANDIDATE_INVALID');
+  }
+  if (!arcTokenSchemaReady) return fail(reply, 503, 'ARC_TOKEN_ISSUANCE_MIGRATION_REQUIRED');
+  const actionId = requireActionId(body);
+  const result = await transaction(async (client) => {
+    await assertMember(client, worldId, request.agentId, true);
+    return decideWorldTokenIssuerCandidate(client, { worldId, agentId: request.agentId, intentId,
+      candidateAgentId, decision: body.decision, rationale: body.rationale ?? null,
+      actionId, worldMinute: await readWorldMinutes(client, worldId) });
+  });
+  return reply.send(result);
+});
+app.post('/v1/worlds/:worldId/token-issuance/intents/:intentId/responses', async (request, reply) => {
+  const { worldId, intentId } = request.params;
+  const body = request.body || {};
+  if (!validUuid(worldId) || !validUuid(intentId)) return fail(reply, 400, 'TOKEN_ISSUANCE_ID_INVALID');
+  if (!arcTokenSchemaReady) return fail(reply, 503, 'ARC_TOKEN_ISSUANCE_MIGRATION_REQUIRED');
+  const actionId = requireActionId(body);
+  const result = await transaction(async (client) => {
+    await assertMember(client, worldId, request.agentId, true);
+    return respondToWorldTokenIssuance(client, { worldId, agentId: request.agentId, intentId,
+      decision: body.decision, rationale: body.rationale ?? null, actionId,
+      worldMinute: await readWorldMinutes(client, worldId) });
+  });
+  return reply.send(result);
+});
+app.post('/v1/worlds/:worldId/token-issuance/intents/:intentId/issuer-decision', async (request, reply) => {
+  const { worldId, intentId } = request.params;
+  const body = request.body || {};
+  if (!validUuid(worldId) || !validUuid(intentId)) return fail(reply, 400, 'TOKEN_ISSUANCE_ID_INVALID');
+  if (!arcTokenSchemaReady) return fail(reply, 503, 'ARC_TOKEN_ISSUANCE_MIGRATION_REQUIRED');
+  const actionId = requireActionId(body);
+  const result = await transaction(async (client) => {
+    await assertMember(client, worldId, request.agentId, true);
+    return confirmWorldTokenIssuance(client, { worldId, agentId: request.agentId, intentId,
+      decision: body.decision, actionId, worldMinute: await readWorldMinutes(client, worldId) });
+  });
+  return reply.send(result);
+});
+app.post('/v1/worlds/:worldId/tokens/:tokenId/decision', async (request, reply) => {
+  const { worldId, tokenId } = request.params;
+  const body = request.body || {};
+  if (!validUuid(worldId) || !validUuid(tokenId)) return fail(reply, 400, 'AGENT_TOKEN_ID_INVALID');
+  if (!arcTokenSchemaReady) return fail(reply, 503, 'ARC_TOKEN_ISSUANCE_MIGRATION_REQUIRED');
+  const actionId = requireActionId(body);
+  const result = await transaction(async (client) => {
+    await assertMember(client, worldId, request.agentId, true);
+    return decideWorldAgentTokenAcceptance(client, { worldId, agentId: request.agentId, tokenId,
+      decision: body.decision, rationale: body.rationale ?? null, actionId,
+      worldMinute: await readWorldMinutes(client, worldId) });
+  });
+  return reply.send(result);
+});
+app.post('/v1/worlds/:worldId/tokens/:tokenId/uses', async (request, reply) => {
+  const { worldId, tokenId } = request.params;
+  const body = request.body || {};
+  if (!validUuid(worldId) || !validUuid(tokenId)) return fail(reply, 400, 'AGENT_TOKEN_ID_INVALID');
+  if (!arcTokenSchemaReady) return fail(reply, 503, 'ARC_TOKEN_ISSUANCE_MIGRATION_REQUIRED');
+  const actionId = requireActionId(body);
+  const result = await transaction(async (client) => {
+    await assertMember(client, worldId, request.agentId, true);
+    return recordWorldAgentTokenUse(client, { worldId, agentId: request.agentId, tokenId,
+      usageContext: body.usageContext, evidence: body.evidence || {}, actionId,
+      worldMinute: await readWorldMinutes(client, worldId) });
+  });
+  return reply.code(result.used ? 201 : 200).send(result);
+});
 app.post('/v1/worlds/:worldId/values', async (request, reply) =>
   runWorldV7Action(request, reply, createWorldValue));
 app.post('/v1/worlds/:worldId/values/:valueId/exposures', async (request, reply) =>
@@ -2430,6 +2593,8 @@ app.get('/v1/worlds/:worldId/events', async (request, reply) => {
 await pool.query(await readFile(path.join(ROOT, 'schema.sql'), 'utf8'));
 const arcSchema = await pool.query(`SELECT to_regclass('public.arc_settlement_outbox') IS NOT NULL AS ready`);
 arcSchemaReady = arcSchema.rows[0]?.ready === true;
+const arcTokenSchema = await pool.query(`SELECT to_regclass('public.arc_token_issuance_intents') IS NOT NULL AS ready`);
+arcTokenSchemaReady = arcTokenSchema.rows[0]?.ready === true;
 arcSetupReason = arcSchemaReady ? 'observer_not_registered' : 'arc_schema_migration_required';
 if (arcSchemaReady) {
   try {
@@ -2438,6 +2603,15 @@ if (arcSchemaReady) {
   } catch (error) {
     arcSignerSetupError = String(error?.code || 'ARC_SIGNER_CONFIGURATION_INVALID').replace(/[^A-Z0-9_]/gi, '').slice(0, 80);
     console.error(JSON.stringify({ code: arcSignerSetupError }, null, 0));
+  }
+  try {
+    const signerResult = await loadConfiguredArcInfrastructureSigner({ config: ARC_CONFIG, env: process.env });
+    arcInfrastructureSigner = signerResult.signer;
+  } catch (error) {
+    arcSignerSetupError ||= String(error?.code || 'ARC_INFRA_SIGNER_CONFIGURATION_INVALID')
+      .replace(/[^A-Z0-9_]/gi, '').slice(0, 80);
+    console.error(JSON.stringify({ code: String(error?.code || 'ARC_INFRA_SIGNER_CONFIGURATION_INVALID')
+      .replace(/[^A-Z0-9_]/gi, '').slice(0, 80) }, null, 0));
   }
 }
 await expireAdultServiceBookings();
@@ -2456,6 +2630,7 @@ try {
     chooseWithTypeSafe: process.env.TYPESAFE_API_KEY && typeSafeRuntimeState ? chooseWithTypeSafe : null,
     chooseCivilizationOption: process.env.TYPESAFE_API_KEY && typeSafeRuntimeState ? chooseCivilizationOption : null,
     chooseWorldV7Reflection: process.env.TYPESAFE_API_KEY && typeSafeRuntimeState ? chooseWorldV7Reflection : null,
+    currencyGenesisEnabled: arcTokenSchemaReady,
     onAutonomousBusinessAction: arcSchemaReady ? enqueueArcAgentEconomicAction : null,
     runtimeState: typeSafeRuntimeState,
     fruitfly: fruitflyRuntime,
@@ -2487,6 +2662,13 @@ if (worldEngine.running && worldEngine.worldLockOwned && worldEngine.worldId) {
       isOwner: () => worldEngine.running && worldEngine.worldLockOwned && worldEngine.worldId === observerWorldId,
       onError: (record) => app.log.error(record, 'Arc settlement outbox processing failed') });
     await arcSettlementWorker.start();
+    if (arcTokenSchemaReady) {
+      arcAgentTokenIssuanceWorker = startArcAgentTokenIssuanceWorker({ pool, config: ARC_CONFIG,
+        env: process.env, signer: arcInfrastructureSigner, rpcClient: ARC_RPC_CLIENT,
+        isOwner: () => worldEngine.running && worldEngine.worldLockOwned && worldEngine.worldId === observerWorldId,
+        onError: (record) => app.log.error(record, 'Arc Agent token issuance worker failed') });
+      await arcAgentTokenIssuanceWorker.start({ worldId: observerWorldId });
+    }
   }
 }
 const adultServiceExpiryTimer = setInterval(() => {
@@ -2507,6 +2689,7 @@ async function shutdown() {
   clearInterval(cryptoMarketTimer);
   clearInterval(robinhoodMarketTimer);
   await arcSettlementWorker?.stop();
+  await arcAgentTokenIssuanceWorker?.stop();
   await arcObserver?.stop();
   await v6LifecycleObserver?.stop();
   await worldEngine.stop?.();

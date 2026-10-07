@@ -143,8 +143,36 @@ test('Arc signer rejects non-zero native value before invoking the external sign
 
 function makeSettlementClient() {
   const rows = new Map();
-  const client = { rows,
+  const costReservations = new Map();
+  const pilotBudget = { id: 1, spent_usdc_base_units: 0n, reserved_usdc_base_units: 0n };
+  const client = { rows, costReservations, pilotBudget,
     async query(sql, values = []) {
+      if (sql.startsWith('SELECT * FROM arc_mainnet_pilot_budget')) {
+        return { rowCount: 1, rows: [pilotBudget] };
+      }
+      if (sql.startsWith('SELECT * FROM arc_mainnet_pilot_cost_reservations')) {
+        const reservation = costReservations.get(`${values[0]}:${values[1]}`);
+        return { rowCount: reservation ? 1 : 0, rows: reservation ? [reservation] : [] };
+      }
+      if (sql.startsWith('UPDATE arc_mainnet_pilot_cost_reservations SET status=$3')) {
+        const reservation = costReservations.get(`${values[0]}:${values[1]}`);
+        if (!reservation) return { rowCount: 0, rows: [] };
+        reservation.status = values[2];
+        if (values[3]) reservation.transaction_hash = values[3];
+        return { rowCount: 1, rows: [reservation] };
+      }
+      if (sql.startsWith("UPDATE arc_mainnet_pilot_cost_reservations SET status='settled'")) {
+        const reservation = [...costReservations.values()].find((item) => item.id === values[0]);
+        if (!reservation) return { rowCount: 0, rows: [] };
+        Object.assign(reservation, { status: 'settled', actual_cost_usdc_base_units: values[1],
+          gas_used: values[2], effective_gas_price: values[3] });
+        return { rowCount: 1, rows: [reservation] };
+      }
+      if (sql.startsWith('UPDATE arc_mainnet_pilot_budget SET reserved_usdc_base_units=reserved_usdc_base_units-$1')) {
+        pilotBudget.reserved_usdc_base_units -= BigInt(values[0]);
+        pilotBudget.spent_usdc_base_units += BigInt(values[1]);
+        return { rowCount: 1, rows: [pilotBudget] };
+      }
       if (sql.includes('INSERT INTO arc_settlement_outbox')) {
         const key = `${values[0]}:${values[1]}`;
         if (rows.has(key)) return { rowCount: 0, rows: [] };
@@ -200,6 +228,17 @@ function makeSettlementClient() {
   return client;
 }
 
+function seedPilotCostReservation(client, settlement, status = 'reserved') {
+  const reservedCost = 10_000_000n;
+  client.pilotBudget.reserved_usdc_base_units += reservedCost;
+  client.costReservations.set(`settlement:${settlement.id}`, {
+    id: `cost-${settlement.id}`, operation_type: 'settlement', operation_id: settlement.id,
+    world_id: settlement.world_id, chain_id: ARC_MAINNET_CHAIN_ID,
+    transfer_usdc_base_units: '1000001', gas_limit: '50000', max_fee_per_gas: '20000000000',
+    reserved_cost_usdc_base_units: reservedCost.toString(), status, transaction_hash: settlement.transaction_hash || null
+  });
+}
+
 const settlementInput = (overrides = {}) => ({ worldId: WORLD_ID, worldActionId: 'resident-action-0001',
   worldEventId: '1234', chainId: ARC_MAINNET_CHAIN_ID, settlementContract: CONTRACT,
   tokenAddress: ARC_MAINNET_USDC_ADDRESS, fromAgentId: AGENT_ID, toAgentId: RECIPIENT_ID,
@@ -220,6 +259,7 @@ test('settlement intents are idempotent and reject action ID reuse with changed 
 test('settlement submission can only be claimed once and retry reconciles instead of resending', async () => {
   const client = makeSettlementClient();
   const { settlement } = await prepareArcSettlement(client, settlementInput());
+  seedPilotCostReservation(client, settlement);
   const config = createIsolatedArcMainnetConfig();
   let submissions = 0;
   const signer = new ExternalKmsArcSigner({ config, addressForResident: async () => PAYER,
@@ -240,6 +280,7 @@ test('settlement submission can only be claimed once and retry reconciles instea
 test('settlement submission cannot retry an unknown transaction without its hash', async () => {
   const client = makeSettlementClient();
   const { settlement } = await prepareArcSettlement(client, settlementInput());
+  seedPilotCostReservation(client, settlement, 'submission_unknown');
   settlement.status = 'submission_unknown';
   const result = await reconcileArcSettlementById(client, { settlementId: settlement.id,
     rpcClient: { async getTransactionReceipt() { throw new Error('must not query without hash'); } } });
@@ -261,12 +302,14 @@ function settlementEventLog(settlement, logIndex = '0x2') {
 test('unknown submission recovery finds the exact settlement event and finalizes without resending', async () => {
   const client = makeSettlementClient();
   const { settlement } = await prepareArcSettlement(client, settlementInput());
+  seedPilotCostReservation(client, settlement, 'submission_unknown');
   Object.assign(settlement, { status: 'submission_unknown', nonce: '0', from_address: PAYER, to_address: RECIPIENT,
     submission_start_block: '100', reconciliation_cursor_block: '100', reconciliation_tx_cursor_block: '100' });
   const rpcClient = { async getChainId() { return ARC_MAINNET_CHAIN_ID; }, async getBlockNumber() { return '0x123'; },
     async getBlock() { return null; }, async getTransactionCount() { return '0x0'; },
     async getLogs() { return [settlementEventLog(settlement)]; },
     async getTransactionReceipt() { return { transactionHash: HASH, status: '0x1', blockNumber: '0x123',
+      gasUsed: '0x5208', effectiveGasPrice: '0x4a817c800',
       logs: [settlementEventLog(settlement)] }; } };
   const recovered = await reconcileArcSettlementById(client, { settlementId: settlement.id, rpcClient });
   assert.equal(recovered.status, 'final');
@@ -284,7 +327,9 @@ test('settlement receipt audit matches chain, event payload, and finality status
   const client = makeSettlementClient();
   const { settlement } = await prepareArcSettlement(client, settlementInput());
   settlement.status = 'submitted'; settlement.transaction_hash = HASH;
-  const final = await reconcileArcSettlementReceipt(client, { settlement, receipt });
+  seedPilotCostReservation(client, settlement, 'submitted');
+  const final = await reconcileArcSettlementReceipt(client, { settlement,
+    receipt: { ...receipt, gasUsed: '0x5208', effectiveGasPrice: '0x4a817c800' } });
   assert.equal(final.status, 'final');
   assert.equal(final.settlement.block_number, '291');
   assert.equal(final.settlement.log_index, 2);

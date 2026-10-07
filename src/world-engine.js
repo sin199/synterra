@@ -45,6 +45,7 @@ import { activityDurationSeconds, activityNeedEffects, activityVariant, applyEnv
   destinationFeasible, environmentEventIdeas, environmentSnapshot, environmentTransitions, homeActivityCandidates, hourlyNeedUpdate,
   travelSeconds, worldEnvironment } from './world-environment.js';
 import { writeWorldHistory } from './world-domain.js';
+import { advanceWorldCurrencyGenesis, ensureWorldCurrencyGenesisRequirement } from './world-token-issuance.js';
 
 export const WORLD_TICK_MS = 1_000;
 const TYPE_SAFE_INTERVAL_MS = 30 * 60_000;
@@ -1891,6 +1892,7 @@ async function runStrategicTypeSafe(pool, worldId, chooseWithTypeSafe, runtimeSt
 
 export async function startWorldEngine(pool, { worldId: requestedWorldId = null, onError = () => {}, onStatus = () => {}, chooseWithTypeSafe = null,
   chooseCivilizationOption = null, chooseWorldV7Reflection = null,
+  currencyGenesisEnabled = false, authorCurrencyProposal = null,
   onAutonomousBusinessAction = null,
   runtimeState = null, fruitfly = null, tickMs = WORLD_TICK_MS, nowProvider = () => Date.now(), schedule = true,
   emergencySink = process.stderr } = {}) {
@@ -1959,6 +1961,8 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
       if (!clock.rowCount) throw new Error('WORLD_RUNTIME_STATE_MISSING');
       await initializeWorldCivilization(initialize, { worldId, worldMinute: Number(clock.rows[0].world_minutes) });
       await initializeWorldV7(initialize, { worldId, worldMinute: Number(clock.rows[0].world_minutes) });
+      if (currencyGenesisEnabled) await ensureWorldCurrencyGenesisRequirement(initialize,
+        { worldId, worldMinute: Number(clock.rows[0].world_minutes) });
         const unscheduled = await initialize.query(`SELECT agent_id FROM world_agent_states
         WHERE world_id=$1 AND next_civilization_review_world_minutes IS NULL ORDER BY agent_id`, [worldId]);
       for (const resident of unscheduled.rows) {
@@ -2302,6 +2306,7 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
 
         for (const row of membersResult.rows) {
           const agent = { ...row, agentId: row.agent_id,
+            currentGoal: row.current_goal || row.goal || 'balanced',
             lastTradeAt: row.last_trade_at, planned_paid_meal: row.planned_paid_meal,
             nextInstitutionalReviewWorldMinutes: row.next_institutional_review_world_minutes === null
               ? null : Number(row.next_institutional_review_world_minutes),
@@ -2342,6 +2347,13 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
                   setPhase(phase);
                 } });
               if (lastCivilizationPhase) phaseSucceeded(lastCivilizationPhase);
+              if (currencyGenesisEnabled) {
+                setPhase('CURRENCY_GENESIS_RESIDENT_REVIEW');
+                await advanceWorldCurrencyGenesis(client, { worldId, agent, worldMinute: worldMinutes,
+                  chooseWithTypeSafe: chooseCivilizationOption ? chooseCivilizationOptionBounded : null,
+                  ...(authorCurrencyProposal ? { authorProposal: authorCurrencyProposal } : {}) });
+                phaseSucceeded('CURRENCY_GENESIS_RESIDENT_REVIEW');
+              }
               setPhase('RESIDENT_COGNITION');
               capabilityOptions = await listWorldCapabilityUses(client, { worldId, limit: 100 });
               phaseSucceeded('RESIDENT_COGNITION');

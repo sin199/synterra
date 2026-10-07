@@ -70,6 +70,81 @@ export class ArcSigner {
   }
 }
 
+// Infrastructure transactions (factory calls, checkpoints and provenance)
+// use a separate sender identity from resident wallets and Agent issuers.
+export class ArcInfrastructureSigner {
+  constructor({ config, providerName }) {
+    if (config?.name !== 'mainnet' || config?.chainId !== ARC_MAINNET_CHAIN_ID) {
+      const error = new Error('Arc Mainnet infrastructure signer configuration is required.');
+      error.code = 'ARC_MAINNET_ONLY';
+      throw error;
+    }
+    this.config = config;
+    this.providerName = String(providerName || 'external_signer').slice(0, 64);
+  }
+
+  async getAddress() { throw new Error('ArcInfrastructureSigner must implement getAddress().'); }
+  async sendTransaction(_transaction) { throw new Error('ArcInfrastructureSigner must implement sendTransaction().'); }
+}
+
+class CallbackArcInfrastructureSigner extends ArcInfrastructureSigner {
+  #getAddress;
+  #submitTransaction;
+
+  constructor({ config, getAddress, submitTransaction, providerName }) {
+    super({ config, providerName });
+    if (typeof getAddress !== 'function' || typeof submitTransaction !== 'function') {
+      throw new TypeError('Infrastructure signer address and transaction callbacks are required.');
+    }
+    this.#getAddress = getAddress;
+    this.#submitTransaction = submitTransaction;
+  }
+
+  async getAddress() {
+    const address = await this.#getAddress();
+    if (typeof address !== 'string' || !/^0x[0-9a-fA-F]{40}$/.test(address)) {
+      const error = new Error('Infrastructure signer returned an invalid public address.');
+      error.code = 'ARC_INFRASTRUCTURE_ADDRESS_INVALID';
+      throw error;
+    }
+    return address;
+  }
+
+  async sendTransaction(transaction) {
+    assertArcWriteAllowed(this.config, { operation: 'infrastructure transaction submission' });
+    validateTransactionEnvelope(this.config, transaction);
+    const response = await this.#submitTransaction(Object.freeze({ ...transaction }));
+    if (!response || typeof response.hash !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(response.hash)) {
+      const error = new Error('Infrastructure signer did not return a valid transaction hash.');
+      error.code = 'ARC_SIGNER_TRANSACTION_HASH_MISSING';
+      throw error;
+    }
+    return { hash: response.hash, providerName: this.providerName };
+  }
+}
+
+export class ExternalKmsArcInfrastructureSigner extends CallbackArcInfrastructureSigner {
+  constructor({ config, getAddress, submitTransaction }) {
+    super({ config, getAddress, submitTransaction, providerName: 'external_kms' });
+  }
+}
+
+export class ManagedWalletArcInfrastructureSigner extends CallbackArcInfrastructureSigner {
+  constructor({ config, getAddress, submitTransaction, providerName = 'managed_wallet' }) {
+    super({ config, getAddress, submitTransaction, providerName });
+  }
+}
+
+export function assertArcInfrastructureSigner(signer, config) {
+  if (!(signer instanceof ArcInfrastructureSigner) || signer.config !== config
+      || typeof signer.getAddress !== 'function' || typeof signer.sendTransaction !== 'function') {
+    const error = new TypeError('Infrastructure Arc execution requires a configured infrastructure signer.');
+    error.code = 'ARC_INFRASTRUCTURE_SIGNER_INTERFACE_REQUIRED';
+    throw error;
+  }
+  return signer;
+}
+
 class CallbackArcSigner extends ArcSigner {
   #addressForResident;
   #submitTransaction;

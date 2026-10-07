@@ -4,6 +4,15 @@ pragma solidity ^0.8.28;
 import {SynterraWorldRegistry} from "../src/SynterraWorldRegistry.sol";
 import {SynterraSettlement} from "../src/SynterraSettlement.sol";
 import {SynterraCapabilityProvenance} from "../src/SynterraCapabilityProvenance.sol";
+import {SynterraAgentToken} from "../src/SynterraAgentToken.sol";
+import {SynterraAgentTokenFactory} from "../src/SynterraAgentTokenFactory.sol";
+
+contract ArcTokenIssuerActor {
+    function release(SynterraAgentToken token, bytes32 releaseId, address[] calldata recipients,
+        uint256[] calldata amounts, uint64 worldMinute) external {
+        token.releaseReserved(releaseId, recipients, amounts, worldMinute);
+    }
+}
 
 contract MockArcUsdc {
     mapping(address => uint256) public balanceOf;
@@ -243,6 +252,137 @@ contract SynterraArcContractsTest {
                 SynterraCapabilityProvenance.CapabilityStatus.Proposed)
         ));
         require(!missingResidentAccepted, "resident capability accepted without a creator identity");
+    }
+
+    function testAgentTokenFactoryPreservesIssuerIdentityFixedSupplyAndOneTokenPilotLimit() external {
+        ArcTokenIssuerActor issuer = new ArcTokenIssuerActor();
+        address relayer = address(this);
+        bytes16 issuerAgentId = 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa;
+        bytes32 issuanceId = keccak256("agent-authored-issuance");
+        bytes32 specHash = keccak256("agent-selected-name-symbol-purpose-and-distribution");
+        uint256 scale = 10 ** 6;
+        address[] memory recipients = new address[](1);
+        uint256[] memory amounts = new uint256[](1);
+        recipients[0] = address(0xBEEF);
+        amounts[0] = 400_000_000 * scale;
+        SynterraAgentTokenFactory factory = new SynterraAgentTokenFactory(WORLD,
+            address(0xABCD), relayer, 1);
+
+        SynterraAgentTokenFactory.CreateTokenRequest memory request = SynterraAgentTokenFactory.CreateTokenRequest({
+            requestedWorldId: WORLD,
+            capabilityGeneration: 1,
+            issuanceId: issuanceId,
+            issuerAgentId: issuerAgentId,
+            issuerIdentityId: 818,
+            issuerWallet: address(issuer),
+            name: "Agent chosen name",
+            symbol: "ACN",
+            decimals: 6,
+            specificationHash: specHash,
+            worldMinute: 197_666,
+            unallocatedSupplyHandling: 1,
+            ownershipModel: 0,
+            authorityModel: 1,
+            recipients: recipients,
+            amountsRaw: amounts,
+            reserveRaw: 600_000_000 * scale
+        });
+        (address tokenAddress, uint32 sequence, bool created) = factory.createToken(abi.encode(request));
+        require(created && sequence == 1, "first Agent token was not created");
+        require(factory.creationCount() == 1, "factory count not incremented exactly once");
+        require(factory.tokenForIssuance(issuanceId) == tokenAddress, "issuance id mapping missing");
+
+        SynterraAgentToken token = SynterraAgentToken(tokenAddress);
+        uint256 fixedSupply = 1_000_000_000 * scale;
+        require(keccak256(bytes(token.name())) == keccak256(bytes("Agent chosen name")), "Agent name changed");
+        require(keccak256(bytes(token.symbol())) == keccak256(bytes("ACN")), "Agent symbol changed");
+        require(token.decimals() == 6, "Agent-selected decimals changed");
+        require(token.worldId() == WORLD && token.issuerAgentId() == issuerAgentId, "world or issuer provenance missing");
+        require(token.issuerIdentityId() == 818 && token.issuerWallet() == address(issuer), "issuer identity conflated with relayer");
+        require(token.specificationHash() == specHash && token.createdWorldMinute() == 197_666, "specification provenance missing");
+        require(token.initialSupply() == fixedSupply && token.totalSupply() == fixedSupply, "fixed 1B human supply mismatch");
+        require(token.balanceOf(recipients[0]) == amounts[0], "Agent-defined initial allocation missing");
+        require(token.balanceOf(address(token)) == 600_000_000 * scale, "Agent reserve allocation changed");
+
+        address[] memory reserveRecipients = new address[](1);
+        uint256[] memory reserveAmounts = new uint256[](1);
+        reserveRecipients[0] = address(0xCAFE);
+        reserveAmounts[0] = 25_000_000 * scale;
+        bytes32 releaseId = keccak256("Agent-selected-reserve-release");
+        issuer.release(token, releaseId, reserveRecipients, reserveAmounts, 197_700);
+        require(token.balanceOf(reserveRecipients[0]) == reserveAmounts[0], "issuer reserve release missing");
+        require(token.reservedSupply() == 575_000_000 * scale, "remaining reserve mismatch");
+        (bool replayAccepted,) = address(issuer).call(abi.encodeCall(
+            ArcTokenIssuerActor.release, (token, releaseId, reserveRecipients, reserveAmounts, 197_701)
+        ));
+        require(!replayAccepted, "reserve release replay accepted");
+        require(token.totalSupply() == fixedSupply, "reserve release changed fixed supply");
+
+        address[] memory secondRecipients = new address[](0);
+        uint256[] memory secondAmounts = new uint256[](0);
+        SynterraAgentTokenFactory.CreateTokenRequest memory secondRequest = SynterraAgentTokenFactory.CreateTokenRequest({
+            requestedWorldId: WORLD,
+            capabilityGeneration: 1,
+            issuanceId: keccak256("second-token-intent"),
+            issuerAgentId: issuerAgentId,
+            issuerIdentityId: 818,
+            issuerWallet: address(issuer),
+            name: "Another Agent choice",
+            symbol: "AAC",
+            decimals: 6,
+            specificationHash: keccak256("second-spec"),
+            worldMinute: 197_701,
+            unallocatedSupplyHandling: 1,
+            ownershipModel: 0,
+            authorityModel: 1,
+            recipients: secondRecipients,
+            amountsRaw: secondAmounts,
+            reserveRaw: fixedSupply
+        });
+        (bool secondCreationAccepted,) = address(factory).call(abi.encodeCall(
+            SynterraAgentTokenFactory.createToken, (abi.encode(secondRequest))
+        ));
+        require(!secondCreationAccepted, "one-token pilot cap allowed a second token");
+        require(factory.creationCount() == 1, "failed second creation changed the factory count");
+    }
+
+    function testFactorySupportsCapabilityGenerationExpansionWithoutChangingTokenHistory() external {
+        address writer = address(this);
+        SynterraAgentTokenFactory factory = new SynterraAgentTokenFactory(WORLD,
+            address(0xABCD), writer, 2);
+        SynterraAgentTokenFactory.CreateTokenRequest memory request = SynterraAgentTokenFactory.CreateTokenRequest({
+            requestedWorldId: WORLD,
+            capabilityGeneration: 1,
+            issuanceId: keccak256("generation-one-issuance"),
+            issuerAgentId: 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,
+            issuerIdentityId: 818,
+            issuerWallet: address(0xCAFE),
+            name: "Agent First",
+            symbol: "AF",
+            decimals: 0,
+            specificationHash: keccak256("generation-one-specification"),
+            worldMinute: 197_666,
+            unallocatedSupplyHandling: 1,
+            ownershipModel: 0,
+            authorityModel: 1,
+            recipients: new address[](0),
+            amountsRaw: new uint256[](0),
+            reserveRaw: 1_000_000_000
+        });
+        (address firstAddress, uint32 firstSequence, bool firstCreated) = factory.createToken(abi.encode(request));
+        require(firstCreated && firstSequence == 1, "first generation token was not preserved");
+
+        request.capabilityGeneration = 2;
+        request.issuanceId = keccak256("generation-two-issuance");
+        request.name = "Agent Second";
+        request.symbol = "AS";
+        request.specificationHash = keccak256("generation-two-specification");
+        request.worldMinute = 198_000;
+        (address secondAddress, uint32 secondSequence, bool secondCreated) = factory.createToken(abi.encode(request));
+        require(secondCreated && secondSequence == 2, "expanded capability did not create its next token");
+        require(firstAddress != secondAddress && factory.creationCount() == 2, "token history was overwritten");
+        require(SynterraAgentToken(firstAddress).capabilityGeneration() == 1
+            && SynterraAgentToken(secondAddress).capabilityGeneration() == 2, "generation provenance changed");
     }
 
     function testFuzzSettlementTransfersOnlyAuthorizedAmount(uint96 amount) external {

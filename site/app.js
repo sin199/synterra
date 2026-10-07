@@ -30,6 +30,7 @@ const worldArcObserverStatus = document.querySelector('#world-arc-observer-statu
 const worldArcStats = document.querySelector('#world-arc-stats');
 const worldArcFindingsList = document.querySelector('#world-arc-findings-list');
 const worldArcSettlementsList = document.querySelector('#world-arc-settlements-list');
+const worldAgentTokenList = document.querySelector('#world-agent-token-list');
 const worldV6LifecycleSummary = document.querySelector('#world-v6-lifecycle-summary');
 const worldV6LifecycleObserverStatus = document.querySelector('#world-v6-lifecycle-observer-status');
 const worldV6LifecycleStats = document.querySelector('#world-v6-lifecycle-stats');
@@ -780,6 +781,7 @@ function renderWorldEvolution() {
   const recovery = evolution.economy?.recovery || {};
   const v6Lifecycle = evolution.v6Lifecycle || {};
   const arc = evolution.arcMainnet || {};
+  const agentTokenIssuance = evolution.agentTokenIssuance || {};
   const arcObserver = evolution.arcObserver || {};
   const arcSettlementWorker = evolution.arcSettlementWorker || {};
   const arcDatabase = arcObserver.database || {};
@@ -948,6 +950,33 @@ function renderWorldEvolution() {
         worldArcSettlementsList.append(row);
       }
     }
+  }
+  const tokenIntentCounts = agentTokenIssuance.counts || {};
+  const currencyRequirement = agentTokenIssuance.requirement || {};
+  const tokenProposalResponses = agentTokenIssuance.proposalResponses || {};
+  const tokenAcceptance = agentTokenIssuance.acceptance || {};
+  const tokenUsage = agentTokenIssuance.usage || {};
+  const tokenWorker = agentTokenIssuance.worker || evolution.arcAgentTokenIssuanceWorker || {};
+  if (worldAgentTokenList) {
+    const tokenRows = [
+      { title: '当前规则', detail: `首发供应量 ${agentTokenIssuance.fixedHumanSupply || '1,000,000,000'} 枚 · 本阶段最多 ${displayCount(agentTokenIssuance.currentPilotLimit ?? 1)} 枚 · Mainnet write gate ${agentTokenIssuance.writesEnabled ? '开启' : '关闭'}` },
+      { title: '持久货币要求', detail: currencyRequirement.status
+        ? `${currencyRequirement.status} · 世界分钟 ${displayCount(currencyRequirement.lastTransitionWorldMinute)} · ${currencyRequirement.status === 'SATISFIED' ? '仅链上创建并 reconciliation 后满足' : '持续作为世界事实；居民可以忽略、拒绝或延期单个方案'}`
+        : '尚无 requirement 记录 · migration 尚未初始化' },
+      { title: '发行执行器', detail: `${tokenWorker.available && tokenWorker.running ? '运行中' : '不可用'} · ${tokenWorker.mode || 'read_only_reconciliation'} · Mainnet 写入 ${tokenWorker.writesEnabled ? '开启' : '关闭'}${tokenWorker.lastProcessedAt ? ` · 最近处理 ${new Date(tokenWorker.lastProcessedAt).toLocaleString()}` : ''}${tokenWorker.reason ? ` · ${tokenWorker.reason}` : ''}` },
+      { title: '发行意图', detail: agentTokenIssuance.available
+        ? `总数 ${displayCount(tokenIntentCounts.intents)} · 提案 ${displayCount(tokenIntentCounts.proposed)} · 未完整 ${displayCount(tokenIntentCounts.incomplete)} · 待决 ${displayCount(tokenIntentCounts.pending)} · 扩展请求 ${displayCount(tokenIntentCounts.extensionRequested)} · 预算阻塞 ${displayCount(tokenIntentCounts.budgetBlocked)} · 已创建 ${displayCount(tokenIntentCounts.created)} · 受当前能力限制 ${displayCount(tokenIntentCounts.deferred)} · 失败 ${displayCount(tokenIntentCounts.failed)} · 拒绝 ${displayCount(tokenIntentCounts.rejected)}`
+        : `只读状态不可用 · ${agentTokenIssuance.reason || 'arc_token_issuance_migration_required'}` },
+      ...(agentTokenIssuance.available ? [{ title: 'Agent 回应', detail: `支持 ${displayCount(tokenProposalResponses.support)} · 反对 ${displayCount(tokenProposalResponses.oppose)} · 忽略 ${displayCount(tokenProposalResponses.ignore)} · 分配和身份由 Agent 决定` }] : []),
+      ...(agentTokenIssuance.available ? [{ title: '发行后的自主选择', detail: `接受 ${displayCount(tokenAcceptance.accept)} · 拒绝 ${displayCount(tokenAcceptance.reject)} · 忽略 ${displayCount(tokenAcceptance.ignore)} · 记录使用 ${displayCount(tokenUsage.uses)} 次 / ${displayCount(tokenUsage.uniqueAgents)} 位 Agent` }] : []),
+      ...(agentTokenIssuance.intents || []).map((intent) => ({
+        title: intent.name ? `${intent.name}${intent.symbol ? ` (${intent.symbol})` : ''}` : 'Agent 发行意图（名称待 Agent 决定）',
+        detail: `${intent.status} · 提议者 ${intent.proposerName} · 发行者 ${intent.issuerName || '尚未选择'} · ${intent.meaning || intent.purpose || '含义/用途待 Agent 决定'}${intent.incompleteFields?.length ? ` · 缺少 ${intent.incompleteFields.join(', ')}` : ''}`
+      })),
+      ...(agentTokenIssuance.tokens || []).map((token) => ({ title: `${token.name} (${token.symbol})`,
+        detail: `已创建 · ${token.decimals} 位 decimals · 发行者 ${token.issuerAgentId} · 发行分钟 ${displayCount(token.createdWorldMinute)} · 接受 ${displayCount(token.acceptanceResponses?.accept)} / 拒绝 ${displayCount(token.acceptanceResponses?.reject)} / 忽略 ${displayCount(token.acceptanceResponses?.ignore)} · 使用 ${displayCount(token.usageCount)} 次 / ${displayCount(token.uniqueUsers)} 位 Agent` }))
+    ];
+    renderEvolutionList(worldAgentTokenList, tokenRows, '暂无 Agent 自主发行提案。', (item) => item.detail);
   }
   const v6Counts = v6Lifecycle.counts || {};
   const proposalReviews = v6Lifecycle.reviews?.proposal || {};

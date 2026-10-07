@@ -11,10 +11,13 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
 const CONTRACTS = Object.freeze([
   { name: 'SynterraWorldRegistry', source: 'SynterraWorldRegistry.sol', args: ['worldId','owner','checkpointWriter','identityWriter'] },
   { name: 'SynterraSettlement', source: 'SynterraSettlement.sol', args: ['worldId','usdc','emergencyOperator'] },
-  { name: 'SynterraCapabilityProvenance', source: 'SynterraCapabilityProvenance.sol', args: ['worldId','owner','writer'] }
+  { name: 'SynterraCapabilityProvenance', source: 'SynterraCapabilityProvenance.sol', args: ['worldId','owner','writer'] },
+  { name: 'SynterraAgentTokenFactory', source: 'SynterraAgentTokenFactory.sol',
+    args: ['worldId','owner','writer','maxTokenCreationsPerWorld'] }
 ]);
 const ADDRESS_ARGS = new Set(['registry-owner','checkpoint-writer','identity-writer',
-  'settlement-operator','provenance-owner','provenance-writer','deployer']);
+  'settlement-operator','provenance-owner','provenance-writer','agent-token-factory-owner',
+  'agent-token-factory-writer','deployer']);
 
 function parseArgs(argv) {
   const result = {};
@@ -94,13 +97,19 @@ function deploymentArgs(options) {
   const settlementOperator = normalizeAddress(options['settlement-operator'], '--settlement-operator');
   const provenanceOwner = normalizeAddress(options['provenance-owner'], '--provenance-owner');
   const provenanceWriter = normalizeAddress(options['provenance-writer'], '--provenance-writer');
+  const agentTokenFactoryOwner = normalizeAddress(options['agent-token-factory-owner'], '--agent-token-factory-owner');
+  const agentTokenFactoryWriter = normalizeAddress(options['agent-token-factory-writer'], '--agent-token-factory-writer');
   if (new Set([registryOwner.toLowerCase(), checkpointWriter.toLowerCase(), identityWriter.toLowerCase()]).size !== 3) {
     throw new TypeError('Registry owner, checkpoint writer, and identity writer must be distinct.');
   }
   if (provenanceOwner.toLowerCase() === provenanceWriter.toLowerCase()) {
     throw new TypeError('Provenance owner and writer must be distinct.');
   }
-  return { worldId, registryOwner, checkpointWriter, identityWriter, settlementOperator, provenanceOwner, provenanceWriter };
+  if (agentTokenFactoryOwner.toLowerCase() === agentTokenFactoryWriter.toLowerCase()) {
+    throw new TypeError('Agent token factory owner and writer must be distinct.');
+  }
+  return { worldId, registryOwner, checkpointWriter, identityWriter, settlementOperator,
+    provenanceOwner, provenanceWriter, agentTokenFactoryOwner, agentTokenFactoryWriter };
 }
 
 function assembleDeployments(artifacts, args) {
@@ -108,7 +117,8 @@ function assembleDeployments(artifacts, args) {
   const constructorValues = {
     SynterraWorldRegistry: [args.worldId, args.registryOwner, args.checkpointWriter, args.identityWriter],
     SynterraSettlement: [args.worldId, ARC_MAINNET_USDC_ADDRESS, args.settlementOperator],
-    SynterraCapabilityProvenance: [args.worldId, args.provenanceOwner, args.provenanceWriter]
+    SynterraCapabilityProvenance: [args.worldId, args.provenanceOwner, args.provenanceWriter],
+    SynterraAgentTokenFactory: [args.worldId, args.agentTokenFactoryOwner, args.agentTokenFactoryWriter, 1]
   };
   return CONTRACTS.map(({ name }) => {
     const item = byName.get(name);

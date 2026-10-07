@@ -4,6 +4,7 @@ import { assertArcMainnetChainId, ARC_MAINNET_CHAIN_ID, ARC_MAINNET_USDC_ADDRESS
   simulatedUsdcToArcTokenUnits } from './config.js';
 import { assertArcSigner, buildVerifiedArcTransaction } from './wallet-provider.js';
 import { reserveArcNonce, releaseArcNonceReservation } from './nonce-manager.js';
+import { reserveArcMainnetPilotCost } from './pilot-budget.js';
 import { ARC_SETTLEMENT_INTERFACE, arcReasonHash, arcWorldActionHash,
   submitArcSettlement, toArcBytes16Uuid } from './settlement.js';
 
@@ -322,7 +323,19 @@ export async function evaluateNextArcSettlementPolicy({ pool, config, env, signe
     }
     const saveClient = await pool.connect();
     let prepared;
+    let budgetExceeded = false;
     try {
+      await saveClient.query('BEGIN');
+      try {
+        await reserveArcMainnetPilotCost(saveClient, { operationType: 'settlement', operationId: String(outbox.id),
+          worldId: outbox.world_id, transferUsdcBaseUnits: policyDecision.amountBaseUnits,
+          gasLimit, maxFeePerGas: transaction.maxFeePerGas });
+      } catch (error) {
+        if (error?.code !== 'ARC_MAINNET_PILOT_COST_CAP_EXCEEDED') throw error;
+        budgetExceeded = true;
+        prepared = await savePolicyResult(saveClient, claim, rejectedReason(error.code));
+      }
+      if (!budgetExceeded) {
       prepared = await savePolicyResult(saveClient, claim, { status: 'prepared', code: 'ONCHAIN_POLICY_APPROVED' }, {
         contractAddress, fromAddress: signerAddress, toAddress: recipientAddress,
         amountBaseUnits: policyDecision.amountBaseUnits, policyVersion: policy.policy_version,
@@ -332,7 +345,22 @@ export async function evaluateNextArcSettlementPolicy({ pool, config, env, signe
           nativeBalanceWei: auth.nativeBalanceWei.toString(), erc20BalanceBaseUnits: auth.tokenBalanceBaseUnits.toString(),
           sharedUnderlyingUsdcBalance: true }
       });
+      }
+      await saveClient.query('COMMIT');
+    } catch (error) {
+      await saveClient.query('ROLLBACK');
+      const releaseClient = await pool.connect();
+      try {
+        await releaseClient.query('BEGIN');
+        await savePolicyResult(releaseClient, claim, temporaryReason('PILOT_BUDGET_RESERVATION_FAILED'));
+        await releaseClient.query('COMMIT');
+      } catch (releaseError) {
+        await releaseClient.query('ROLLBACK');
+        throw releaseError;
+      } finally { releaseClient.release(); }
+      return { processed: true, status: 'policy_pending', reason: error.code || 'PILOT_BUDGET_RESERVATION_FAILED' };
     } finally { saveClient.release(); }
+    if (budgetExceeded) return { processed: true, status: prepared.status, reason: 'ARC_MAINNET_PILOT_COST_CAP_EXCEEDED' };
     const submission = await submitArcSettlement({ client: pool, settlementId: prepared.id, signer, rpcClient,
       residentId: outbox.from_agent_id, buildTransaction: async (settlement) => ({
         to: contractAddress, from: signerAddress, nonce: BigInt(settlement.nonce), gasLimit, value: 0n,

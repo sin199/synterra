@@ -2,7 +2,10 @@ import { randomUUID } from 'node:crypto';
 import { Interface, id, getAddress } from 'ethers';
 import { assertArcChainId, assertArcMainnetChainId, assertArcWriteAllowed } from './config.js';
 import { assertArcSigner, buildVerifiedArcTransaction } from './wallet-provider.js';
-import { markArcNonceReservation, markStaleArcSubmissionsUnknown, saveArcReconciliationCursor } from './nonce-manager.js';
+import { markArcNonceReservation, markStaleArcSubmissionsUnknown, releaseArcNonceReservation,
+  saveArcReconciliationCursor } from './nonce-manager.js';
+import { releaseArcMainnetPilotCost, setArcMainnetPilotCostStatus,
+  settleArcMainnetPilotCost } from './pilot-budget.js';
 
 export const ARC_SETTLEMENT_INTERFACE = new Interface([
   'function settle(bytes32 worldActionId, address recipient, uint256 amount, bytes32 actionFamilyHash, bytes32 reasonHash, uint64 createdWorldMinute)',
@@ -51,6 +54,20 @@ function positiveIntegerString(value, name) {
 function normalizedAddress(value, name) {
   try { return getAddress(value).toLowerCase(); }
   catch { throw new TypeError(`${name} must be a valid EVM address.`); }
+}
+
+async function withDbTransaction(client, operation) {
+  if (typeof client?.connect !== 'function') return operation(client);
+  const connection = await client.connect();
+  try {
+    await connection.query('BEGIN');
+    const result = await operation(connection);
+    await connection.query('COMMIT');
+    return result;
+  } catch (error) {
+    await connection.query('ROLLBACK');
+    throw error;
+  } finally { connection.release(); }
 }
 
 function equivalentIntent(row, intent) {
@@ -203,17 +220,41 @@ export async function submitArcSettlement({ client, settlementId, signer, rpcCli
     transaction = await buildVerifiedArcTransaction({ transaction: prepared, config: signer.config, rpcClient,
       expectedTo: claim.settlement.settlement_contract });
   } catch (error) {
-    await releaseArcSettlementSubmission(client, { settlementId, attemptId: claim.attemptId });
+    await withDbTransaction(client, async (db) => {
+      await releaseArcSettlementSubmission(db, { settlementId, attemptId: claim.attemptId });
+      await releaseArcNonceReservation(db, settlementId);
+      await releaseArcMainnetPilotCost(db, { operationType: 'settlement', operationId: String(settlementId) });
+    });
+    throw error;
+  }
+  try {
+    await withDbTransaction(client, (db) => setArcMainnetPilotCostStatus(db, {
+      operationType: 'settlement', operationId: String(settlementId), status: 'submitting' }));
+  } catch (error) {
+    await withDbTransaction(client, async (db) => {
+      await releaseArcSettlementSubmission(db, { settlementId, attemptId: claim.attemptId });
+      await releaseArcNonceReservation(db, settlementId);
+      await releaseArcMainnetPilotCost(db, { operationType: 'settlement', operationId: String(settlementId) });
+    });
     throw error;
   }
   try {
     const response = await signer.sendTransaction(residentId, transaction);
     if (!response?.hash) throw new Error('Wallet provider did not return a transaction hash.');
-    const settlement = await markArcSettlementSubmitted(client, { settlementId,
-      attemptId: claim.attemptId, transactionHash: response.hash });
+    const settlement = await withDbTransaction(client, async (db) => {
+      const saved = await markArcSettlementSubmitted(db, { settlementId,
+        attemptId: claim.attemptId, transactionHash: response.hash });
+      await setArcMainnetPilotCostStatus(db, { operationType: 'settlement', operationId: String(settlementId),
+        status: 'submitted', transactionHash: response.hash });
+      return saved;
+    });
     return { submitted: true, idempotent: false, transactionHash: response.hash, settlement };
   } catch (error) {
-    await markArcSettlementSubmissionUnknown(client, { settlementId, attemptId: claim.attemptId });
+    await withDbTransaction(client, async (db) => {
+      await markArcSettlementSubmissionUnknown(db, { settlementId, attemptId: claim.attemptId });
+      await setArcMainnetPilotCostStatus(db, { operationType: 'settlement', operationId: String(settlementId),
+        status: 'submission_unknown' });
+    });
     throw error;
   }
 }
@@ -260,11 +301,16 @@ export async function reconcileArcSettlementReceipt(client, { settlement, receip
     return { status: settlement.status, pending: false, mismatch: true, finding: 'TRANSACTION_HASH_MISMATCH' };
   }
   if (!isSuccessfulReceipt(receipt)) {
-    const failed = await client.query(`UPDATE arc_settlement_outbox SET status='failed',block_number=$2,
-        finalized_at=now(),failure_code='ARC_TRANSACTION_REVERTED'
-      WHERE id=$1 AND status IN ('submitted','submission_unknown') RETURNING *`,
-    [settlement.id, receipt.blockNumber ? BigInt(receipt.blockNumber).toString() : null]);
-    await markArcNonceReservation(client, { outboxId: settlement.id, status: 'reconciled' });
+    const failed = await withDbTransaction(client, async (db) => {
+      const updated = await db.query(`UPDATE arc_settlement_outbox SET status='failed',block_number=$2,
+          finalized_at=now(),failure_code='ARC_TRANSACTION_REVERTED'
+        WHERE id=$1 AND status IN ('submitted','submission_unknown') RETURNING *`,
+      [settlement.id, receipt.blockNumber ? BigInt(receipt.blockNumber).toString() : null]);
+      await markArcNonceReservation(db, { outboxId: settlement.id, status: 'reconciled' });
+      await settleArcMainnetPilotCost(db, { operationType: 'settlement', operationId: String(settlement.id),
+        receiptStatus: receipt.status, gasUsed: receipt.gasUsed, effectiveGasPrice: receipt.effectiveGasPrice });
+      return updated;
+    });
     return { status: failed.rows[0]?.status || settlement.status, pending: false, mismatch: false,
       finding: null, settlement: failed.rows[0] || settlement };
   }
@@ -278,11 +324,16 @@ export async function reconcileArcSettlementReceipt(client, { settlement, receip
         && String(parsed.args.worldActionId).toLowerCase() === arcWorldActionHash(settlement.world_action_id).toLowerCase();
     } catch { return false; }
   });
-  const finalized = await client.query(`UPDATE arc_settlement_outbox SET status='final',block_number=$2,log_index=$3,
-      finalized_at=COALESCE(finalized_at,now()),failure_code=NULL
-    WHERE id=$1 AND transaction_hash=$4 AND status IN ('submitted','submission_unknown','final') RETURNING *`,
-  [settlement.id, BigInt(receipt.blockNumber).toString(), Number(BigInt(eventLog.logIndex)), settlement.transaction_hash]);
-  await markArcNonceReservation(client, { outboxId: settlement.id, status: 'reconciled' });
+  const finalized = await withDbTransaction(client, async (db) => {
+    const updated = await db.query(`UPDATE arc_settlement_outbox SET status='final',block_number=$2,log_index=$3,
+        finalized_at=COALESCE(finalized_at,now()),failure_code=NULL
+      WHERE id=$1 AND transaction_hash=$4 AND status IN ('submitted','submission_unknown','final') RETURNING *`,
+    [settlement.id, BigInt(receipt.blockNumber).toString(), Number(BigInt(eventLog.logIndex)), settlement.transaction_hash]);
+    await markArcNonceReservation(db, { outboxId: settlement.id, status: 'reconciled' });
+    await settleArcMainnetPilotCost(db, { operationType: 'settlement', operationId: String(settlement.id),
+      receiptStatus: receipt.status, gasUsed: receipt.gasUsed, effectiveGasPrice: receipt.effectiveGasPrice });
+    return updated;
+  });
   return { status: finalized.rows[0]?.status || settlement.status, pending: false, mismatch: false,
     finding: null, settlement: finalized.rows[0] || settlement };
 }

@@ -15,6 +15,10 @@ import { ARC_MAINNET_CHAIN_ID, ARC_MAINNET_USDC_ADDRESS } from '../src/arc/confi
 import { ARC_SETTLEMENT_POLICY_INTERFACE, enqueueArcAgentEconomicAction } from '../src/arc/agent-economic-action.js';
 import { ArcReadOnlyObserver } from '../src/arc/observer.js';
 import { ArcSettlementOutboxWorker } from '../src/arc/settlement-worker.js';
+import { ArcAgentTokenIssuanceWorker } from '../src/arc/token-issuance-worker.js';
+import { confirmWorldTokenIssuance } from '../src/world-token-issuance.js';
+import { reserveArcMainnetPilotCost, releaseArcMainnetPilotCost,
+  setArcMainnetPilotCostStatus } from '../src/arc/pilot-budget.js';
 import { DeterministicFakeArcSigner, createIsolatedArcMainnetConfig } from './helpers/arc-mainnet-fakes.js';
 import { ARC_SETTLEMENT_INTERFACE, toArcBytes16Uuid } from '../src/arc/settlement.js';
 
@@ -127,10 +131,19 @@ test('Arc Mainnet Agent action reaches persistent outbox, policy evaluation, and
   const childCapabilityId = randomUUID();
   const txHash = HASH;
   const nowMs = Date.now();
+  let engineNowMs = nowMs;
   let engine = null;
   let worker = null;
+  let tokenWorker = null;
   try {
     await applyWorldSchemaAndMigrations(pool, { rootDirectory: repoRoot });
+    await pool.query('DELETE FROM arc_mainnet_pilot_cost_reservations');
+    await pool.query(`UPDATE arc_mainnet_pilot_budget SET spent_usdc_base_units=0,
+      reserved_usdc_base_units=0 WHERE id=1`);
+    await pool.query('DELETE FROM arc_nonce_reservations');
+    await pool.query('DELETE FROM arc_nonce_cursors');
+    await pool.query('DELETE FROM arc_infrastructure_nonce_reservations');
+    await pool.query('DELETE FROM arc_infrastructure_nonce_cursors');
     await pool.query(`INSERT INTO agents(id,name,public_key) VALUES
       ($1,'Arc Mainnet Test Resident A',$2),($3,'Arc Mainnet Test Resident B',$4)`,
     [payerId, `arc-mainnet-test-${payerId}`, recipientId, `arc-mainnet-test-${recipientId}`]);
@@ -152,20 +165,197 @@ test('Arc Mainnet Agent action reaches persistent outbox, policy evaluation, and
     await pool.query(`INSERT INTO world_agent_states(world_id,agent_id,goal,risk_tolerance,next_decision_at)
       VALUES($1,$2,'balanced',0.5,$3),($1,$4,'balanced',0.5,$3)`, [worldId, payerId, new Date(nowMs + 86_400_000), recipientId]);
 
+    await pool.query(`INSERT INTO agent_minds(world_id,agent_id,archetype,current_goal)
+      VALUES($1,$2,'scholar','coordinate a research exchange with peers'),
+        ($1,$3,'maker','support useful research services')`, [worldId, payerId, recipientId]);
+    await pool.query(`INSERT INTO agent_memories(world_id,agent_id,memory_type,summary,importance,world_minutes,
+        consolidation_key,long_term)
+      VALUES($1,$2,'economy','A peer could not record the value of shared research.',0.8,2990,'test-currency-memory',true)`,
+    [worldId, payerId]);
+    await pool.query(`INSERT INTO arc_agent_wallets(world_id,agent_id,chain_id,address,provider,account_type,status,
+        external_identity_id)
+      VALUES($1,$2,$3,$4,'external_kms','eoa','active',818),($1,$5,$3,$6,'external_kms','eoa','active',819)`,
+    [worldId, payerId, ARC_MAINNET_CHAIN_ID, PAYER, recipientId, RECIPIENT]);
+
     const config = createIsolatedArcMainnetConfig({ ARC_SETTLEMENT_RUNTIME_CODE_HASH: RUNTIME_CODE_HASH });
     const rpcClient = fakeMainnetRpc({ worldId, config });
 
-    engine = await startWorldEngine(pool, { worldId, nowProvider: () => nowMs, schedule: false,
+    let allowProposal = false;
+    let responseRecorded = false;
+    let authoringContextObserved = null;
+    const cognitionChoices = [];
+    engine = await startWorldEngine(pool, { worldId, nowProvider: () => engineNowMs, schedule: false,
+      currencyGenesisEnabled: true,
+      chooseCivilizationOption: async (request) => {
+        if (request.choiceType !== 'currency_genesis') return null;
+        const options = request.options || [];
+        const choose = options.find((option) => option.id === 'no_action');
+        let selected = choose;
+        if (allowProposal && request.agentId === payerId
+            && options.some((option) => option.id === 'propose_currency')
+            && !request.state.currentProposal) {
+          selected = options.find((option) => option.id === 'propose_currency');
+        } else if (allowProposal && request.agentId === recipientId
+            && options.some((option) => option.id.startsWith('response:') && option.id.endsWith(':support'))) {
+          selected = options.find((option) => option.id.startsWith('response:') && option.id.endsWith(':support'));
+          responseRecorded = true;
+        } else if (allowProposal && responseRecorded && request.agentId === payerId) {
+          selected = options.find((option) => option.id === `nominate:${request.state.currentProposal?.id}:${recipientId}`)
+            || options.find((option) => option.id.startsWith('nominate:') && option.id.endsWith(`:${recipientId}`))
+            || choose;
+        } else if (allowProposal && request.agentId === recipientId) {
+          selected = options.find((option) => option.id === `candidate:${recipientId}:accept`)
+            || options.find((option) => option.id.startsWith('issuer:') && option.id.endsWith(':issue'))
+            || choose;
+        }
+        if (selected) cognitionChoices.push({ agentId: request.agentId, choice: selected.id });
+        return selected ? { choice: { id: selected.id }, confidence: 0.99, model: 'isolated-resident-cognition' } : null;
+      },
+      authorCurrencyProposal: async (input) => {
+        authoringContextObserved = { agentId: input.resident.agentId, currentGoal: input.resident.currentGoal,
+          goalCount: input.resident.goals.length, memories: input.resident.recentMemories.map((memory) => memory.summary),
+          requirementStatus: input.worldFacts.requirementStatus,
+          recipientCount: input.availableRecipients.length };
+        assert.equal(input.resident.agentId, payerId);
+        assert.equal(input.resident.currentGoal, 'coordinate a research exchange with peers');
+        assert.ok(input.resident.goals.length > 0, 'authoring receives this resident\'s active goals');
+        assert.ok(input.resident.recentMemories.some((memory) =>
+          memory.summary === 'A peer could not record the value of shared research.'),
+        'authoring receives this resident\'s own memory');
+        assert.equal(input.worldFacts.requirementStatus, 'UNRESOLVED');
+        const proposer = input.availableRecipients.find((recipient) => recipient.id === payerId);
+        const peer = input.availableRecipients.find((recipient) => recipient.id === recipientId);
+        assert.ok(proposer && peer, 'the resident receives real recipient options from the isolated world');
+        return { model: 'isolated-resident-authoring', reason: null, specification: {
+          name: 'Research Exchange', symbol: 'REX',
+          meaning: `A value record for ${input.resident.currentGoal}.`,
+          purpose: input.resident.currentGoal,
+          rationale: input.resident.recentMemories[0].summary,
+          decimals: 0,
+          distribution: [
+            { recipientType: 'agent', recipientId: proposer.id, recipientAddress: proposer.address, amount: '600000000' },
+            { recipientType: 'agent', recipientId: peer.id, recipientAddress: peer.address, amount: '400000000' }
+          ],
+          reserveAmount: '0', unallocatedSupplyHandling: 'fully_distributed',
+          ownershipModel: 'erc20_holder_owned', authorityModel: 'no_mint_no_burn'
+        } };
+      },
       onAutonomousBusinessAction: enqueueArcAgentEconomicAction, emergencySink: { write() {} } });
     assert.equal(engine.running, true);
     await pool.query(`UPDATE world_agent_states SET next_decision_at=$3 WHERE world_id=$1 AND agent_id=ANY($2::uuid[])`,
       [worldId, [payerId, recipientId], new Date(nowMs + 86_400_000)]);
 
+    const runCurrencyReview = async () => {
+      await pool.query(`UPDATE world_agent_states SET next_civilization_review_world_minutes=0
+        WHERE world_id=$1`, [worldId]);
+      const before = await pool.query(`SELECT world_minutes FROM world_runtime_state WHERE world_id=$1`, [worldId]);
+      engineNowMs += 60_000;
+      await engine.tickOnce();
+      const after = await pool.query(`SELECT world_minutes FROM world_runtime_state WHERE world_id=$1`, [worldId]);
+      assert.ok(Number(after.rows[0].world_minutes) > Number(before.rows[0].world_minutes),
+        `isolated engine tick did not advance: ${JSON.stringify(engine.getLiveness())}`);
+    };
+    await runCurrencyReview();
+    let requirement = await pool.query(`SELECT status FROM arc_currency_genesis_requirements WHERE world_id=$1`, [worldId]);
+    assert.equal(requirement.rows[0].status, 'UNRESOLVED', 'a no-action cognition choice keeps the persistent requirement alive');
+    assert.equal(Number((await pool.query(`SELECT count(*)::int AS count FROM arc_token_issuance_intents WHERE world_id=$1`,
+      [worldId])).rows[0].count), 0, 'no proposal is created before a resident chooses one');
+    assert.ok(cognitionChoices.some((entry) => entry.choice === 'no_action'));
+
+    allowProposal = true;
+    await runCurrencyReview();
+    let proposal = await pool.query(`SELECT id,status,decision_path,issuer_agent_id,name,specification_hash
+      FROM arc_token_issuance_intents WHERE world_id=$1 ORDER BY created_world_minute,id LIMIT 1`, [worldId]);
+    for (let attempt = 0; attempt < 4 && (!proposal.rowCount || !responseRecorded); attempt += 1) {
+      await runCurrencyReview();
+      proposal = await pool.query(`SELECT id,status,decision_path,issuer_agent_id,name,specification_hash
+        FROM arc_token_issuance_intents WHERE world_id=$1 ORDER BY created_world_minute,id LIMIT 1`, [worldId]);
+    }
+    assert.equal(proposal.rowCount, 1, 'a resident created a proposal through the persistent World Engine review');
+    assert.equal(proposal.rows[0].decision_path, 'world_engine');
+    assert.ok(authoringContextObserved, 'a resident who chose the proposal action invoked local authoring');
+    assert.equal(proposal.rows[0].name, 'Research Exchange', JSON.stringify(authoringContextObserved));
+    assert.ok(proposal.rows[0].specification_hash === null, 'proposal authoring is not itself execution confirmation');
+    const proposalId = proposal.rows[0].id;
+    const response = await pool.query(`SELECT decision,agent_id FROM arc_token_issuance_responses
+      WHERE world_id=$1 AND intent_id=$2`, [worldId, proposalId]);
+    assert.equal(response.rowCount, 1);
+    assert.equal(response.rows[0].agent_id, recipientId);
+    assert.equal(response.rows[0].decision, 'support');
+    await assert.rejects(() => inTransaction(pool, (client) => confirmWorldTokenIssuance(client, {
+      worldId, agentId: recipientId, intentId: proposalId, decision: null,
+      actionId: 'missing-decision-confirmation', worldMinute: 3000
+    })), (error) => error.message === 'TOKEN_ISSUER_DECISION_INVALID');
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      proposal = await pool.query(`SELECT id,status FROM arc_token_issuance_intents WHERE world_id=$1 AND id=$2`,
+        [worldId, proposalId]);
+      if (proposal.rows[0]?.status === 'issuer_confirmed') break;
+      await runCurrencyReview();
+    }
+    proposal = await pool.query(`SELECT id,status,decision_path,issuer_agent_id,name,symbol,specification_hash,
+        transaction_hash,initial_supply_human,distribution,unallocated_supply_handling,ownership_model,authority_model
+      FROM arc_token_issuance_intents WHERE world_id=$1 AND id=$2`, [worldId, proposalId]);
+    assert.equal(proposal.rows[0].issuer_agent_id, recipientId, 'the proposed issuer emerges from resident nomination and acceptance');
+    assert.equal(proposal.rows[0].status, 'issuer_confirmed', 'the selected issuer explicitly confirmed the complete Agent-authored specification');
+    assert.equal(proposal.rows[0].name, 'Research Exchange');
+    assert.equal(proposal.rows[0].symbol, 'REX');
+    assert.equal(proposal.rows[0].initial_supply_human, '1000000000');
+    assert.equal(proposal.rows[0].unallocated_supply_handling, 'fully_distributed');
+    assert.equal(proposal.rows[0].ownership_model, 'erc20_holder_owned');
+    assert.equal(proposal.rows[0].authority_model, 'no_mint_no_burn');
+    assert.ok(cognitionChoices.some((entry) => entry.choice === 'propose_currency'));
+    assert.ok(cognitionChoices.some((entry) => entry.choice.startsWith('response:') && entry.choice.endsWith(':support')));
+    assert.ok(cognitionChoices.some((entry) => entry.choice === `nominate:${proposalId}:${recipientId}`));
+    assert.ok(cognitionChoices.some((entry) => entry.choice === `candidate:${recipientId}:accept`));
+    assert.ok(cognitionChoices.some((entry) => entry.agentId === recipientId
+      && entry.choice === `issuer:${proposalId}:issue`));
+    assert.match(proposal.rows[0].specification_hash, /^0x[0-9a-f]{64}$/i,
+      'the Agent-authored specification has a canonical hash before broadcast');
+    assert.equal(proposal.rows[0].transaction_hash, null, 'no chain submission is claimed by off-chain confirmation');
+    requirement = await pool.query(`SELECT status FROM arc_currency_genesis_requirements WHERE world_id=$1`, [worldId]);
+    assert.notEqual(requirement.rows[0].status, 'SATISFIED');
+    assert.equal(Number((await pool.query(`SELECT count(*)::int AS count FROM arc_agent_tokens WHERE world_id=$1`,
+      [worldId])).rows[0].count), 0, 'no token is created in this isolated acceptance path');
+
+    let tokenBroadcasts = 0;
+    const readOnlyConfig = Object.freeze({ ...config, writesEnabled: false });
+    tokenWorker = new ArcAgentTokenIssuanceWorker({ pool, config: readOnlyConfig,
+      env: {}, signer: { async getAddress() { return PAYER; }, async sendTransaction() { tokenBroadcasts += 1; } },
+      rpcClient: { async getChainId() { return ARC_MAINNET_CHAIN_ID; }, async getBlockNumber() { return '0x1234'; } },
+      isOwner: () => true, intervalMs: 60_000 });
+    await tokenWorker.start({ worldId });
+    assert.equal(tokenWorker.getStatus().mode, 'read_only_reconciliation');
+    assert.equal(tokenWorker.getStatus().writesEnabled, false);
+    assert.equal(tokenBroadcasts, 0, 'closed Mainnet gate prevents token issuance broadcast');
+    await tokenWorker.stop();
+    tokenWorker = null;
+    const revalidatedSchema = await applyWorldSchemaAndMigrations(pool, { rootDirectory: repoRoot });
+    assert.deepEqual(revalidatedSchema.applied, [], 'a restart reapplies no migration and preserves open currency history');
+    assert.ok(revalidatedSchema.alreadyApplied.includes('0002_arc_agent_token_issuance.sql'));
+
+    const fkClient = await pool.connect();
+    try {
+      await fkClient.query('BEGIN');
+      await fkClient.query(`DELETE FROM arc_token_issuance_intents WHERE world_id=$1 AND id=$2`, [worldId, proposalId]);
+      const preservedRequirement = await fkClient.query(`SELECT world_id,capability_generation,status,current_proposal_id
+        FROM arc_currency_genesis_requirements WHERE world_id=$1`, [worldId]);
+      assert.equal(preservedRequirement.rows[0].world_id, worldId);
+      assert.equal(preservedRequirement.rows[0].capability_generation, 1);
+      assert.equal(preservedRequirement.rows[0].current_proposal_id, null,
+        'deleting an intent clears only the nullable proposal pointer');
+      assert.notEqual(preservedRequirement.rows[0].status, 'SATISFIED');
+      await fkClient.query('ROLLBACK');
+    } catch (error) {
+      await fkClient.query('ROLLBACK');
+      throw error;
+    } finally { fkClient.release(); }
+
     const business = await inTransaction(pool, (client) => foundWorldBusiness(client, { worldId, agentId: recipientId,
       actionId: 'arc-mainnet-business-seed', worldTime: 3000,
       proposal: { name: 'Arc Research Studio', businessType: 'research', purpose: 'Offer a research service in the isolated integration world.',
         serviceType: 'research_service', serviceName: 'Research Notes',
-        serviceDescription: 'A deterministic research service for the isolated Arc integration world.', capitalUsdc: '250.00000000' } }));
+        serviceDescription: 'A deterministic research service for the isolated Arc integration world.', capitalUsdc: '250.00000000',
+        basePriceUsdc: '5.00000000' } }));
 
     await pool.query(`UPDATE world_agent_states SET status='performing',planned_action='business_work',
         planned_context=$3::jsonb,action_started_at=$4,action_ends_at=$5,next_decision_at=$6
@@ -199,6 +389,8 @@ test('Arc Mainnet Agent action reaches persistent outbox, policy evaluation, and
     assert.equal(outboxBeforePolicy.rows[0].from_agent_id, payerId);
     assert.equal(outboxBeforePolicy.rows[0].to_agent_id, recipientId);
     assert.equal(outboxBeforePolicy.rows[0].action_family, 'resident_service_purchase');
+    assert.ok(Number(outboxBeforePolicy.rows[0].simulated_amount_usdc) < 10,
+      'the real Agent action path stays within the shared 10 USDC pilot budget');
     assert.equal(String(outboxBeforePolicy.rows[0].world_event_id), String(actionResult.rows[0].id));
     const replayedOutbox = await inTransaction(pool, (client) => enqueueArcAgentEconomicAction(client, {
       worldId, worldActionId: outboxBeforePolicy.rows[0].world_action_id,
@@ -212,9 +404,6 @@ test('Arc Mainnet Agent action reaches persistent outbox, policy evaluation, and
     assert.equal(String((await pool.query(`SELECT count(*)::int AS count FROM arc_settlement_outbox WHERE world_id=$1`,
       [worldId])).rows[0].count), '1');
 
-    await pool.query(`INSERT INTO arc_agent_wallets(world_id,agent_id,chain_id,address,provider,account_type,status)
-      VALUES($1,$2,$3,$4,'external_kms','eoa','active'),($1,$5,$3,$6,'external_kms','eoa','active')`,
-    [worldId, payerId, ARC_MAINNET_CHAIN_ID, PAYER, recipientId, RECIPIENT]);
     await pool.query(`INSERT INTO arc_spending_policies(world_id,agent_id,chain_id,token_address,
         per_action_limit_base_units,daily_limit_base_units,settlement_basis_points,allowed_action_families,
         allowed_contracts,emergency_paused,policy_version)
@@ -293,7 +482,42 @@ test('Arc Mainnet Agent action reaches persistent outbox, policy evaluation, and
       assert.equal(status.database.capabilityProvenance.total, 1);
       assert.equal(status.database.recentSettlements[0].transactionHash, txHash);
     } finally { await observer.stop(); }
+
+    await pool.query('DELETE FROM arc_mainnet_pilot_cost_reservations');
+    await pool.query(`UPDATE arc_mainnet_pilot_budget SET spent_usdc_base_units=0,
+      reserved_usdc_base_units=0 WHERE id=1`);
+    const reserveConcurrent = async (operationId) => {
+      try {
+        return await inTransaction(pool, (client) => reserveArcMainnetPilotCost(client, {
+          operationType: 'token_creation', operationId, worldId,
+          transferUsdcBaseUnits: 6_000_000n, gasLimit: 1n, maxFeePerGas: 1n
+        }));
+      } catch (error) {
+        if (error.code === 'ARC_MAINNET_PILOT_COST_CAP_EXCEEDED') return null;
+        throw error;
+      }
+    };
+    const concurrentBudgetResults = await Promise.all([
+      reserveConcurrent(`budget-a-${worldId}`), reserveConcurrent(`budget-b-${worldId}`)
+    ]);
+    assert.equal(concurrentBudgetResults.filter(Boolean).length, 1,
+      'two concurrent operations cannot each reserve the same remaining 10 USDC pilot budget');
+    const reservedOperation = concurrentBudgetResults[0] ? `budget-a-${worldId}` : `budget-b-${worldId}`;
+    await inTransaction(pool, (client) => setArcMainnetPilotCostStatus(client, {
+      operationType: 'token_creation', operationId: reservedOperation, status: 'submission_unknown'
+    }));
+    await assert.rejects(() => inTransaction(pool, (client) => releaseArcMainnetPilotCost(client, {
+      operationType: 'token_creation', operationId: reservedOperation
+    })), { code: 'ARC_PILOT_COST_RESERVATION_CANNOT_BE_RELEASED' });
+    const budgetAfterUnknown = await pool.query(`SELECT reserved_usdc_base_units::text AS reserved
+      FROM arc_mainnet_pilot_budget WHERE id=1`);
+    assert.equal(budgetAfterUnknown.rows[0].reserved, '6000001',
+      'unknown submission keeps its global pilot budget reservation');
+    await pool.query('DELETE FROM arc_mainnet_pilot_cost_reservations');
+    await pool.query(`UPDATE arc_mainnet_pilot_budget SET spent_usdc_base_units=0,
+      reserved_usdc_base_units=0 WHERE id=1`);
   } finally {
+    if (tokenWorker) await tokenWorker.stop();
     if (worker) await worker.stop();
     if (engine) await engine.stop();
     await pool.end();
