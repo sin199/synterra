@@ -474,11 +474,11 @@ function makeStars() {
 // ---------------------------------------------------------------------------------------------
 // static terrain
 function makeTerrain() {
-  const rings = 56, segments = 160, positions = [], colors = [], index = [];
+  const rings = 56, segments = 160, positions = [], colors = [], index = [], grassMask = [], snowMask = [];
   const grassA = new THREE.Color('#78a956'), grassB = new THREE.Color('#5d9147'), grassC = new THREE.Color('#9bbf62');
   const sand = new THREE.Color('#e3cf9a'), rock = new THREE.Color('#8b8a7a'), wet = new THREE.Color('#b8a47a');
   const color = new THREE.Color();
-  positions.push(0, heightAt(0, 0), 0); color.copy(grassA); colors.push(color.r, color.g, color.b);
+  positions.push(0, heightAt(0, 0), 0); color.copy(grassA); colors.push(color.r, color.g, color.b); grassMask.push(1); snowMask.push(1);
   for (let ring = 1; ring <= rings; ring += 1) {
     const t = ring / rings, d = Math.pow(t, 0.85) * 1.08;
     for (let s = 0; s < segments; s += 1) {
@@ -487,11 +487,15 @@ function makeTerrain() {
       positions.push(x, y, z);
       const n = fbm(x * 0.35, z * 0.35);
       color.copy(grassB).lerp(grassA, n).lerp(grassC, Math.max(0, fbm(x * 0.12 + 9, z * 0.12) - 0.55) * 1.4);
-      if (y > 1.2) color.lerp(rock, Math.min(1, (y - 1.2) * 0.8));
+      const rocky = y > 1.2 ? Math.min(1, (y - 1.2) * 0.8) : 0;
+      if (rocky) color.lerp(rock, rocky);
       const coast = smooth(0.88, 0.95, d);
       if (coast > 0) color.lerp(sand, coast);
       if (y < WATER_LEVEL + 0.05) color.lerp(wet, 0.6);
       colors.push(color.r, color.g, color.b);
+      // how much of this vertex is vegetation (seasonal tint) and how much can hold snow
+      grassMask.push((1 - rocky) * (1 - coast));
+      snowMask.push(y < WATER_LEVEL + 0.05 ? 0 : 1 - coast * 0.6);
     }
   }
   for (let s = 0; s < segments; s += 1) index.push(0, 1 + ((s + 1) % segments), 1 + s);
@@ -508,7 +512,27 @@ function makeTerrain() {
   geometry.setIndex(index); geometry.computeVertexNormals();
   const mesh = new THREE.Mesh(geometry, new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.95, flatShading: true }));
   mesh.receiveShadow = true;
+  mesh.userData.baseColors = Float32Array.from(colors);
+  mesh.userData.grassMask = Float32Array.from(grassMask);
+  mesh.userData.snowMask = Float32Array.from(snowMask);
   return mesh;
+}
+
+// Seasonal / snow tint of the ground. `tint` = { autumn, winter, summer, snow } each 0..1.
+const SEASON_GROUND = { autumn: new THREE.Color('#b39a4e'), winter: new THREE.Color('#8e9a82'), summer: new THREE.Color('#9fb752'), snow: new THREE.Color('#eef3f8') };
+function tintTerrain(mesh, tint) {
+  const { baseColors, grassMask, snowMask } = mesh.userData;
+  const attribute = mesh.geometry.attributes.color, out = attribute.array, c = new THREE.Color();
+  for (let i = 0, v = 0; i < out.length; i += 3, v += 1) {
+    c.setRGB(baseColors[i], baseColors[i + 1], baseColors[i + 2]);
+    const g = grassMask[v];
+    if (tint.summer) c.lerp(SEASON_GROUND.summer, 0.16 * tint.summer * g);
+    if (tint.autumn) c.lerp(SEASON_GROUND.autumn, 0.34 * tint.autumn * g);
+    if (tint.winter) c.lerp(SEASON_GROUND.winter, 0.36 * tint.winter * g);
+    if (tint.snow) c.lerp(SEASON_GROUND.snow, 0.88 * tint.snow * snowMask[v]);
+    out[i] = c.r; out[i + 1] = c.g; out[i + 2] = c.b;
+  }
+  attribute.needsUpdate = true;
 }
 
 function makeWater() {
@@ -590,6 +614,81 @@ function glowTexture() {
   const texture = new THREE.CanvasTexture(canvas); texture.colorSpace = THREE.SRGBColorSpace; return texture;
 }
 
+function flakeTexture() {
+  const canvas = document.createElement('canvas'); canvas.width = canvas.height = 32;
+  const context = canvas.getContext('2d');
+  const gradient = context.createRadialGradient(16, 16, 0, 16, 16, 16);
+  gradient.addColorStop(0, 'rgba(255,255,255,1)'); gradient.addColorStop(0.45, 'rgba(255,255,255,0.8)'); gradient.addColorStop(1, 'rgba(255,255,255,0)');
+  context.fillStyle = gradient; context.fillRect(0, 0, 32, 32);
+  return new THREE.CanvasTexture(canvas);
+}
+
+// ---- residents' cottages: local space, front (door) faces +z toward the plaza ---------------------
+const COTTAGE_WALLS = ['#f3e6cf', '#e9d6c0', '#dfe7ef', '#f0dcd0', '#e4ecd8', '#f5ecd9'];
+const COTTAGE_ROOFS = ['#b5523b', '#6f4f8f', '#3f6f8f', '#8a5a34', '#4f7f4a', '#a8433f'];
+function buildCottage(b, seed, windowMaterial, groundDrop) {
+  const r = rng(seed), h = hash(seed);
+  const wall = COTTAGE_WALLS[h % COTTAGE_WALLS.length], roof = COTTAGE_ROOFS[(h >>> 5) % COTTAGE_ROOFS.length];
+  b.box(1.5, 0.14 + groundDrop, 1.25, '#a59a86', 0, -groundDrop, -0.05, { cast: false });
+  b.box(1.2, 0.78, 0.95, wall, 0, 0.14, -0.1);
+  b.gable(1.42, 0.6, 1.15, roof, 0, 0.92, -0.1);
+  b.box(0.16, 0.42, 0.16, '#8a7a6a', 0.34, 1.1, -0.35);
+  b.door(-0.22, 0.14, 0.38, '#6b4a32', 0.24, 0.42);
+  b.box(0.26, 0.22, 0.04, windowMaterial, 0.28, 0.42, 0.38, { cast: false });
+  b.box(0.04, 0.22, 0.26, windowMaterial, 0.61, 0.42, -0.1, { cast: false });
+  b.box(0.04, 0.22, 0.26, windowMaterial, -0.61, 0.42, -0.1, { cast: false });
+  b.box(0.32, 0.04, 0.08, '#efe7d6', 0.28, 0.38, 0.42, { cast: false });
+  // little front garden: picket posts, a flower box and a bench
+  for (let i = 0; i < 5; i += 1) b.box(0.04, 0.2, 0.04, '#f2ead9', -0.7 + i * 0.35, 0.1, 0.72, { cast: false });
+  b.box(1.45, 0.03, 0.03, '#f2ead9', 0, 0.22, 0.72, { cast: false });
+  b.box(0.3, 0.06, 0.08, '#7f5a3b', 0.28, 0.32, 0.44, { cast: false });
+  for (let i = 0; i < 3; i += 1) b.sphere(0.04, ['#f2a1c1', '#f5d34f', '#ff8a5c'][Math.floor(r() * 3)], 0.19 + i * 0.09, 0.38, 0.44, { cast: false });
+  return { chimney: [0.34, 1.6, -0.35] };
+}
+
+// ---- weather particles ---------------------------------------------------------------------------
+const RAIN_MAX = 2600, SNOW_MAX = 1800;
+const PRECIP_BOX = { x: 26, z: 22, top: 15 };
+function makeRain() {
+  const positions = new Float32Array(RAIN_MAX * 6), seeds = new Float32Array(RAIN_MAX * 3), r = rng('rain');
+  for (let i = 0; i < RAIN_MAX; i += 1) { seeds[i * 3] = (r() * 2 - 1) * PRECIP_BOX.x; seeds[i * 3 + 1] = r() * PRECIP_BOX.top; seeds[i * 3 + 2] = (r() * 2 - 1) * PRECIP_BOX.z; }
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3).setUsage(THREE.DynamicDrawUsage));
+  geometry.setDrawRange(0, 0);
+  const material = new THREE.LineBasicMaterial({ color: '#c9d6e6', transparent: true, opacity: 0.5, depthWrite: false, fog: true });
+  const mesh = new THREE.LineSegments(geometry, material); mesh.frustumCulled = false; mesh.renderOrder = 3;
+  return { mesh, positions, seeds, material };
+}
+function makeSnow(texture) {
+  const positions = new Float32Array(SNOW_MAX * 3), seeds = new Float32Array(SNOW_MAX * 4), r = rng('snow');
+  for (let i = 0; i < SNOW_MAX; i += 1) { seeds[i * 4] = (r() * 2 - 1) * PRECIP_BOX.x; seeds[i * 4 + 1] = r() * PRECIP_BOX.top; seeds[i * 4 + 2] = (r() * 2 - 1) * PRECIP_BOX.z; seeds[i * 4 + 3] = r() * TAU; }
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3).setUsage(THREE.DynamicDrawUsage));
+  geometry.setDrawRange(0, 0);
+  const material = new THREE.PointsMaterial({ color: '#ffffff', map: texture, size: 0.17, sizeAttenuation: true, transparent: true, opacity: 0.95, depthWrite: false, alphaTest: 0.02 });
+  const mesh = new THREE.Points(geometry, material); mesh.frustumCulled = false; mesh.renderOrder = 3;
+  return { mesh, positions, seeds, material };
+}
+
+// Visual targets for each sim weather condition (all 0..1). Unknown conditions fall back to clear.
+const WEATHER_LOOK = {
+  clear: { cloud: 0.2, overcast: 0, rain: 0, snow: 0, storm: 0, fog: 0, heat: 0 },
+  cloudy: { cloud: 0.85, overcast: 0.45, rain: 0, snow: 0, storm: 0, fog: 0.08, heat: 0 },
+  fog: { cloud: 0.45, overcast: 0.4, rain: 0, snow: 0, storm: 0, fog: 1, heat: 0 },
+  rain: { cloud: 1, overcast: 0.62, rain: 0.7, snow: 0, storm: 0, fog: 0.25, heat: 0 },
+  storm: { cloud: 1, overcast: 0.9, rain: 1, snow: 0, storm: 1, fog: 0.35, heat: 0 },
+  snow: { cloud: 0.95, overcast: 0.5, rain: 0, snow: 0.8, storm: 0, fog: 0.3, heat: 0 },
+  heatwave: { cloud: 0, overcast: 0, rain: 0, snow: 0, storm: 0, fog: 0, heat: 1 }
+};
+const WEATHER_ICON = { clear: '☀', cloudy: '☁', fog: '≋', rain: '☂', storm: '⚡', snow: '❄', heatwave: '♨' };
+const SEASON_LABEL = { spring: ['SPRING', '春'], summer: ['SUMMER', '夏'], autumn: ['AUTUMN', '秋'], winter: ['WINTER', '冬'] };
+const WEEKDAY_ZH = { Monday: '周一', Tuesday: '周二', Wednesday: '周三', Thursday: '周四', Friday: '周五', Saturday: '周六', Sunday: '周日' };
+const CLOSED_REASON = { storm: '风暴关闭', closed_hours: '已打烊', inactive: '停用', unknown: '关闭' };
+const VARIANT_LABEL = { sleep: '睡觉', home_rest: '在家休息', home_meal: '在家做饭', cafe_meal: '咖啡馆用餐', picnic: '野餐', snack: '小吃',
+  meal: '用餐', garden_stroll: '花园散步', garden_rest: '花园小憩', stargazing: '观星', observatory_study: '观测学习', library_study: '图书馆学习',
+  gathering: '周末聚会', coffee_chat: '咖啡闲聊', chat: '聊天', night_shift: '夜班', data_shift: '数据值班', workshop_shift: '工坊轮班' };
+const isHome = (location) => typeof location === 'string' && location.startsWith('home:');
+
 // ---------------------------------------------------------------------------------------------
 export function createWorld3D(canvas, labelsElement, onSelect) {
   let renderer;
@@ -654,18 +753,33 @@ export function createWorld3D(canvas, labelsElement, onSelect) {
   const raycaster = new THREE.Raycaster(), ndc = new THREE.Vector2(), projected = new THREE.Vector3();
   let projectedResidents = [];
   const clouds = new THREE.Group(); scene.add(clouds);
+  const cloudMat = new THREE.MeshStandardMaterial({ color: '#ffffff', roughness: 1, flatShading: true, transparent: true, opacity: 0.92 });
   {
-    const r = rng('clouds'), cloudMat = new THREE.MeshStandardMaterial({ color: '#ffffff', roughness: 1, flatShading: true, transparent: true, opacity: 0.92 });
-    for (let i = 0; i < 7; i += 1) {
+    const r = rng('clouds');
+    for (let i = 0; i < 18; i += 1) {
       const cloud = new THREE.Group();
       for (let k = 0; k < 4; k += 1) {
         const puff = new THREE.Mesh(new THREE.IcosahedronGeometry(1 + r() * 0.9, 0), cloudMat);
         puff.position.set(k * 1.3 - 2, r() * 0.5, (r() - 0.5) * 1.2); puff.scale.y = 0.6; cloud.add(puff);
       }
-      cloud.userData.angle = r() * TAU; cloud.userData.radius = 20 + r() * 26; cloud.userData.speed = 0.004 + r() * 0.006;
-      cloud.position.y = 11 + r() * 5; clouds.add(cloud);
+      // the first 7 are the fair-weather clouds; the rest only appear as cover grows. All stay outside the
+      // town ring (or high above it) so they never sit between the camera and the residents.
+      cloud.userData.angle = r() * TAU; cloud.userData.radius = 21 + r() * 26; cloud.userData.speed = 0.004 + r() * 0.006;
+      cloud.userData.baseY = i < 7 ? 11 + r() * 5 : 13 + r() * 6; cloud.position.y = cloud.userData.baseY; cloud.visible = i < 7; clouds.add(cloud);
     }
   }
+  // ---- weather state ------------------------------------------------------------------------------
+  const rain = makeRain(), snow = makeSnow(flakeTexture());
+  scene.add(rain.mesh, snow.mesh);
+  const lightning = new THREE.AmbientLight('#dfe8ff', 0); scene.add(lightning);
+  const weatherNow = { cloud: 0.2, overcast: 0, rain: 0, snow: 0, storm: 0, fog: 0, heat: 0, wind: 10, windAngle: 0.7, flash: 0, nextFlash: 0, initialised: false };
+  const groundTint = { autumn: 0, winter: 0, summer: 0, snow: 0 }, groundTarget = { autumn: 0, winter: 0, summer: 0, snow: 0 };
+  let groundApplied = null, natureTrees = null;
+  const homeWindowMats = new Map(), placeWindowMats = [], placeGlows = [];
+  let homeSlots = [], homeById = new Map();
+  const hud = document.createElement('div'); hud.className = 'world3d-hud'; hud.hidden = true; hud.setAttribute('aria-live', 'off');
+  (labelsElement.parentElement || labelsElement).append(hud);
+  let hudSignature = '';
 
   // ---- layout ------------------------------------------------------------------------------------
   function placeCenters(scenes) {
@@ -699,6 +813,56 @@ export function createWorld3D(canvas, labelsElement, onSelect) {
     return { center, u, p: [-u[1], u[0]], front: [center[0] - u[0] * 2.25, center[1] - u[1] * 2.25], angle: Math.atan2(u[1], u[0]) };
   }
 
+  // Residents' homes live in an outer residential ring. The sim's home position only supplies the
+  // preferred direction (its radius ~1.1 is "edge of town"); each cottage is nudged to the nearest
+  // free slot that is on land, clear of places / spoke roads / other cottages, and whose straight
+  // footpath back to the plaza does not cut through a place.
+  function computeHomeSlots(residents, frames) {
+    const segment = (px, pz, ax, az, bx, bz) => {
+      const dx = bx - ax, dz = bz - az, t = Math.max(0, Math.min(1, ((px - ax) * dx + (pz - az) * dz) / (dx * dx + dz * dz || 1)));
+      return Math.hypot(px - (ax + dx * t), pz - (az + dz * t));
+    };
+    const wanted = residents.filter((resident) => resident?.home && typeof resident.home === 'object').map((resident) => {
+      const x = Number(resident.home?.position?.x), z = Number(resident.home?.position?.z);
+      const desired = Number.isFinite(x) && Number.isFinite(z) && Math.hypot(x, z) > 0.05 ? Math.atan2(z, x) : (hash(`home:${resident.id}`) % 3600) / 3600 * TAU;
+      return { id: resident.id, location: typeof resident.home.location === 'string' && isHome(resident.home.location) ? resident.home.location : `home:${resident.id}`, desired };
+    }).sort((a, b) => a.desired - b.desired || (a.id < b.id ? -1 : 1));
+    const slots = [];
+    const valid = (x, z, ux, uz) => {
+      if (islandDistance(x, z) > 0.86 || heightAt(x, z) > 1.6) return false;
+      const sx = ux * PLAZA_RADIUS, sz = uz * PLAZA_RADIUS, fx = x - ux * 1.25, fz = z - uz * 1.25;
+      for (const frame of frames) {
+        if (Math.hypot(x - frame.center[0], z - frame.center[1]) < 3.2) return false;
+        if (segment(x, z, frame.u[0] * PLAZA_RADIUS, frame.u[1] * PLAZA_RADIUS, frame.front[0], frame.front[1]) < 1.5) return false;
+        if (segment(frame.center[0], frame.center[1], sx, sz, fx, fz) < 2.5) return false;
+        if (segment(frame.front[0], frame.front[1], sx, sz, fx, fz) < 1.2) return false;
+      }
+      for (const slot of slots) {
+        if (Math.hypot(x - slot.center[0], z - slot.center[1]) < 2.0) return false;
+        if (segment(x, z, slot.pathStart[0], slot.pathStart[1], slot.front[0], slot.front[1]) < 1.15) return false;
+        if (segment(slot.center[0], slot.center[1], sx, sz, fx, fz) < 1.15) return false;
+      }
+      return true;
+    };
+    for (const item of wanted) {
+      let found = null;
+      for (const ring of [13.6, 15.3, 16.8]) {
+        for (let k = 0; k < 160 && !found; k += 1) {
+          const angle = item.desired + (k % 2 ? 1 : -1) * Math.ceil(k / 2) * 0.02;
+          const x = Math.cos(angle) * ring, z = Math.sin(angle) * ring * 0.82, length = Math.hypot(x, z), ux = x / length, uz = z / length;
+          if (valid(x, z, ux, uz)) found = { x, z, ux, uz };
+        }
+        if (found) break;
+      }
+      if (!found) continue; // no room: the resident is drawn at the fallback spot instead of a cottage
+      const { x, z, ux, uz } = found;
+      slots.push({ id: item.id, location: item.location, center: [x, z], u: [ux, uz], p: [-uz, ux],
+        front: [x - ux * 1.25, z - uz * 1.25], pathStart: [ux * (PLAZA_RADIUS - 0.15), uz * (PLAZA_RADIUS - 0.15)],
+        angle: Math.atan2(uz, ux), y: heightAt(x, z) });
+    }
+    return slots;
+  }
+
   function layout(now) {
     const scenes = data?.scenes || [], residents = data?.residents || [];
     const frames = townFrames;
@@ -715,7 +879,7 @@ export function createWorld3D(canvas, labelsElement, onSelect) {
       if (resident.currentStatus === 'walking' || groups.has(resident.location) === false) continue;
       const target = destinationGroups.get(resident.location) || []; target.push(resident); destinationGroups.set(resident.location, target);
     }
-    const frameFor = (place) => { const index = sceneByName.get(place); return index === undefined ? null : frames[index]; };
+    const frameFor = (place) => { const index = sceneByName.get(place); return index === undefined ? (homeById.get(place) || null) : frames[index]; };
     const spotFor = (resident, place, buckets, fallbackOrder) => {
       const members = buckets.get(place) || [resident];
       const order = Math.max(0, members.findIndex((item) => item.id === resident.id)), total = members.length;
@@ -766,13 +930,18 @@ export function createWorld3D(canvas, labelsElement, onSelect) {
   }
 
   // ---- town construction (rebuilt only when the set of places changes) ---------------------------
-  function buildTown(scenes, frames) {
+  function buildTown(scenes, frames, homes = []) {
     if (townGroup) {
       scene.remove(townGroup);
-      townGroup.traverse((object) => { if (object.isMesh || object.isInstancedMesh) object.geometry?.dispose(); });
+      townGroup.traverse((object) => { if (object.isMesh || object.isInstancedMesh) object.geometry?.dispose(); if (object.isSprite) object.material.dispose(); });
       for (const light of lampLights) scene.remove(light);
     }
-    dynamicParts = []; lampLights = []; glowSprites = [];
+    for (const material of [...placeWindowMats, ...homeWindowMats.values()]) material.dispose();
+    dynamicParts = []; lampLights = []; glowSprites = []; placeWindowMats.length = 0; placeGlows.length = 0; homeWindowMats.clear();
+    const glowAt = (x, y, z, size) => {
+      const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: glowMap, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, opacity: 0 }));
+      sprite.position.set(x, y, z); sprite.scale.set(size, size, 1); sprite.userData.dynamic = true; return sprite;
+    };
     const raw = new THREE.Group();
     const b = new Builder(raw, materials);
     // plaza
@@ -806,8 +975,29 @@ export function createWorld3D(canvas, labelsElement, onSelect) {
       place.position.set(frame.center[0], 0, frame.center[1]);
       place.rotation.y = Math.atan2(-frame.center[0], -frame.center[1]);
       raw.add(place);
-      buildPlace(new Builder(place, materials), type, scenes[index].name);
+      const windowMaterial = materials.window.clone(); placeWindowMats.push(windowMaterial);
+      buildPlace(new Builder(place, { ...materials, window: windowMaterial }), type, scenes[index].name);
+      const glow = glowAt(frame.front[0] + frame.u[0] * 0.6, 0.9, frame.front[1] + frame.u[1] * 0.6, 2.6); raw.add(glow); placeGlows.push(glow);
     });
+    // residents' cottages, each with its own footpath back to the plaza
+    for (const slot of homes) {
+      const [x, z] = slot.center;
+      const corners = [[0.8, 0.7], [-0.8, 0.7], [0.8, -0.7], [-0.8, -0.7]].map(([a, c]) => heightAt(x + slot.p[0] * a + slot.u[0] * c, z + slot.p[1] * a + slot.u[1] * c));
+      const groundDrop = Math.max(0, slot.y - Math.min(...corners)) + 0.04;
+      const cottage = new THREE.Group(); cottage.position.set(x, slot.y, z); cottage.rotation.y = Math.atan2(-x, -z); raw.add(cottage);
+      const windowMaterial = materials.window.clone(); homeWindowMats.set(slot.id, windowMaterial);
+      buildCottage(new Builder(cottage, { ...materials, window: windowMaterial }), slot.location, windowMaterial, groundDrop);
+      const glow = glowAt(x - slot.u[0] * 0.75 + slot.p[0] * 0.28, slot.y + 0.55, z - slot.u[1] * 0.75 + slot.p[1] * 0.28, 1.3);
+      glow.userData.homeId = slot.id; raw.add(glow);
+      const [sx, sz] = slot.pathStart, [ex, ez] = [slot.front[0] + slot.u[0] * 0.55, slot.front[1] + slot.u[1] * 0.55];
+      const length = Math.hypot(ex - sx, ez - sz), pieces = Math.max(1, Math.ceil(length / 1.1)), ry = -Math.atan2(ez - sz, ex - sx);
+      for (let i = 0; i < pieces; i += 1) {
+        const a = i / pieces, c = (i + 1) / pieces;
+        const ax = sx + (ex - sx) * a, az = sz + (ez - sz) * a, cx = sx + (ex - sx) * c, cz = sz + (ez - sz) * c;
+        const ha = Math.max(0, heightAt(ax, az)), hc = Math.max(0, heightAt(cx, cz)), span = length / pieces;
+        b.box(span + 0.06, 0.03, 0.5, '#cdbb92', (ax + cx) / 2, (ha + hc) / 2 - 0.01, (az + cz) / 2, { ry, rz: Math.atan2(hc - ha, span), cast: false });
+      }
+    }
     // footpaths between neighbouring places
     const order = frames.map((frame, index) => [frame.angle, index]).sort((x, y) => x[0] - y[0]);
     for (let i = 0; i < order.length && order.length > 2; i += 1) {
@@ -820,14 +1010,19 @@ export function createWorld3D(canvas, labelsElement, onSelect) {
     merged.traverse((object) => {
       if (object.userData.dynamic) dynamicParts.push(object);
       if (object.userData.glow) glowSprites.push(object);
+      if (object.userData.homeId) homeWindowMats.get(object.userData.homeId).userData.glow = object;
     });
     // soft contact shadows under buildings (fake ambient occlusion)
     for (const frame of frames) {
       const blob = new THREE.Mesh(blobGeometry, blobMaterial); blob.scale.set(5.2, 1, 5.2); blob.position.set(frame.center[0], 0.045, frame.center[1]); blob.renderOrder = 1; merged.add(blob);
     }
     const hub = new THREE.Mesh(blobGeometry, blobMaterial); hub.scale.set(5, 1, 5); hub.position.y = 0.05; hub.renderOrder = 1; merged.add(hub);
-    merged.add(scatterNature(frames));
+    for (const slot of homes) {
+      const blob = new THREE.Mesh(blobGeometry, blobMaterial); blob.scale.set(2.6, 1, 2.6); blob.position.set(slot.center[0], slot.y + 0.05, slot.center[1]); blob.renderOrder = 1; merged.add(blob);
+    }
+    merged.add(scatterNature(frames, homes));
     townGroup = merged; scene.add(townGroup);
+    groundApplied = null; // re-apply seasonal colours to the fresh tree instances
   }
 
   function lampPost(b, x, z) {
@@ -839,10 +1034,16 @@ export function createWorld3D(canvas, labelsElement, onSelect) {
     b.group.add(sprite);
   }
 
-  function scatterNature(frames) {
+  function scatterNature(frames, homes = []) {
     const group = new THREE.Group(), r = rng('synterra-nature');
     const blocked = (x, z, clearance) => {
       if (Math.hypot(x, z) < PLAZA_RADIUS + 1.2 + clearance) return true;
+      for (const slot of homes) {
+        if (Math.hypot(x - slot.center[0], z - slot.center[1]) < 1.5 + clearance) return true;
+        const [ax, az] = slot.pathStart, [bx, bz] = slot.front;
+        const t = Math.max(0, Math.min(1, ((x - ax) * (bx - ax) + (z - az) * (bz - az)) / ((bx - ax) ** 2 + (bz - az) ** 2 || 1)));
+        if (Math.hypot(x - (ax + (bx - ax) * t), z - (az + (bz - az) * t)) < 0.45 + clearance) return true;
+      }
       for (const frame of frames) {
         if (Math.hypot(x - frame.center[0], z - frame.center[1]) < 2.4 + clearance) return true;
         if (Math.hypot(x - frame.front[0], z - frame.front[1]) < 1.5 + clearance) return true;
@@ -884,6 +1085,8 @@ export function createWorld3D(canvas, labelsElement, onSelect) {
       round.setColorAt(i, autumn ? color.setHSL(0.08 + tree.hue * 0.04, 0.62, 0.5) : color.setHSL(0.27 + tree.hue * 0.08, 0.45, 0.36 + tree.hue * 0.07));
     });
     for (const mesh of [trunk, pine, round]) { mesh.castShadow = true; mesh.receiveShadow = true; group.add(mesh); }
+    const baseOf = (mesh) => mesh.instanceColor ? Float32Array.from(mesh.instanceColor.array) : null;
+    natureTrees = { pine, round, pineBase: baseOf(pine), roundBase: baseOf(round), roundHue: rounds.map((tree) => tree.hue), flowers: null };
     // rocks, bushes and flowers
     const smalls = [];
     for (let attempt = 0; attempt < 1400 && smalls.length < 420; attempt += 1) {
@@ -901,10 +1104,11 @@ export function createWorld3D(canvas, labelsElement, onSelect) {
         mesh.setMatrixAt(i, dummy.matrix); mesh.setColorAt(i, colorFor(item));
       });
       mesh.castShadow = cast; mesh.receiveShadow = true; group.add(mesh);
+      return mesh;
     };
     make(new THREE.DodecahedronGeometry(0.22, 0), smalls.filter((s) => s.kind === 'rock'), (s) => color.setHSL(0.1, 0.06, 0.45 + s.hue * 0.15), true);
     make(new THREE.IcosahedronGeometry(0.25, 0).translate(0, 0.15, 0), smalls.filter((s) => s.kind === 'bush'), (s) => color.setHSL(0.28 + s.hue * 0.06, 0.45, 0.33), true);
-    make(new THREE.IcosahedronGeometry(0.06, 0).translate(0, 0.08, 0), smalls.filter((s) => s.kind === 'flower'),
+    natureTrees.flowers = make(new THREE.IcosahedronGeometry(0.06, 0).translate(0, 0.08, 0), smalls.filter((s) => s.kind === 'flower'),
       (s) => color.set(['#f2a1c1', '#f5d34f', '#ffffff', '#c58df0', '#ff8a5c'][Math.floor(s.hue * 5)]), false);
     return group;
   }
@@ -932,8 +1136,14 @@ export function createWorld3D(canvas, labelsElement, onSelect) {
 
   function activityFor(resident, now) {
     if (resident.currentStatus === 'walking') {
-      const shortTarget = String(resident.targetLocation || '目标地点').replace(/^.+?'s\s+/, '');
+      const target = resident.targetLocationLabel || resident.targetLocation;
+      const shortTarget = isHome(resident.targetLocation) ? '家' : String(target || '目标地点').replace(/^.+?'s\s+/, '');
       return { label: `前往 ${shortTarget}`, kind: 'travel' };
+    }
+    if (resident.asleep) return { label: '睡觉', kind: 'care' };
+    if (resident.currentStatus === 'performing' && VARIANT_LABEL[resident.activityVariant]) {
+      const kinds = { rest: 'care', eat: 'care', learn: 'learn', socialize: 'socialize', work: 'work', cooperate: 'work', trade: 'trade' };
+      return { label: VARIANT_LABEL[resident.activityVariant], kind: kinds[resident.currentAction] || 'care' };
     }
     if (resident.currentStatus === 'performing') {
       const actions = { work: ['工作', 'work'], learn: ['学习', 'learn'], rest: ['休息', 'care'],
@@ -978,6 +1188,12 @@ export function createWorld3D(canvas, labelsElement, onSelect) {
       }
       const node = labelNodes.get(key);
       node.dataset.type = sceneItem.sceneType || 'commons';
+      const closed = sceneItem.openNow === false;
+      node.classList.toggle('is-closed', closed);
+      const shortName = sceneItem.name.replace(/^.+?'s\s+/, '');
+      node.textContent = closed ? `${shortName} · ${CLOSED_REASON[sceneItem.closedReason] || '关闭'}` : shortName;
+      const hours = sceneItem.opensAt && closed ? ` · ${sceneItem.opensAt} 开门` : sceneItem.closesAt && !closed ? ` · 营业至 ${sceneItem.closesAt}` : '';
+      node.title = `${sceneItem.name}${closed ? ` · ${CLOSED_REASON[sceneItem.closedReason] || '关闭'}` : ''}${hours}`;
       node.style.setProperty('--place-color', (TYPE_STYLE[sceneItem.sceneType] || TYPE_STYLE.commons).label);
     }
     for (const resident of residents) {
@@ -1002,6 +1218,19 @@ export function createWorld3D(canvas, labelsElement, onSelect) {
       node.title = activity ? `${resident.name} · ${activity.label}` : resident.name;
       node.setAttribute('aria-label', activity ? `查看 ${resident.name}，${activity.label}` : `查看 ${resident.name}`);
       node.classList.toggle('is-selected', resident.id === selectedId);
+    }
+    for (const slot of homeSlots) {
+      const key = `home:${slot.id}`; wanted.add(key);
+      if (!labelNodes.has(key)) {
+        const node = document.createElement('button'); node.type = 'button'; node.className = 'world3d-home-label';
+        node.textContent = 'Zz'; node.hidden = true;
+        node.addEventListener('click', () => onSelect(node.dataset.residentId));
+        labelNodes.set(key, node); labelsElement.append(node);
+      }
+      const owner = residents.find((resident) => resident.id === slot.id);
+      const node = labelNodes.get(key); node.dataset.residentId = slot.id;
+      const label = owner?.home?.label || `${owner?.name || ''} home`;
+      node.title = `${label} · 睡觉中`; node.setAttribute('aria-label', `${label}，${owner?.name || ''} 正在睡觉`);
     }
     const trading = data?.trading || {};
     const eth = trading.quotes?.find((quote) => quote.symbol === 'ETH');
@@ -1038,6 +1267,7 @@ export function createWorld3D(canvas, labelsElement, onSelect) {
     const now = performance.now();
     let minutes = Number(engine?.worldMinutes);
     if (!Number.isFinite(minutes) && Number.isFinite(Number(engine?.hour))) minutes = Number(engine.hour) * 60 + Number(engine.minute || 0);
+    if (!Number.isFinite(minutes)) minutes = Number(data?.world?.environment?.calendar?.worldMinutes);
     if (!Number.isFinite(minutes)) return;
     if (clock.sampleMinutes !== null && minutes > clock.sampleMinutes && now - clock.sampleAt > 500) {
       clock.rate = Math.min(0.01, (minutes - clock.sampleMinutes) / (now - clock.sampleAt));
@@ -1054,8 +1284,13 @@ export function createWorld3D(canvas, labelsElement, onSelect) {
   }
 
   const sunDir = new THREE.Vector3(), skyColor = new THREE.Color(), waterDay = new THREE.Color('#4fb0cf'), waterNight = new THREE.Color('#14304a');
-  function applyTimeOfDay(hour) {
+  const overcastTop = new THREE.Color(), overcastHorizon = new THREE.Color(), warmTint = new THREE.Color('#ffcf8a'), hazeColor = new THREE.Color('#f1d6a6');
+  const fogGrey = new THREE.Color('#c3cad1'), cloudWhite = new THREE.Color('#ffffff'), cloudGrey = new THREE.Color('#8f979f'), cloudStorm = new THREE.Color('#4f565e');
+  const flashColor = new THREE.Color('#e8eeff');
+  function applyTimeOfDay(rawHour) {
+    const hour = paletteHour(rawHour);
     const palette = skyAt(hour);
+    const w = weatherNow, night = palette.night, daylight = 1 - night;
     const dayAngle = ((hour - 6) / 12) * Math.PI;
     const isDay = hour >= 6 && hour <= 18;
     const elevation = isDay ? Math.sin(dayAngle) : Math.sin(((hour - 18 + 24) % 24) / 12 * Math.PI);
@@ -1063,23 +1298,244 @@ export function createWorld3D(canvas, labelsElement, onSelect) {
     const el = Math.max(0.22, elevation);
     sunDir.set(Math.cos(azimuth) * Math.cos(el), Math.sin(el), Math.sin(azimuth) * Math.cos(el)).normalize();
     sun.position.copy(view.target).addScaledVector(sunDir, 60); sun.target.position.copy(view.target);
-    sun.color.copy(palette.light); sun.intensity = palette.lightIntensity;
-    hemi.intensity = palette.hemi;
-    hemi.color.copy(palette.top).lerp(skyColor.set('#ffffff'), 0.55);
-    hemi.groundColor.set(palette.night > 0.5 ? '#1d2433' : '#5b6b3a');
-    sky.uniforms.top.value.copy(palette.top); sky.uniforms.horizon.value.copy(palette.horizon);
+    const overcast = Math.min(1, w.overcast + w.storm * 0.1);
+    sun.color.copy(palette.light).lerp(warmTint, w.heat * 0.55);
+    sun.intensity = palette.lightIntensity * (1 - overcast * 0.78) * (1 + w.heat * 0.08);
+    hemi.intensity = palette.hemi * (1 - overcast * 0.22 - w.storm * 0.15) + w.flash * 0.9;
+    hemi.color.copy(palette.top).lerp(skyColor.set('#ffffff'), 0.55).lerp(fogGrey, overcast * 0.5).lerp(warmTint, w.heat * 0.5);
+    hemi.groundColor.set(night > 0.5 ? '#1d2433' : '#5b6b3a');
+    // overcast sky: flat grey that follows the light level; storms are darker
+    const brightness = 0.07 + daylight * (0.92 - w.storm * 0.42);
+    overcastTop.set('#9aa3ad').multiplyScalar(brightness);
+    overcastHorizon.set('#b8bfc6').multiplyScalar(brightness * 1.02);
+    const greyMix = Math.min(1, overcast * 0.95 + w.fog * 0.5);
+    sky.uniforms.top.value.copy(palette.top).lerp(overcastTop, greyMix).lerp(hazeColor, w.heat * 0.3 * daylight);
+    sky.uniforms.horizon.value.copy(palette.horizon).lerp(overcastHorizon, greyMix).lerp(hazeColor, w.heat * 0.7 * daylight);
+    if (w.flash) { sky.uniforms.top.value.lerp(flashColor, w.flash * 0.55); sky.uniforms.horizon.value.lerp(flashColor, w.flash * 0.4); }
     sky.uniforms.sunDir.value.set(Math.cos(azimuth) * Math.cos(Math.max(-0.2, elevation)), isDay ? elevation : -0.3, Math.sin(azimuth) * Math.cos(elevation));
-    sky.uniforms.sunColor.value.copy(palette.light); sky.uniforms.day.value = 1 - palette.night;
-    scene.fog.color.copy(palette.horizon);
-    stars.material.opacity = Math.max(0, palette.night - 0.15);
-    const night = palette.night;
+    sky.uniforms.sunColor.value.copy(palette.light); sky.uniforms.day.value = daylight * (1 - overcast * 0.9);
+    // fog: thin sea haze normally; dense for fog, heavier in rain / snow / storm, warm haze in heat
+    scene.fog.color.copy(sky.uniforms.horizon.value);
+    if (w.fog > 0.01) scene.fog.color.lerp(overcastHorizon.set('#c9cfd4').multiplyScalar(0.12 + daylight * 0.85), w.fog * 0.7);
+    const precip = Math.max(w.rain * (0.6 + w.storm * 0.4), w.snow * 0.8);
+    scene.fog.near = Math.max(4, 55 - w.fog * 44 - precip * 28 - w.heat * 26);
+    scene.fog.far = Math.max(scene.fog.near + 12, 165 - w.fog * 112 - precip * 70 - w.heat * 62);
+    stars.material.opacity = Math.max(0, night - 0.15) * (1 - Math.min(1, overcast * 1.1 + w.fog));
     materials.window.emissiveIntensity = 0.05 + night * 2.6;
     materials.lamp.emissiveIntensity = 0.2 + night * 3;
     materials.screen.emissiveIntensity = 0.9 + night * 0.8;
-    for (const light of lampLights) light.intensity = night * 3.2;
-    for (const sprite of glowSprites) sprite.material.opacity = night * 0.85;
-    water.material.color.copy(waterDay).lerp(waterNight, night);
-    renderer.toneMappingExposure = 1.05 + night * 0.25;
+    // lamps also switch on under heavy cloud / fog during the day
+    const gloom = Math.max(night, Math.min(0.7, overcast * 0.55 + w.fog * 0.5) * daylight);
+    for (const light of lampLights) light.intensity = gloom * 3.2;
+    for (const sprite of glowSprites) sprite.material.opacity = gloom * 0.85;
+    lightning.intensity = w.flash * 1.5;
+    water.material.color.copy(waterDay).lerp(waterNight, Math.min(1, night + overcast * 0.35));
+    renderer.toneMappingExposure = 1.05 + night * 0.25 + w.heat * 0.08;
+    cloudMat.color.copy(cloudWhite).lerp(cloudGrey, Math.min(1, overcast * 1.1)).lerp(cloudStorm, w.storm);
+    cloudMat.opacity = 0.9 + overcast * 0.08;
+    applyPlaceAndHomeLights(night, gloom);
+  }
+
+  // place windows follow openNow; cottage windows follow whether the owner is home (and awake)
+  function applyPlaceAndHomeLights(night, gloom) {
+    const scenes = data?.scenes || [];
+    placeWindowMats.forEach((material, index) => {
+      const open = scenes[index]?.openNow !== false;
+      material.emissiveIntensity = open ? 0.05 + gloom * 2.6 : 0.01;
+      material.color.set(open ? '#3d4f62' : '#252d36');
+      const glow = placeGlows[index];
+      if (glow) glow.material.opacity = open ? gloom * 0.75 : 0;
+    });
+    if (!homeWindowMats.size) return;
+    const residents = new Map((data?.residents || []).map((resident) => [resident.id, resident]));
+    for (const [id, material] of homeWindowMats) {
+      const owner = residents.get(id);
+      const homeKey = owner?.home?.location || `home:${id}`;
+      const home = Boolean(owner) && (owner.location === homeKey || (owner.location === undefined && owner.atHome === true));
+      const level = !home ? 0 : owner.asleep ? 0.12 : 1;
+      material.emissiveIntensity = 0.02 + gloom * 2.8 * level;
+      material.color.set(level ? '#3d4f62' : '#2b333c');
+      if (material.userData.glow) material.userData.glow.material.opacity = gloom * 0.8 * level;
+    }
+  }
+
+  // ---- weather & season ---------------------------------------------------------------------------
+  const autumnLeaf = new THREE.Color(), winterLeaf = new THREE.Color('#7d7a62'), snowWhite = new THREE.Color('#f4f7fb'), leaf = new THREE.Color();
+  function applyGroundTint() {
+    const t = groundTint;
+    if (groundApplied && ['autumn', 'winter', 'summer', 'snow'].every((key) => Math.abs(groundApplied[key] - t[key]) < 0.015)) return;
+    groundApplied = { ...t };
+    tintTerrain(terrain, t);
+    if (!natureTrees) return;
+    const { round, pine, roundBase, pineBase, roundHue, flowers } = natureTrees;
+    if (roundBase) {
+      for (let i = 0; i < round.count; i += 1) {
+        leaf.fromArray(roundBase, i * 3);
+        const hue = roundHue[i] ?? 0.5;
+        autumnLeaf.setHSL(0.02 + hue * 0.1, 0.68, 0.46);
+        if (t.summer) leaf.offsetHSL(0, 0.04 * t.summer, -0.02 * t.summer);
+        if (t.autumn) leaf.lerp(autumnLeaf, t.autumn * (0.45 + hue * 0.5));
+        if (t.winter) leaf.lerp(winterLeaf, t.winter * 0.55);
+        if (t.snow) leaf.lerp(snowWhite, t.snow * 0.55);
+        round.setColorAt(i, leaf);
+      }
+      round.instanceColor.needsUpdate = true;
+    }
+    if (pineBase) {
+      for (let i = 0; i < pine.count; i += 1) {
+        leaf.fromArray(pineBase, i * 3);
+        if (t.winter) leaf.offsetHSL(0, -0.08 * t.winter, -0.02 * t.winter);
+        if (t.snow) leaf.lerp(snowWhite, t.snow * (i % 2 ? 0.62 : 0.4));
+        pine.setColorAt(i, leaf);
+      }
+      pine.instanceColor.needsUpdate = true;
+    }
+    if (flowers) flowers.visible = t.winter < 0.5 && t.snow < 0.3;
+  }
+
+  function weatherTargets() {
+    const env = data?.world?.environment, weather = env?.weather, calendar = env?.calendar;
+    const look = { ...(WEATHER_LOOK[weather?.condition] || WEATHER_LOOK.clear) };
+    if (weather) {
+      const precipitation = Number(weather.precipitation), cover = Number(weather.cloudCover);
+      if (Number.isFinite(precipitation) && precipitation > 0) {
+        if (look.rain) look.rain = Math.min(1, look.rain * 0.55 + precipitation * 0.6 + (weather.condition === 'storm' ? 0.4 : 0));
+        if (look.snow) look.snow = Math.min(1, 0.45 + precipitation * 0.55);
+      }
+      if (Number.isFinite(cover)) look.cloud = Math.max(look.cloud, weather.condition === 'heatwave' ? 0 : cover * 0.9);
+    }
+    const wind = Number(weather?.windKph);
+    look.wind = Number.isFinite(wind) ? wind : 10;
+    look.windAngle = Number.isFinite(Number(weather?.block)) ? (hash(`wind:${weather.block}`) % 628) / 100 : 0.7;
+    const season = calendar?.season;
+    groundTarget.autumn = season === 'autumn' ? 1 : 0; groundTarget.winter = season === 'winter' ? 1 : 0; groundTarget.summer = season === 'summer' ? 1 : 0;
+    const temperature = Number(weather?.temperatureC);
+    groundTarget.snow = weather?.condition === 'snow' ? 0.55 + look.snow * 0.45 : season === 'winter' && Number.isFinite(temperature) && temperature <= 0 ? 0.3 : 0;
+    return look;
+  }
+
+  function stepWeather(dt, time, motion) {
+    const target = weatherTargets();
+    const snap = !weatherNow.initialised || !motion;
+    const k = snap ? 1 : 1 - Math.exp(-dt * 0.9), kGround = snap ? 1 : 1 - Math.exp(-dt * 0.35);
+    for (const key of ['cloud', 'overcast', 'rain', 'snow', 'storm', 'fog', 'heat', 'wind']) weatherNow[key] += (target[key] - weatherNow[key]) * k;
+    let angleDelta = ((target.windAngle - weatherNow.windAngle + Math.PI * 3) % TAU) - Math.PI;
+    weatherNow.windAngle += angleDelta * k;
+    for (const key of Object.keys(groundTint)) groundTint[key] += (groundTarget[key] - groundTint[key]) * kGround;
+    weatherNow.initialised = Boolean(data);
+    applyGroundTint();
+    // lightning: short double flicker every few seconds while stormy
+    const t = time / 1000;
+    if (weatherNow.storm > 0.5 && motion) {
+      if (!weatherNow.nextFlash || t > weatherNow.nextFlash + 30) weatherNow.nextFlash = t + 1.5 + Math.random() * 3;
+      if (t >= weatherNow.nextFlash) { weatherNow.flashStart = t; weatherNow.nextFlash = t + 3.5 + Math.random() * 6; }
+      const since = t - (weatherNow.flashStart ?? -10);
+      weatherNow.flash = since < 0.09 ? 1 : since < 0.16 ? 0.25 : since < 0.26 ? 0.85 : Math.max(0, 0.85 - (since - 0.26) * 4);
+    } else weatherNow.flash = 0;
+    animatePrecipitation(dt, motion);
+  }
+
+  function animatePrecipitation(dt, motion) {
+    const wind = weatherNow.wind, wx = Math.cos(weatherNow.windAngle), wz = Math.sin(weatherNow.windAngle);
+    const cx = view.target.x, cz = view.target.z;
+    const rainCount = Math.round(RAIN_MAX * Math.min(1, weatherNow.rain));
+    rain.mesh.visible = rainCount > 8;
+    if (rain.mesh.visible) {
+      const fall = 24 + weatherNow.storm * 8, drift = wind * 0.09, step = motion ? dt : 0;
+      const slantX = wx * drift / fall, slantZ = wz * drift / fall, streak = 0.55 + weatherNow.storm * 0.25;
+      const { seeds, positions } = rain;
+      for (let i = 0; i < rainCount; i += 1) {
+        let y = seeds[i * 3 + 1] - fall * step;
+        if (y < 0) y += PRECIP_BOX.top;
+        seeds[i * 3 + 1] = y;
+        seeds[i * 3] += wx * drift * step; seeds[i * 3 + 2] += wz * drift * step;
+        if (seeds[i * 3] > PRECIP_BOX.x) seeds[i * 3] -= PRECIP_BOX.x * 2; else if (seeds[i * 3] < -PRECIP_BOX.x) seeds[i * 3] += PRECIP_BOX.x * 2;
+        if (seeds[i * 3 + 2] > PRECIP_BOX.z) seeds[i * 3 + 2] -= PRECIP_BOX.z * 2; else if (seeds[i * 3 + 2] < -PRECIP_BOX.z) seeds[i * 3 + 2] += PRECIP_BOX.z * 2;
+        const x = cx + seeds[i * 3], z = cz + seeds[i * 3 + 2], o = i * 6;
+        positions[o] = x; positions[o + 1] = y; positions[o + 2] = z;
+        positions[o + 3] = x - slantX * streak; positions[o + 4] = y + streak; positions[o + 5] = z - slantZ * streak;
+      }
+      rain.mesh.geometry.setDrawRange(0, rainCount * 2);
+      rain.mesh.geometry.attributes.position.needsUpdate = true;
+      rain.material.opacity = 0.38 + weatherNow.rain * 0.3;
+    }
+    const snowCount = Math.round(SNOW_MAX * Math.min(1, weatherNow.snow));
+    snow.mesh.visible = snowCount > 8;
+    if (snow.mesh.visible) {
+      const step = motion ? dt : 0, drift = wind * 0.05, t = performance.now() / 1000;
+      const { seeds, positions } = snow;
+      for (let i = 0; i < snowCount; i += 1) {
+        let y = seeds[i * 4 + 1] - (1.3 + (i % 5) * 0.18) * step;
+        if (y < 0) y += PRECIP_BOX.top;
+        seeds[i * 4 + 1] = y;
+        seeds[i * 4] += wx * drift * step; seeds[i * 4 + 2] += wz * drift * step;
+        if (seeds[i * 4] > PRECIP_BOX.x) seeds[i * 4] -= PRECIP_BOX.x * 2; else if (seeds[i * 4] < -PRECIP_BOX.x) seeds[i * 4] += PRECIP_BOX.x * 2;
+        if (seeds[i * 4 + 2] > PRECIP_BOX.z) seeds[i * 4 + 2] -= PRECIP_BOX.z * 2; else if (seeds[i * 4 + 2] < -PRECIP_BOX.z) seeds[i * 4 + 2] += PRECIP_BOX.z * 2;
+        const phase = seeds[i * 4 + 3];
+        positions[i * 3] = cx + seeds[i * 4] + Math.sin(t * 0.9 + phase) * 0.35;
+        positions[i * 3 + 1] = y;
+        positions[i * 3 + 2] = cz + seeds[i * 4 + 2] + Math.cos(t * 0.7 + phase) * 0.35;
+      }
+      snow.mesh.geometry.setDrawRange(0, snowCount);
+      snow.mesh.geometry.attributes.position.needsUpdate = true;
+    }
+  }
+
+  // ---- HUD: world day, time, season, weather, short forecast ---------------------------------------
+  const pad = (value) => String(value).padStart(2, '0');
+  function updateHud(hour) {
+    const env = data?.world?.environment, calendar = env?.calendar, weather = env?.weather;
+    if (!calendar && !weather) { if (!hud.hidden) { hud.hidden = true; hudSignature = ''; } return; }
+    const engine = data?.world?.engine;
+    const time = clock.sampleMinutes === null ? (calendar?.time || '--:--') : `${pad(Math.floor(hour))}:${pad(Math.floor((hour % 1) * 60))}`;
+    const day = calendar?.day ?? engine?.day;
+    const night = calendar?.isNight === true;
+    const condition = weather?.condition;
+    const icon = condition === 'clear' && night ? '☾' : WEATHER_ICON[condition] || '·';
+    const temperature = Number(weather?.temperatureC);
+    const forecast = (env?.forecast || []).slice(0, 4);
+    const signature = [time, day, calendar?.weekday, calendar?.season, condition, temperature, weather?.windKph, ...forecast.map((item) => `${item.time}${item.condition}${item.temperatureC}`)].join('|');
+    if (signature === hudSignature) return;
+    hudSignature = signature; hud.hidden = false;
+    hud.replaceChildren();
+    const row = (className, ...children) => { const node = document.createElement('div'); node.className = className; node.append(...children); hud.append(node); return node; };
+    const span = (className, text) => { const node = document.createElement('span'); node.className = className; node.textContent = text; return node; };
+    const weekday = calendar?.weekday ? `${String(calendar.weekday).slice(0, 3).toUpperCase()} ${WEEKDAY_ZH[calendar.weekday] || ''}`.trim() : '';
+    const top = row('world3d-hud-day', span('world3d-hud-eyebrow', [day ? `DAY ${day}` : null, weekday || null].filter(Boolean).join(' · ')));
+    if (calendar?.isWeekend) top.append(span('world3d-hud-chip', '周末'));
+    const season = SEASON_LABEL[calendar?.season];
+    row('world3d-hud-clock', span('world3d-hud-time', time), span('world3d-hud-season', season ? `${season[0]} ${season[1]}` : ''));
+    if (weather) {
+      const parts = [weather.label || condition || '', Number.isFinite(temperature) ? `${Math.round(temperature)}°C` : ''].filter(Boolean).join(' · ');
+      const line = row('world3d-hud-weather', span('world3d-hud-icon', icon), span('world3d-hud-weather-text', parts));
+      line.dataset.condition = condition || 'clear';
+      const wind = Number(weather.windKph);
+      if (Number.isFinite(wind)) line.append(span('world3d-hud-wind', `风 ${Math.round(wind)} km/h`));
+    }
+    if (forecast.length) {
+      const list = row('world3d-hud-forecast');
+      for (const item of forecast) {
+        const cell = document.createElement('span'); cell.className = 'world3d-hud-slot';
+        cell.title = `${item.time} ${item.label || item.condition || ''} ${Number.isFinite(Number(item.temperatureC)) ? `${Math.round(item.temperatureC)}°C` : ''}`.trim();
+        const slotHour = parseClock(item.time), rise = parseClock(calendar?.sunrise) ?? 6, set = parseClock(calendar?.sunset) ?? 18.5;
+        const slotNight = slotHour !== null && (slotHour < rise || slotHour >= set);
+        cell.append(span('world3d-hud-slot-time', item.time || ''), span('world3d-hud-slot-icon', item.condition === 'clear' && slotNight ? '☾' : WEATHER_ICON[item.condition] || '·'),
+          span('world3d-hud-slot-temp', Number.isFinite(Number(item.temperatureC)) ? `${Math.round(item.temperatureC)}°` : ''));
+        list.append(cell);
+      }
+    }
+    hud.setAttribute('aria-label', `第 ${day ?? '?'} 天 ${calendar?.weekday || ''} ${time} ${season?.[1] || ''} ${weather?.label || ''} ${Number.isFinite(temperature) ? `${Math.round(temperature)}°C` : ''}`.trim());
+  }
+
+  // hour-of-day remapped so the season's sunrise / sunset line up with the sky palette's dawn / dusk
+  const parseClock = (value) => { const match = /^(\d{1,2}):(\d{2})/.exec(String(value || '')); return match ? Number(match[1]) + Number(match[2]) / 60 : null; };
+  function paletteHour(hour) {
+    const calendar = data?.world?.environment?.calendar;
+    const rise = parseClock(calendar?.sunrise), set = parseClock(calendar?.sunset);
+    if (rise === null || set === null || !(rise > 1 && set > rise + 4 && set < 23)) return hour;
+    if (hour < rise) return hour * (6.4 / rise);
+    if (hour < set) return 6.4 + (hour - rise) * ((18.4 - 6.4) / (set - rise));
+    return 18.4 + (hour - set) * ((24 - 18.4) / (24 - set));
   }
 
   // ---- per-frame --------------------------------------------------------------------------------
@@ -1104,11 +1560,18 @@ export function createWorld3D(canvas, labelsElement, onSelect) {
       if (u.bob) part.position.y = 0.86 + Math.sin(t * 4) * 0.05;
       if (u.flag !== undefined) part.rotation.y = Math.sin(t * 2 + u.flag) * 0.25;
     }
-    for (const cloud of clouds.children) {
-      cloud.userData.angle += cloud.userData.speed * 0.016;
+    const visibleClouds = Math.round(4 + weatherNow.cloud * (clouds.children.length - 4));
+    const windBoost = 1 + weatherNow.wind / 9;
+    clouds.children.forEach((cloud, index) => {
+      cloud.visible = index < visibleClouds;
+      cloud.userData.angle += cloud.userData.speed * 0.016 * windBoost;
       cloud.position.x = Math.cos(cloud.userData.angle) * cloud.userData.radius;
       cloud.position.z = Math.sin(cloud.userData.angle) * cloud.userData.radius * 0.8;
-    }
+      cloud.position.y = cloud.userData.baseY;
+      // never let a cloud drift in front of the lens
+      if (cloud.visible && cloud.position.distanceTo(camera.position) < 16) cloud.visible = false;
+      cloud.scale.set(1 + weatherNow.overcast * 0.6, 1 + weatherNow.storm * 0.4, 1 + weatherNow.overcast * 0.6);
+    });
   }
 
   function updateCamera(dt) {
@@ -1134,8 +1597,12 @@ export function createWorld3D(canvas, labelsElement, onSelect) {
     const moving = updateCamera(reducedMotion?.matches ? 1 : dt);
     const motion = !reducedMotion?.matches;
     const hour = currentHour(time);
+    stepWeather(dt, time, motion);
     applyTimeOfDay(hour);
+    updateHud(hour);
     canvas.dataset.worldHour = hour.toFixed(2);
+    canvas.dataset.weather = data?.world?.environment?.weather?.condition || '';
+    canvas.dataset.lightning = weatherNow.flash > 0.01 ? 'flash' : '';
     if (motion) animateWorld(time);
     const now = Date.now();
     projectedResidents = [];
@@ -1145,9 +1612,20 @@ export function createWorld3D(canvas, labelsElement, onSelect) {
         placeLabel(labelNodes.get(`scene:${data.scenes[index].name}`), frame.center[0], 3.2, frame.center[1], rect);
       });
       placeLabel(labelNodes.get('market'), 0, 4.7, 0, rect);
+      for (const slot of homeSlots) {
+        const owner = data.residents.find((resident) => resident.id === slot.id);
+        const node = labelNodes.get(`home:${slot.id}`);
+        if (!node) continue;
+        if (owner?.asleep && owner.location === slot.location) placeLabel(node, slot.center[0], slot.y + 2.3, slot.center[1], rect);
+        else node.hidden = true;
+      }
       for (const item of placed) {
         const figure = figures.get(item.resident.id); if (!figure) continue;
-        figure.root.position.set(item.position[0], 0, item.position[1]);
+        // asleep at home: the resident is indoors; the cottage shows "Zz" instead
+        const indoors = Boolean(item.resident.asleep && homeById.has(item.resident.location));
+        figure.root.visible = !indoors;
+        if (indoors) { const node = labelNodes.get(`resident:${item.resident.id}`); if (node) node.hidden = true; continue; }
+        figure.root.position.set(item.position[0], Math.max(0, heightAt(item.position[0], item.position[1])), item.position[1]);
         if (figure.heading === null) figure.heading = item.facing;
         let delta = ((item.facing - figure.heading + Math.PI * 3) % TAU) - Math.PI;
         figure.heading += motion ? delta * Math.min(1, dt * 8) : delta;
@@ -1158,7 +1636,7 @@ export function createWorld3D(canvas, labelsElement, onSelect) {
         const selected = item.resident.id === selectedId;
         figure.ring.visible = selected;
         if (selected) { const pulse = 1 + Math.sin(time / 260) * 0.08; figure.ring.scale.set(pulse, pulse, pulse); }
-        const point = placeLabel(labelNodes.get(`resident:${item.resident.id}`), item.position[0], 2.05, item.position[1], rect);
+        const point = placeLabel(labelNodes.get(`resident:${item.resident.id}`), item.position[0], 2.05 + figure.root.position.y, item.position[1], rect);
         if (point) projectedResidents.push({ id: item.resident.id, x: point[0], y: point[1] });
       }
     }
@@ -1278,8 +1756,15 @@ export function createWorld3D(canvas, labelsElement, onSelect) {
       data = nextData;
       selectedId = nextSelectedId;
       const scenes = data?.scenes || [];
-      const signature = scenes.map((item) => `${item.name}|${item.sceneType}|${item.position?.x}|${item.position?.z}`).join(';');
-      if (signature !== townSignature) { townSignature = signature; townFrames = placeCenters(scenes).map(placeFrame); buildTown(scenes, townFrames); }
+      const residents = data?.residents || [];
+      const signature = scenes.map((item) => `${item.name}|${item.sceneType}|${item.position?.x}|${item.position?.z}`).join(';')
+        + '#' + residents.map((item) => `${item.id}@${item.home?.position?.x ?? ''},${item.home?.position?.z ?? ''}`).sort().join(';');
+      if (signature !== townSignature) {
+        townSignature = signature; townFrames = placeCenters(scenes).map(placeFrame);
+        homeSlots = computeHomeSlots(residents, townFrames);
+        homeById = new Map(homeSlots.map((slot) => [slot.location, slot]));
+        buildTown(scenes, townFrames, homeSlots);
+      }
       syncFigures(data?.residents || []);
       syncClock(data?.world?.engine);
       ensureLabels(scenes, data?.residents || []);
@@ -1296,6 +1781,7 @@ export function createWorld3D(canvas, labelsElement, onSelect) {
       window.removeEventListener('resize', invalidate);
       document.removeEventListener('visibilitychange', visibilityChanged);
       reducedMotion?.removeEventListener?.('change', motionPreferenceChanged);
+      hud.remove();
       renderer.dispose();
     }
   };

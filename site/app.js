@@ -97,6 +97,11 @@ const ACTION_LABELS = { work: '工作', cooperate: '合作工作', learn: '学�
   organization_join: '加入组织', organization_reject: '拒绝组织邀请', organization_leave: '退出组织',
   organization_invite: '邀请成员', organization_contribute: '组织贡献', information_share: '分享信息',
   information_accept: '采纳信息', information_ignore: '忽略信息', information_doubt: '质疑信息' };
+const ACTIVITY_VARIANT_LABELS = { sleep: '睡觉', home_rest: '在家休息', home_meal: '在家做饭', cafe_meal: '咖啡馆用餐', picnic: '野餐',
+  snack: '小吃', meal: '用餐', garden_stroll: '花园散步', garden_rest: '花园小憩', stargazing: '观星', observatory_study: '观测学习',
+  library_study: '图书馆学习', gathering: '周末聚会', coffee_chat: '咖啡闲聊', chat: '聊天', night_shift: '夜班', data_shift: '数据值班',
+  workshop_shift: '工坊轮班' };
+const CHRONOTYPE_LABELS = { lark: '早起型', neutral: '常规作息', owl: '夜猫子' };
 let latestMapData = null;
 let selectedAgentId = null;
 let selectedResidentDetail = null;
@@ -312,7 +317,10 @@ function renderAgentPanel(agent, detail = selectedResidentDetail) {
 
   const needs = document.createElement('div');
   needs.className = 'agent-needs';
-  for (const [key, label, value] of [['energy', '精力', agent.energy], ['food', '食物', agent.food], ['social', '社交', agent.social]]) {
+  const needRows = [['energy', '精力', agent.energy], ['food', '食物', agent.food], ['social', '社交', agent.social]];
+  if (agent.hygiene !== undefined && agent.hygiene !== null) needRows.push(['hygiene', '卫生', agent.hygiene]);
+  if (agent.fun !== undefined && agent.fun !== null) needRows.push(['fun', '娱乐', agent.fun]);
+  for (const [key, label, value] of needRows) {
     const row = document.createElement('div');
     row.className = 'need-row';
     const name = document.createElement('span');
@@ -331,13 +339,24 @@ function renderAgentPanel(agent, detail = selectedResidentDetail) {
 
   const facts = document.createElement('dl');
   facts.className = 'agent-facts';
-  const activeAction = agent.currentStatus === 'walking'
-    ? `前往 ${agent.targetLocation || '目标地点'}`
-    : agent.currentStatus === 'performing' ? (ACTION_LABELS[agent.currentAction] || agent.currentAction || '行动中') : '待决定';
+  const targetLabel = agent.targetLocationLabel || agent.targetLocation;
+  const variantLabel = ACTIVITY_VARIANT_LABELS[agent.activityVariant] || agent.activityVariant || null;
+  const activeAction = agent.asleep ? '睡觉中'
+    : agent.currentStatus === 'walking' ? `前往 ${targetLabel || '目标地点'}`
+    : agent.currentStatus === 'performing' ? `${ACTION_LABELS[agent.currentAction] || agent.currentAction || '行动中'}${variantLabel ? ` · ${variantLabel}` : ''}` : '待决定';
+  const environmentFacts = [];
+  if (agent.home) environmentFacts.push(['住所', `${agent.home.label || '住所'}${agent.atHome ? ' · 在家' : ''}`]);
+  if (agent.asleep !== undefined) {
+    const chronotype = CHRONOTYPE_LABELS[agent.chronotype] || agent.chronotype;
+    const sleepWindow = agent.sleepWindow?.start && agent.sleepWindow?.end ? `${agent.sleepWindow.start}–${agent.sleepWindow.end}` : null;
+    environmentFacts.push(['睡眠', [agent.asleep ? '睡着了' : '醒着', chronotype, sleepWindow].filter(Boolean).join(' · ')]);
+  }
+  if (variantLabel && !agent.asleep) environmentFacts.push(['活动形式', variantLabel]);
   for (const [label, value] of [
-    ['所在地点', agent.location || '未知'],
+    ['所在地点', agent.locationLabel || agent.location || '未知'],
     ['当前行动', activeAction],
-    ['目标地点', agent.targetLocation || '—'],
+    ['目标地点', targetLabel || '—'],
+    ...environmentFacts,
     ['现金', `${moneyFormat.format(Number(agent.assets?.USDC || 0))} USDC`],
     ['BTC / ETH', `${Number(agent.assets?.BTC || 0).toFixed(6)} / ${Number(agent.assets?.ETH || 0).toFixed(5)}`],
     ['心情 / 知识', `${displayCount(agent.happiness)} / ${displayCount(agent.knowledge)}`],
