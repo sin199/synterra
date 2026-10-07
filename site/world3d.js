@@ -2,6 +2,7 @@
 // Data contract is unchanged: reads the /local/map-data payload (scenes, residents, world.engine clock,
 // trading) and exposes createWorld3D(canvas, labelsElement, onSelect) -> { update, select, dispose } | null.
 import * as THREE from './vendor/three.module.min.js';
+import { createCryptoPlaza } from './crypto-plaza.js';
 
 const TAU = Math.PI * 2;
 const ISLAND_RADIUS = 18.5;
@@ -80,7 +81,8 @@ function makeMaterials() {
     beacon: new THREE.MeshStandardMaterial({ color: '#3a0d0d', emissive: '#ff4040', emissiveIntensity: 1.5, flatShading: true }),
     glass: new THREE.MeshStandardMaterial({ color: '#cfeff2', roughness: 0.12, metalness: 0.1, transparent: true, opacity: 0.38, flatShading: true }),
     fountain: new THREE.MeshStandardMaterial({ color: '#6cc6e0', emissive: '#2a7fa0', emissiveIntensity: 0.25, roughness: 0.15, flatShading: true }),
-    smoke: new THREE.MeshStandardMaterial({ color: '#e8e6e2', roughness: 1, transparent: true, opacity: 0.55, flatShading: true, depthWrite: false })
+    smoke: new THREE.MeshStandardMaterial({ color: '#e8e6e2', roughness: 1, transparent: true, opacity: 0.55, flatShading: true, depthWrite: false }),
+    beer: new THREE.MeshStandardMaterial({ color: '#f0a52a', emissive: '#ff9a1f', emissiveIntensity: 0.9, roughness: 0.2, flatShading: true })
   };
 }
 
@@ -302,12 +304,6 @@ function buildExchange(b, boardTexture) {
   board.position.set(0, 1.0, 1.52); b.group.add(board);
   b.box(1.82, 0.74, 0.06, '#26343a', 0, 0.63, 1.48, { cast: false });
   b.door(0, 0.2, 1.51, '#2f5a50', 0.42, 0.3);
-  for (const angle of [0.6, -0.6, Math.PI - 0.6, Math.PI + 0.6]) {
-    const x = Math.sin(angle) * 2.6, z = Math.cos(angle) * 2.6;
-    b.cyl(0.035, 0.04, 2.1, 6, '#dcd6c8', x, 0.02, z);
-    const flag = b.box(0.5, 0.3, 0.02, angle > 2 ? '#3aa58f' : '#e3b23c', x + 0.27, 1.75, z, { dynamic: true, cast: false });
-    flag.userData.flag = hash(angle) % 100 / 10;
-  }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -369,6 +365,7 @@ function buildResidentFigure(resident, materials) {
     book: part(new THREE.BoxGeometry(0.2, 0.14, 0.04), std('#b8423a'), 0.0, 0.62, 0.22),
     tablet: part(new THREE.BoxGeometry(0.2, 0.13, 0.02), materials.screen, 0.0, 0.64, 0.22),
     cup: part(new THREE.CylinderGeometry(0.04, 0.035, 0.08, 8), std('#ffffff'), 0, -0.36, 0.04, armR),
+    beer: part(new THREE.CylinderGeometry(0.045, 0.04, 0.13, 8), materials.beer, 0, -0.36, 0.05, armR),
     hammer: new THREE.Group()
   };
   part(new THREE.BoxGeometry(0.025, 0.24, 0.025), std('#8b5e3c'), 0, -0.04, 0.1, props.hammer).rotation.x = Math.PI / 2;
@@ -384,10 +381,12 @@ function buildResidentFigure(resident, materials) {
   return { root, body, legL, legR, armL, armR, head, props, ring, hit, phase: (h % 1000) / 1000 * TAU, heading: null, color: `#${shirt.getHexString()}` };
 }
 
-function poseResident(figure, activity, walking, time, reducedMotion) {
+// options (plaza only): perch 'stool' | 'table' | 'stand', drink (idle at the bar), react { kind, k, age }
+// returns an extra root height (jumping when the crowd cheers)
+function poseResident(figure, activity, walking, time, reducedMotion, options = {}) {
   const t = reducedMotion ? 0 : time / 1000 + figure.phase;
   const { body, legL, legR, armL, armR, head, props } = figure;
-  let legSwing = 0, armLx = 0, armRx = 0, armRz = 0, armLz = 0, bob = 0, headX = 0, crouch = 0, sit = false;
+  let legSwing = 0, armLx = 0, armRx = 0, armRz = 0, armLz = 0, bob = 0, headX = 0, crouch = 0, sit = false, lean = 0, jump = 0;
   for (const prop of Object.values(props)) prop.visible = false;
   if (walking) {
     const s = Math.sin(t * 9);
@@ -405,16 +404,40 @@ function poseResident(figure, activity, walking, time, reducedMotion) {
         if (activity.label === '休息') { sit = true; headX = 0.25; }
         else { armRx = -1.9 + Math.max(0, Math.sin(t * 1.8)) * 0.9; props.cup.visible = true; }
         break;
-      default: armLz = -0.06; armRz = 0.06; headX = Math.sin(t * 0.5) * 0.06;
+      default:
+        if (options.drink) { armRx = -1.75 + Math.max(0, Math.sin(t * 1.1)) * 0.95; armRz = 0.15; armLz = -0.08; props.beer.visible = true; headX = -0.05 + Math.max(0, Math.sin(t * 1.1 - 0.4)) * -0.25; }
+        else { armLz = -0.06; armRz = 0.06; headX = Math.sin(t * 0.5) * 0.06; }
+    }
+    const react = options.react;
+    if (react && react.k > 0.01 && !reducedMotion) {
+      const k = react.k, delay = (figure.phase / TAU) * 0.35;
+      if (react.age > delay) {
+        const wave = Math.sin((t + figure.phase) * 11);
+        if (react.kind === 'pump') {
+          for (const prop of Object.values(props)) prop.visible = false;
+          if (options.drink || activity?.kind !== 'trade') props.beer.visible = true; else props.tablet.visible = false;
+          armLx = -0.25 * k; armRx = -0.25 * k; armLz = -2.75 * k + wave * 0.25 * k; armRz = 2.75 * k - wave * 0.25 * k;
+          headX = -0.35 * k;
+          if (options.perch !== 'stool') jump = Math.abs(Math.sin((t + figure.phase) * 7.5)) * 0.2 * k;
+        } else {
+          headX = 0.55 * k; lean = 0.22 * k; crouch = 0.05 * k;
+          armLx = 0.18 * k; armRx = -2.4 * k; armRz = 0.9 * k; armLz = -0.05; // one hand on the head
+          if (react.big) armLx = -2.4 * k, armLz = -0.9 * k;
+        }
+      }
     }
   }
-  if (sit) {
+  if (options.perch === 'stool' && !walking) {
+    legL.rotation.x = -1.15; legR.rotation.x = -1.05; body.position.y = -0.1 + bob; body.rotation.x = lean;
+  } else if (sit) {
     legL.rotation.x = legR.rotation.x = -1.45; body.position.y = -0.3; armLx = armRx = -0.35;
   } else {
     legL.rotation.x = legSwing; legR.rotation.x = -legSwing; body.position.y = bob - crouch;
   }
+  if (options.perch !== 'stool' || walking) body.rotation.x = lean;
   armL.rotation.set(armLx, 0, armLz); armR.rotation.set(armRx, 0, armRz);
   head.rotation.x = headX;
+  return jump;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -720,23 +743,12 @@ export function createWorld3D(canvas, labelsElement, onSelect) {
   const blobMaterial = new THREE.MeshBasicMaterial({ map: blobMap, transparent: true, depthWrite: false, toneMapped: false });
   const blobGeometry = new THREE.PlaneGeometry(1, 1).rotateX(-Math.PI / 2);
 
-  // ticker board texture for the central exchange
-  const boardCanvas = document.createElement('canvas'); boardCanvas.width = 256; boardCanvas.height = 96;
-  const boardTexture = new THREE.CanvasTexture(boardCanvas); boardTexture.colorSpace = THREE.SRGBColorSpace;
-  const priceHistory = [];
-  function drawBoard(price) {
-    const context = boardCanvas.getContext('2d');
-    context.fillStyle = '#071816'; context.fillRect(0, 0, 256, 96);
-    context.fillStyle = '#7ff0cf'; context.font = 'bold 15px monospace'; context.fillText('SYNTERRA EXCHANGE', 12, 22);
-    context.fillStyle = '#f2f5df'; context.font = 'bold 20px monospace';
-    context.fillText(price ? `ETH $${Number(price).toLocaleString('en-US', { maximumFractionDigits: 0 })}` : 'SIM MARKET', 12, 50);
-    const series = priceHistory.length > 1 ? priceHistory : [1, 1.02, 0.99, 1.04, 1.01, 1.06, 1.03, 1.08];
-    const min = Math.min(...series), max = Math.max(...series), span = max - min || 1;
-    context.strokeStyle = '#c9f36a'; context.lineWidth = 2.5; context.beginPath();
-    series.forEach((value, i) => { const x = 12 + (i / (series.length - 1)) * 232, y = 86 - ((value - min) / span) * 26; i ? context.lineTo(x, y) : context.moveTo(x, y); });
-    context.stroke(); boardTexture.needsUpdate = true;
-  }
-  drawBoard(null);
+  // central plaza: the "코인 BAR" crypto-pub trading scene (K-line LED halo, pylons, ticker, bar, neon)
+  const LAMP_ANGLES = [0, 1, 2, 3].map((i) => (i / 4) * TAU + Math.PI / 4);
+  const plaza = createCryptoPlaza(THREE, { lampAngles: LAMP_ANGLES, lampRadius: PLAZA_RADIUS - 0.25 });
+  scene.add(plaza.group);
+  const boardTexture = plaza.boardTexture;
+  let lighting = { night: 0, gloom: 0 };
 
   // ---- state ------------------------------------------------------------------------------------
   const view = { yaw: -0.55, pitch: 0.7, distance: 33, target: new THREE.Vector3(0, 0.4, 0) };
@@ -863,6 +875,8 @@ export function createWorld3D(canvas, labelsElement, onSelect) {
     return slots;
   }
 
+  // residents trading gather at the plaza bar whatever place the sim filed them under
+  const plazaLocation = (resident) => resident.currentStatus === 'performing' && resident.currentAction === 'trade' ? 'Exchange' : resident.location;
   function layout(now) {
     const scenes = data?.scenes || [], residents = data?.residents || [];
     const frames = townFrames;
@@ -870,20 +884,29 @@ export function createWorld3D(canvas, labelsElement, onSelect) {
     const sceneByName = new Map(scenes.map((scene, index) => [scene.name, index]));
     const groups = new Map(), destinationGroups = new Map();
     for (const resident of residents) {
-      const bucket = groups.get(resident.location) || []; bucket.push(resident); groups.set(resident.location, bucket);
+      const location = plazaLocation(resident);
+      const bucket = groups.get(location) || []; bucket.push(resident); groups.set(location, bucket);
       if (resident.currentStatus === 'walking' && resident.targetLocation) {
         const target = destinationGroups.get(resident.targetLocation) || []; target.push(resident); destinationGroups.set(resident.targetLocation, target);
       }
     }
     for (const resident of residents) {
-      if (resident.currentStatus === 'walking' || groups.has(resident.location) === false) continue;
-      const target = destinationGroups.get(resident.location) || []; target.push(resident); destinationGroups.set(resident.location, target);
+      if (resident.currentStatus === 'walking' || groups.has(plazaLocation(resident)) === false) continue;
+      const target = destinationGroups.get(plazaLocation(resident)) || []; target.push(resident); destinationGroups.set(plazaLocation(resident), target);
     }
+    const plazaMembers = [...(groups.get('Exchange') || []).filter((r) => r.currentStatus !== 'walking'),
+      ...(destinationGroups.get('Exchange') || []).filter((r) => r.currentStatus === 'walking')]
+      .map((r) => ({ id: r.id, trading: r.currentAction === 'trade' }));
+    const plazaSpots = plaza.spotsFor(plazaMembers);
     const frameFor = (place) => { const index = sceneByName.get(place); return index === undefined ? (homeById.get(place) || null) : frames[index]; };
     const spotFor = (resident, place, buckets, fallbackOrder) => {
       const members = buckets.get(place) || [resident];
       const order = Math.max(0, members.findIndex((item) => item.id === resident.id)), total = members.length;
       const frame = frameFor(place);
+      if (!frame && place === 'Exchange' && plazaSpots.has(resident.id)) {
+        const spot = plazaSpots.get(resident.id);
+        return { pos: spot.pos, face: spot.face, frame: null, angle: spot.angle, perch: spot };
+      }
       if (!frame) {
         const angle = place === 'Exchange' ? (order / Math.max(total, 1)) * TAU + 0.4 : fallbackOrder * 2.4;
         const radius = place === 'Exchange' ? 2.45 + (order % 2) * 0.35 : 3.0;
@@ -917,14 +940,14 @@ export function createWorld3D(canvas, labelsElement, onSelect) {
       return { pos: [a[0] + (b[0] - a[0]) * k, a[1] + (b[1] - a[1]) * k], face: Math.atan2(b[0] - a[0], b[1] - a[1]) };
     };
     const placed = residents.map((resident, index) => {
-      const from = spotFor(resident, resident.location, groups, index);
-      if (resident.currentStatus !== 'walking' || !resident.targetLocation) return { resident, position: from.pos, facing: from.face, movement: null };
+      const from = spotFor(resident, plazaLocation(resident), groups, index);
+      if (resident.currentStatus !== 'walking' || !resident.targetLocation) return { resident, position: from.pos, facing: from.face, movement: null, perch: from.perch || null };
       const to = spotFor(resident, resident.targetLocation, destinationGroups, index);
       const started = Date.parse(resident.movementStartedAt || ''), ends = Date.parse(resident.movementEndsAt || '');
       const progress = !Number.isFinite(started) || !Number.isFinite(ends) || ends <= started ? 1 : Math.max(0, Math.min(1, (now - started) / (ends - started)));
       const eased = progress < 1 ? progress * progress * (3 - 2 * progress) * 0.35 + progress * 0.65 : 1;
       const point = sample(routeBetween(from, to), eased);
-      return { resident, position: point.pos, facing: progress < 1 ? point.face : to.face, movement: { progress } };
+      return { resident, position: point.pos, facing: progress < 1 ? point.face : to.face, movement: { progress }, perch: progress >= 1 ? to.perch || null : null };
     });
     return { centers, frames, placed };
   }
@@ -950,8 +973,9 @@ export function createWorld3D(canvas, labelsElement, onSelect) {
     const exchange = new THREE.Group(); raw.add(exchange);
     buildExchange(new Builder(exchange, materials), boardTexture);
     // plaza lamps with real point lights
+    plaza.placePylons(frames.map((frame) => frame.angle));
     for (let i = 0; i < 4; i += 1) {
-      const a = (i / 4) * TAU + Math.PI / 4, x = Math.cos(a) * (PLAZA_RADIUS - 0.25), z = Math.sin(a) * (PLAZA_RADIUS - 0.25);
+      const a = LAMP_ANGLES[i], x = Math.cos(a) * (PLAZA_RADIUS - 0.25), z = Math.sin(a) * (PLAZA_RADIUS - 0.25);
       lampPost(b, x, z);
       const light = new THREE.PointLight('#ffcf86', 0, 7, 1.6); light.position.set(x, 1.6, z); scene.add(light); lampLights.push(light);
     }
@@ -1167,17 +1191,7 @@ export function createWorld3D(canvas, labelsElement, onSelect) {
 
   // ---- DOM labels (same structure / classes as before) ------------------------------------------
   function ensureLabels(scenes, residents) {
-    const wanted = new Set(['market']);
-    if (!labelNodes.has('market')) {
-      const node = document.createElement('div');
-      node.className = 'world3d-market-label';
-      node.setAttribute('aria-label', 'Synterra 模拟交易大厅行情');
-      const title = document.createElement('strong'); title.className = 'world3d-market-title';
-      const line = document.createElement('span'); line.className = 'world3d-market-ticker';
-      const footer = document.createElement('span'); footer.className = 'world3d-market-status';
-      node.append(title, line, footer);
-      labelsElement.append(node); labelNodes.set('market', node);
-    }
+    const wanted = new Set();
     for (const sceneItem of scenes) {
       const key = `scene:${sceneItem.name}`; wanted.add(key);
       if (!labelNodes.has(key)) {
@@ -1212,10 +1226,18 @@ export function createWorld3D(canvas, labelsElement, onSelect) {
       node.querySelector('.world3d-agent-initials').textContent = resident.name.split(/[-\s]/).filter(Boolean).at(-1)?.slice(-2) || '•';
       const activity = activityFor(resident, Date.now());
       const actionNode = node.querySelector('.world3d-agent-action');
-      actionNode.textContent = activity?.label || '';
-      actionNode.dataset.kind = activity?.kind || 'idle';
-      actionNode.hidden = !activity;
-      node.title = activity ? `${resident.name} · ${activity.label}` : resident.name;
+      const fill = ownTrade(resident, Date.now());
+      if (fill) {
+        const size = Number(fill.size ?? fill.quantity);
+        const label = `${fill.side === 'sell' ? '매도 SELL' : '매수 BUY'} ${Number.isFinite(size) ? size.toFixed(size >= 1 ? 2 : 4) : ''} ${fill.asset || ''}`.replace(/\s+/g, ' ').trim();
+        actionNode.textContent = label; actionNode.dataset.kind = 'trade'; actionNode.dataset.side = fill.side === 'sell' ? 'sell' : 'buy'; actionNode.hidden = false;
+      } else {
+        actionNode.textContent = activity?.label || '';
+        actionNode.dataset.kind = activity?.kind || 'idle';
+        delete actionNode.dataset.side;
+        actionNode.hidden = !activity;
+      }
+      node.title = fill ? `${resident.name} · ${actionNode.textContent}` : activity ? `${resident.name} · ${activity.label}` : resident.name;
       node.setAttribute('aria-label', activity ? `查看 ${resident.name}，${activity.label}` : `查看 ${resident.name}`);
       node.classList.toggle('is-selected', resident.id === selectedId);
     }
@@ -1232,25 +1254,20 @@ export function createWorld3D(canvas, labelsElement, onSelect) {
       const label = owner?.home?.label || `${owner?.name || ''} home`;
       node.title = `${label} · 睡觉中`; node.setAttribute('aria-label', `${label}，${owner?.name || ''} 正在睡觉`);
     }
-    const trading = data?.trading || {};
-    const eth = trading.quotes?.find((quote) => quote.symbol === 'ETH');
-    const robinhood = trading.robinhood || {};
-    const scanner = robinhood.scanner || {};
-    const tradableCount = (robinhood.tokens || []).filter((token) => token.tradable).length;
-    const market = labelNodes.get('market');
-    if (market) {
-      market.querySelector('.world3d-market-title').textContent = 'SYN TERRA EXCHANGE';
-      market.querySelector('.world3d-market-ticker').textContent = eth?.priceUsd
-        ? `ETH  $${Number(eth.priceUsd).toLocaleString('en-US', { maximumFractionDigits: 2 })}   ·   USDC` : 'INTERNAL SIMULATED MARKET';
-      market.querySelector('.world3d-market-status').textContent = scanner.healthy
-        ? `ROBINHOOD · PONS V2   ${tradableCount} 可模拟` : 'ROBINHOOD SCAN CONNECTING';
-      market.dataset.live = scanner.healthy && scanner.fresh ? 'true' : 'false';
-    }
-    if (eth?.priceUsd && Number(eth.priceUsd) !== priceHistory.at(-1)) {
-      priceHistory.push(Number(eth.priceUsd)); if (priceHistory.length > 40) priceHistory.shift();
-      drawBoard(eth.priceUsd);
-    }
     for (const [key, node] of labelNodes) if (!wanted.has(key)) { node.remove(); labelNodes.delete(key); }
+  }
+
+  // the resident's own fill in the last two minutes (BTC / ETH or Pons meme paper trades)
+  function ownTrade(resident, now) {
+    const lists = [data?.world?.market?.recentTrades || [], data?.trading?.recentTrades || []];
+    let best = null;
+    for (const list of lists) for (const trade of list) {
+      const mine = (trade.residentId ?? trade.agentId) ? (trade.residentId ?? trade.agentId) === resident.id : (trade.resident ?? trade.agentName) === resident.name;
+      const at = Date.parse(trade.createdAt || '');
+      if (!mine || !Number.isFinite(at) || now - at < -5_000 || now - at > 120_000) continue;
+      if (!best || at > Date.parse(best.createdAt)) best = trade;
+    }
+    return best;
   }
 
   function placeLabel(node, x, y, z, rect) {
@@ -1326,6 +1343,7 @@ export function createWorld3D(canvas, labelsElement, onSelect) {
     materials.screen.emissiveIntensity = 0.9 + night * 0.8;
     // lamps also switch on under heavy cloud / fog during the day
     const gloom = Math.max(night, Math.min(0.7, overcast * 0.55 + w.fog * 0.5) * daylight);
+    lighting = { night, gloom };
     for (const light of lampLights) light.intensity = gloom * 3.2;
     for (const sprite of glowSprites) sprite.material.opacity = gloom * 0.85;
     lightning.intensity = w.flash * 1.5;
@@ -1604,6 +1622,9 @@ export function createWorld3D(canvas, labelsElement, onSelect) {
     canvas.dataset.weather = data?.world?.environment?.weather?.condition || '';
     canvas.dataset.lightning = weatherNow.flash > 0.01 ? 'flash' : '';
     if (motion) animateWorld(time);
+    plaza.animate(time, dt, { ...lighting, motion });
+    const crowd = plaza.crowd();
+    canvas.dataset.plazaReaction = crowd ? `${crowd.kind}${crowd.big ? '-big' : ''}` : '';
     const now = Date.now();
     projectedResidents = [];
     if (data) {
@@ -1611,7 +1632,6 @@ export function createWorld3D(canvas, labelsElement, onSelect) {
       frames.forEach((frame, index) => {
         placeLabel(labelNodes.get(`scene:${data.scenes[index].name}`), frame.center[0], 3.2, frame.center[1], rect);
       });
-      placeLabel(labelNodes.get('market'), 0, 4.7, 0, rect);
       for (const slot of homeSlots) {
         const owner = data.residents.find((resident) => resident.id === slot.id);
         const node = labelNodes.get(`home:${slot.id}`);
@@ -1625,14 +1645,18 @@ export function createWorld3D(canvas, labelsElement, onSelect) {
         const indoors = Boolean(item.resident.asleep && homeById.has(item.resident.location));
         figure.root.visible = !indoors;
         if (indoors) { const node = labelNodes.get(`resident:${item.resident.id}`); if (node) node.hidden = true; continue; }
-        figure.root.position.set(item.position[0], Math.max(0, heightAt(item.position[0], item.position[1])), item.position[1]);
+        const ground = Math.max(0, heightAt(item.position[0], item.position[1]));
+        figure.root.position.set(item.position[0], ground + (item.perch?.y || 0), item.position[1]);
         if (figure.heading === null) figure.heading = item.facing;
         let delta = ((item.facing - figure.heading + Math.PI * 3) % TAU) - Math.PI;
         figure.heading += motion ? delta * Math.min(1, dt * 8) : delta;
         figure.root.rotation.y = figure.heading;
         const walking = Boolean(item.movement && item.movement.progress < 1);
         const activity = activityFor(item.resident, now);
-        poseResident(figure, activity, walking, motion ? time : 0, !motion);
+        const atBar = Boolean(item.perch) && !walking;
+        const jump = poseResident(figure, activity, walking, motion ? time : 0, !motion,
+          atBar ? { perch: item.perch.kind, drink: !activity || activity.kind === 'care' && activity.label !== '休息', react: crowd } : {});
+        figure.root.position.y += jump;
         const selected = item.resident.id === selectedId;
         figure.ring.visible = selected;
         if (selected) { const pulse = 1 + Math.sin(time / 260) * 0.08; figure.ring.scale.set(pulse, pulse, pulse); }
@@ -1767,7 +1791,18 @@ export function createWorld3D(canvas, labelsElement, onSelect) {
       }
       syncFigures(data?.residents || []);
       syncClock(data?.world?.engine);
+      plaza.update(data);
       ensureLabels(scenes, data?.residents || []);
+      invalidate();
+    },
+    stats() { return { calls: renderer.info.render.calls, triangles: renderer.info.render.triangles, textures: renderer.info.memory.textures, geometries: renderer.info.memory.geometries }; },
+    // camera control (used by the screenshot harness and for deep links)
+    setView({ yaw, pitch, distance, target } = {}, snap = false) {
+      if (Number.isFinite(yaw)) goal.yaw = yaw;
+      if (Number.isFinite(pitch)) goal.pitch = Math.max(0.12, Math.min(1.35, pitch));
+      if (Number.isFinite(distance)) goal.distance = Math.max(6, Math.min(72, distance));
+      if (Array.isArray(target)) goal.target.set(...target);
+      if (snap) { view.yaw = goal.yaw; view.pitch = goal.pitch; view.distance = goal.distance; view.target.copy(goal.target); }
       invalidate();
     },
     select(id) {
@@ -1782,6 +1817,7 @@ export function createWorld3D(canvas, labelsElement, onSelect) {
       document.removeEventListener('visibilitychange', visibilityChanged);
       reducedMotion?.removeEventListener?.('change', motionPreferenceChanged);
       hud.remove();
+      plaza.dispose();
       renderer.dispose();
     }
   };

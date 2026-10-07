@@ -8,6 +8,7 @@ import { chargeMeal, MEAL_COST_UNITS } from './economy.js';
 import { payAdultServiceProvider, parseAdultServicePrice, refundAdultServiceFunds, reserveAdultServiceFunds } from './adult-services.js';
 import { MESSAGE_TEMPLATES, messageText } from './message-templates.js';
 import { formatUnits, parsePositiveUnits, simulatedQuotes } from './crypto-market.js';
+import { readWorldMarket } from './market-candles.js';
 import { accountSnapshot, ensureCryptoAccount, executeCryptoTrade, MAX_ASSET_NAV_BPS, MAX_ORDER_NAV_BPS, SPREAD_BPS, STARTING_USDC, TRADE_FEE_BPS } from './crypto-trading.js';
 import { formatRawTokenAmount, readRobinhoodMarket, scanRobinhoodMarket } from './robinhood-market.js';
 import { executeRobinhoodPaperTrade, readRobinhoodPaperAccount } from './robinhood-paper-trading.js';
@@ -441,7 +442,7 @@ app.get('/local/map-data', async (_request, reply) => {
       LEFT JOIN crypto_balances b ON b.world_id=m.world_id AND b.agent_id=m.agent_id
       LEFT JOIN crypto_market_quotes q ON q.symbol=b.asset_symbol
       WHERE m.world_id=$1 GROUP BY a.id,a.name ORDER BY min(m.joined_at),a.name`, [worldId]),
-    pool.query(`SELECT a.name AS "agentName",t.side,t.asset_symbol AS asset,t.quantity::text AS quantity,
+    pool.query(`SELECT a.name AS "agentName",a.id AS "agentId",t.side,t.asset_symbol AS asset,t.quantity::text AS quantity,
         t.price_usd::text AS "priceUsd",t.notional_usd::text AS "notionalUsd",t.fee_usdc::text AS "feeUsdc",
         t.created_at AS "createdAt"
       FROM crypto_trades t JOIN agents a ON a.id=t.agent_id WHERE t.world_id=$1
@@ -449,7 +450,7 @@ app.get('/local/map-data', async (_request, reply) => {
     pool.query(`SELECT p.agent_id AS "agentId",round(sum(p.quantity_raw*q.price_usd/power(10::numeric,t.decimals)),8)::text AS "memeValueUsd"
       FROM robinhood_paper_positions p JOIN robinhood_tokens t USING(token_address)
       JOIN robinhood_market_quotes q USING(token_address) WHERE p.world_id=$1 GROUP BY p.agent_id`, [worldId]),
-    pool.query(`SELECT a.name AS "agentName",o.side,o.token_address AS "tokenAddress",o.token_amount_raw::text AS "quantityRaw",
+    pool.query(`SELECT a.name AS "agentName",a.id AS "agentId",o.side,o.token_address AS "tokenAddress",o.token_amount_raw::text AS "quantityRaw",
         t.decimals,o.data->>'priceUsd' AS "priceUsd",o.notional_usd::text AS "notionalUsd",
         o.fee_usdc::text AS "feeUsdc",o.created_at AS "createdAt"
       FROM robinhood_paper_orders o JOIN agents a ON a.id=o.agent_id JOIN robinhood_tokens t USING(token_address)
@@ -475,6 +476,7 @@ app.get('/local/map-data', async (_request, reply) => {
   const worldMinutes = Number(clock?.worldMinutes) || 0;
   const environment = enrichMapEnvironment({ worldSeed: worldId, worldMinutes, scenes: scenes.rows,
     residents: residents.rows, events: [...events.rows, ...dataCenterLogs.rows] });
+  const market = await readWorldMarket(pool, { worldId, recentTrades: cryptoTrades.rows });
   const emergence = await readEmergenceReport(pool, { worldId, worldMinutes });
   const recoveryMetrics = await readEconomicRecoveryMetrics(pool, { worldId, worldMinutes });
   const [economyDashboard, businesses, economicDemand, economyHistory] = await Promise.all([
@@ -540,7 +542,7 @@ app.get('/local/map-data', async (_request, reply) => {
     demand: economicDemand.rows, history: economyHistory.rows, recovery: recoveryMetrics,
     settlement: 'simulated_internal_ledger', chainSettlementEnabled: false };
   worldEvolution.emergence = emergence;
-  return { world: { ...world.rows[0], engine: clock || { running: false }, environment }, scenes: scenes.rows, residents: residents.rows, events: events.rows,
+  return { world: { ...world.rows[0], engine: clock || { running: false }, environment, market }, scenes: scenes.rows, residents: residents.rows, events: events.rows,
     dataCenterLogs: dataCenterLogs.rows, trading: { simulated: true, quotes: cryptoQuotes, robinhood: robinhoodMarket,
       portfolios: cryptoPortfolios.rows, recentTrades }, worldEvolution, generatedAt: new Date().toISOString() };
 });

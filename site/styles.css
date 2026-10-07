@@ -156,6 +156,14 @@
 .world3d-agent-action[hidden]{display:none}
 .world3d-agent-action[data-kind="trade"]{border-color:rgba(104,223,191,.6);background:rgba(13,48,40,.92);color:#a6f1d8}
 .world3d-agent-action[data-kind="trade"]::before{content:"$";background:#2fae8c}
+/* own fills at the plaza coin bar: Korean (Upbit) colours, buy = red, sell = blue */
+.world3d-agent-action[data-side]{max-width:120px;font-weight:800;animation:world3d-fill-pop .45s ease-out}
+.world3d-agent-action[data-side="buy"]{border-color:rgba(255,82,110,.85);background:rgba(70,8,22,.94);color:#ffd0d9;box-shadow:0 0 10px rgba(255,59,92,.55)}
+.world3d-agent-action[data-side="buy"]::before{content:"▲";background:#ff3b5c}
+.world3d-agent-action[data-side="sell"]{border-color:rgba(64,150,255,.85);background:rgba(6,24,66,.94);color:#cfe3ff;box-shadow:0 0 10px rgba(47,139,255,.55)}
+.world3d-agent-action[data-side="sell"]::before{content:"▼";background:#2f8bff}
+@keyframes world3d-fill-pop{0%{transform:translateX(-50%) scale(.6);opacity:0}70%{transform:translateX(-50%) scale(1.12)}100%{transform:translateX(-50%) scale(1);opacity:1}}
+@media (prefers-reduced-motion: reduce){.world3d-agent-action[data-side]{animation:none}}
 .world3d-agent-action[data-kind="work"]{border-color:rgba(201,243,106,.45);color:#e3f6a6}
 .world3d-agent-action[data-kind="work"]::before,.world3d-agent-action[data-kind="build"]::before{content:"⚒";background:#b98a2e}
 .world3d-agent-action[data-kind="travel"]{border-color:rgba(111,185,228,.45);color:#c3e5fa}
