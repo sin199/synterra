@@ -1,0 +1,58 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: synterra
+      POSTGRES_USER: synterra
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set a unique production database password in .env.production}
+    volumes:
+      - synterra-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U synterra -d synterra"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+
+  world-engine:
+    build:
+      context: ../..
+      dockerfile: deploy/container/Dockerfile
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: 8787
+      DATABASE_URL: postgres://synterra:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}@postgres:5432/synterra
+      SYNTERRA_STATE_DIR: /var/lib/synterra/.synterra
+      ARC_ENV: mainnet
+      ARC_RPC_URL: ${ARC_RPC_URL:-https://rpc.mainnet.arc.io}
+      ARC_RPC_FALLBACK_URLS: ${ARC_RPC_FALLBACK_URLS:-}
+      ARC_SIGNER_PROVIDER: ${ARC_SIGNER_PROVIDER:-}
+      ARC_SIGNER_ADAPTER_MODULE: ${ARC_SIGNER_ADAPTER_MODULE:-}
+      ARC_DEPLOYER_ADDRESS: ${ARC_DEPLOYER_ADDRESS:-}
+      ARC_WORLD_TREASURY_ADDRESS: ${ARC_WORLD_TREASURY_ADDRESS:-}
+      ARC_SETTLEMENT_CONTRACT_ADDRESS: ${ARC_SETTLEMENT_CONTRACT_ADDRESS:-}
+      ARC_SETTLEMENT_RUNTIME_CODE_HASH: ${ARC_SETTLEMENT_RUNTIME_CODE_HASH:-}
+      ARC_WORLD_REGISTRY_ADDRESS: ${ARC_WORLD_REGISTRY_ADDRESS:-}
+      ARC_CAPABILITY_PROVENANCE_ADDRESS: ${ARC_CAPABILITY_PROVENANCE_ADDRESS:-}
+      ARC_SETTLEMENT_DEPLOYMENT_BLOCK: ${ARC_SETTLEMENT_DEPLOYMENT_BLOCK:-}
+      ARC_USDC_INDEXER_START_BLOCK: ${ARC_USDC_INDEXER_START_BLOCK:-}
+      TYPESAFE_API_KEY: ${TYPESAFE_API_KEY:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8787:8787"
+    volumes:
+      - synterra-state:/var/lib/synterra/.synterra
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8787/health').then(async r=>{const j=await r.json();if(!r.ok||j.databaseHealthy===false)process.exit(1)}).catch(()=>process.exit(1)"]
+      interval: 20s
+      timeout: 5s
+      retries: 6
+      start_period: 90s
+
+volumes:
+  synterra-postgres:
+  synterra-state:

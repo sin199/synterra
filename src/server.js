@@ -16,6 +16,13 @@ import { createFruitflyRuntime } from './agent-runtime/fruitfly.js';
 import { chooseCivilizationOption, chooseWithTypeSafe, chooseWorldV7Reflection } from './agent-runtime/typesafe.js';
 import { startWorldEngine, worldClock } from './world-engine.js';
 import { buildWorldLiveness, reportWorldEngineError } from './world-engine-diagnostics.js';
+import { arcNetworkConfig } from './arc/config.js';
+import { ArcRpcClient } from './arc/rpc.js';
+import { enqueueArcAgentEconomicAction } from './arc/agent-economic-action.js';
+import { loadConfiguredArcSigner } from './arc/signer-loader.js';
+import { startArcSettlementOutboxWorker } from './arc/settlement-worker.js';
+import { startArcReadOnlyObserver } from './arc/observer.js';
+import { summarizeArcObserverHealth } from './arc/status.js';
 import { createWorldOpportunity, decideWorldOpportunity, listAvailableOpportunities } from './world-opportunities.js';
 import { proposeWorldProject, decideProjectMembership, contributeToProject, listWorldProjects } from './world-projects.js';
 import { foundWorldOrganization, inviteWorldOrganization, decideOrganizationMembership,
@@ -52,14 +59,17 @@ const app = Fastify({ logger: false, bodyLimit: 1_000_000 });
 const challenges = new Map();
 let worldEngine = { running: false, reason: 'starting' };
 let v6LifecycleObserver = null;
+let arcObserver = null;
+let arcSigner = null;
+let arcSignerSetupError = null;
+let arcSettlementWorker = null;
+let arcSchemaReady = false;
+let arcSetupReason = 'arc_schema_migration_required';
 const HOST = process.env.HOST || '127.0.0.1';
 const PORT = Number(process.env.PORT || 8787);
-const ARC_ENV = process.env.ARC_ENV || 'mainnet';
-const ARC_CHAIN_IDS = Object.freeze({ mainnet: 5042, testnet: 5042002 });
-if (!Object.hasOwn(ARC_CHAIN_IDS, ARC_ENV)) {
-  throw new Error('ARC_ENV must be either "mainnet" or "testnet".');
-}
-const CHAIN_ID = ARC_CHAIN_IDS[ARC_ENV];
+const ARC_CONFIG = arcNetworkConfig(process.env);
+const ARC_RPC_CLIENT = new ArcRpcClient({ config: ARC_CONFIG });
+const CHAIN_ID = ARC_CONFIG.chainId;
 const MINING_REWARD = Number(process.env.MINING_REWARD_UNITS || 5);
 const RUN_COST = Number(process.env.WORLD_RUN_COST_PER_UNIT || 1);
 const ROBINHOOD_SCAN_INTERVAL_MS = Math.max(15_000, Math.min(300_000, Number(process.env.ROBINHOOD_SCAN_INTERVAL_MS) || 30_000));
@@ -75,6 +85,26 @@ app.addContentTypeParser('application/json', { parseAs: 'buffer' }, (request, bo
 
 function fail(reply, status, error, detail) {
   return reply.code(status).send({ error, ...(detail ? { detail } : {}) });
+}
+function arcPublicStatus() {
+  const raw = arcObserver?.getStatus() || {
+    available: arcSchemaReady,
+    running: false,
+    mode: 'read_only',
+    sourceOfTruth: 'database_and_arc_chain',
+    worldId: worldEngine.worldId || null,
+    samplingIntervalMs: null,
+    lastSampleAt: null,
+    lastSampleWorldMinute: null,
+    lastFindingCount: null,
+    lastError: null,
+    network: { name: ARC_CONFIG.name, chainId: ARC_CONFIG.chainId, explorerUrl: ARC_CONFIG.explorerUrl },
+    arcMainnet: { configured: true, chainId: ARC_CONFIG.chainId, rpcHealthy: false,
+      latestBlock: null, lastIndexedBlock: null, indexerLag: null, deployerAddress: null,
+      treasuryAddress: null, pendingSettlements: 0, failedSettlements: 0, settlementEnabled: false },
+    reason: arcSignerSetupError || arcSetupReason
+  };
+  return summarizeArcObserverHealth(raw, ARC_CONFIG);
 }
 function logWorldEngineError(error, stage, record) {
   const level = app.log?.level;
@@ -286,15 +316,29 @@ app.get('/health', async () => {
     });
     const row = result.rows[0] || null;
     const observerStatus = await readV6LifecycleObserverRuntimeStatus();
+    const arcObserverStatus = arcPublicStatus();
     return { service: 'synterra', chainId: CHAIN_ID,
       ...buildWorldLiveness({ databaseHealthy: true, runtime: row,
         engine, checkedAt: row?.database_time || new Date() }),
-      v6LifecycleObserver: observerStatus };
+      v6LifecycleObserver: observerStatus,
+      arcMainnet: arcObserverStatus.arcMainnet,
+      arcNetwork: arcObserverStatus.arcNetwork,
+      arcObserver: arcObserverStatus,
+      arcSettlementWorker: arcSettlementWorker?.getStatus() || { available: true, running: false,
+        mode: 'mainnet_write_gated', providerName: arcSigner?.providerName || null,
+        reason: arcSignerSetupError || 'mainnet_write_gate_closed' } };
   } catch {
     const observerStatus = await readV6LifecycleObserverRuntimeStatus();
+    const arcObserverStatus = arcPublicStatus();
     return { service: 'synterra', chainId: CHAIN_ID,
       ...buildWorldLiveness({ databaseHealthy: false, runtime: null, engine, checkedAt: new Date() }),
-      v6LifecycleObserver: observerStatus };
+      v6LifecycleObserver: observerStatus,
+      arcMainnet: arcObserverStatus.arcMainnet,
+      arcNetwork: arcObserverStatus.arcNetwork,
+      arcObserver: arcObserverStatus,
+      arcSettlementWorker: arcSettlementWorker?.getStatus() || { available: true, running: false,
+        mode: 'mainnet_write_gated', providerName: arcSigner?.providerName || null,
+        reason: arcSignerSetupError || 'mainnet_write_gate_closed' } };
   }
 });
 
@@ -466,12 +510,18 @@ app.get('/local/map-data', async (_request, reply) => {
   const v7 = await readWorldV7Summary(pool, { worldId, limit: 12 });
   const v6Lifecycle = await readWorldV6Lifecycle(pool, { worldId, worldMinute: worldMinutes });
   const v6LifecycleObserverStatus = await readV6LifecycleObserverRuntimeStatus(undefined, worldId);
+  const publicArcObserverStatus = arcPublicStatus();
   const worldEvolution = { dashboard: { ...counts.rows[0], worldMinutes, worldAgeHours: Math.round(worldMinutes / 60),
       worldAgeDays: Math.floor(worldMinutes / 1_440) + 1,
       totalSimulatedWealthUsd: (Number(economyDashboard.rows[0]?.total_resident_net_worth_usd || 0)
         + [...memeValueByAgent.values()].reduce((sum, value) => sum + value, 0)).toFixed(2),
         totalInternalUnits: internalUnits.rows[0].units }, opportunities: opportunities.rows, projects,
     organizations, institutions, capabilities, v6Lifecycle, v6LifecycleObserver: v6LifecycleObserverStatus,
+    arcMainnet: publicArcObserverStatus.arcMainnet,
+    arcObserver: publicArcObserverStatus,
+    arcSettlementWorker: arcSettlementWorker?.getStatus() || { available: true, running: false,
+      mode: 'mainnet_write_gated', providerName: arcSigner?.providerName || null,
+      reason: arcSignerSetupError || 'mainnet_write_gate_closed' },
     v7, history: history.rows };
   worldEvolution.economy = { dashboard: economyDashboard.rows[0] || {}, businesses,
     demand: economicDemand.rows, history: economyHistory.rows, recovery: recoveryMetrics,
@@ -2362,6 +2412,18 @@ app.get('/v1/worlds/:worldId/events', async (request, reply) => {
 });
 
 await pool.query(await readFile(path.join(ROOT, 'schema.sql'), 'utf8'));
+const arcSchema = await pool.query(`SELECT to_regclass('public.arc_settlement_outbox') IS NOT NULL AS ready`);
+arcSchemaReady = arcSchema.rows[0]?.ready === true;
+arcSetupReason = arcSchemaReady ? 'observer_not_registered' : 'arc_schema_migration_required';
+if (arcSchemaReady) {
+  try {
+    const signerResult = await loadConfiguredArcSigner({ config: ARC_CONFIG, env: process.env });
+    arcSigner = signerResult.signer;
+  } catch (error) {
+    arcSignerSetupError = String(error?.code || 'ARC_SIGNER_CONFIGURATION_INVALID').replace(/[^A-Z0-9_]/gi, '').slice(0, 80);
+    console.error(JSON.stringify({ code: arcSignerSetupError }, null, 0));
+  }
+}
 await expireAdultServiceBookings();
 await refreshCryptoQuotes();
 await app.listen({ host: HOST, port: PORT });
@@ -2378,6 +2440,7 @@ try {
     chooseWithTypeSafe: process.env.TYPESAFE_API_KEY && typeSafeRuntimeState ? chooseWithTypeSafe : null,
     chooseCivilizationOption: process.env.TYPESAFE_API_KEY && typeSafeRuntimeState ? chooseCivilizationOption : null,
     chooseWorldV7Reflection: process.env.TYPESAFE_API_KEY && typeSafeRuntimeState ? chooseWorldV7Reflection : null,
+    onAutonomousBusinessAction: arcSchemaReady ? enqueueArcAgentEconomicAction : null,
     runtimeState: typeSafeRuntimeState,
     fruitfly: fruitflyRuntime,
     onStatus: (status) => {
@@ -2396,6 +2459,19 @@ if (worldEngine.running && worldEngine.worldLockOwned && worldEngine.worldId) {
     directory: path.join(STATE_DIR, 'v6-observations'),
     isOwner: () => worldEngine.running && worldEngine.worldLockOwned && worldEngine.worldId === observerWorldId,
     onError: (error) => app.log.error({ err: error }, 'read-only V6 lifecycle observer snapshot failed') });
+  if (arcSchemaReady) {
+    arcObserver = startArcReadOnlyObserver({ pool, config: ARC_CONFIG,
+      rpcClient: ARC_RPC_CLIENT,
+      isOwner: () => worldEngine.running && worldEngine.worldLockOwned && worldEngine.worldId === observerWorldId,
+      signerConfigured: Boolean(arcSigner),
+      onError: (error) => app.log.error({ code: error?.code || 'ARC_OBSERVER_ERROR' }, 'read-only Arc observation failed') });
+    await arcObserver.start({ worldId: observerWorldId });
+    arcSettlementWorker = startArcSettlementOutboxWorker({ pool, config: ARC_CONFIG, env: process.env,
+      signer: arcSigner, rpcClient: ARC_RPC_CLIENT,
+      isOwner: () => worldEngine.running && worldEngine.worldLockOwned && worldEngine.worldId === observerWorldId,
+      onError: (record) => app.log.error(record, 'Arc settlement outbox processing failed') });
+    await arcSettlementWorker.start();
+  }
 }
 const adultServiceExpiryTimer = setInterval(() => {
   expireAdultServiceBookings().catch((error) => app.log.error({ err: error }, 'adult service booking expiry failed'));
@@ -2414,6 +2490,8 @@ async function shutdown() {
   clearInterval(adultServiceExpiryTimer);
   clearInterval(cryptoMarketTimer);
   clearInterval(robinhoodMarketTimer);
+  await arcSettlementWorker?.stop();
+  await arcObserver?.stop();
   await v6LifecycleObserver?.stop();
   await worldEngine.stop?.();
   await app.close();

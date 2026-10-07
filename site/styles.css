@@ -169,7 +169,7 @@
 .world-evolution-card li:not(.world-evolution-empty){display:grid;gap:4px;min-width:0;padding:9px 10px;border-left:1px solid rgba(201,243,106,.33);background:rgba(224,238,211,.025)}
 .world-evolution-card li strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#dbe4d4;font-size:10px;font-weight:600}
 .world-evolution-card li span{color:#879380;font:8px/1.55 var(--mono);overflow-wrap:anywhere}
-.capability-evolution-card,.v6-lifecycle-card{grid-column:1/-1}
+.capability-evolution-card,.v6-lifecycle-card,.arc-evolution-card{grid-column:1/-1}
 .capability-epoch{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;margin-bottom:12px}
 .capability-epoch h4{margin-bottom:5px}
 .capability-epoch p{margin:0;color:#879380;font:8px/1.55 var(--mono)}
@@ -179,6 +179,9 @@
 #world-v6-lifecycle-observer-status[data-state="degraded"]{color:#e5b565}
 #world-v6-lifecycle-observer-status[data-state="unavailable"]{color:#e58a83}
 #world-v6-lifecycle-observer-status[data-state="unreported"]{color:#b6c29f}
+#world-arc-observer-status[data-state="running"]{color:#80c990}
+#world-arc-observer-status[data-state="degraded"]{color:#e5b565}
+#world-arc-observer-status[data-state="unavailable"]{color:#e58a83}
 .capability-evolution-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
 .capability-evolution-grid section{min-width:0;padding-top:10px;border-top:1px solid rgba(224,238,211,.08)}
 .capability-evolution-grid h5{margin:0 0 8px;color:#a7b39f;font:500 9px var(--display)}

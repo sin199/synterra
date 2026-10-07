@@ -1,0 +1,325 @@
+{
+  "verifiedAt": "2026-10-07T09:42:58.896Z",
+  "verificationMode": "official_documentation_plus_read_only_mainnet_json_rpc",
+  "noMainnetWritesPerformed": true,
+  "testnetConnected": false,
+  "sources": [
+    {
+      "topic": "rpcEndpoints",
+      "url": "https://docs.arc.io/arc/references/rpc-endpoints"
+    },
+    {
+      "topic": "contractAddresses",
+      "url": "https://docs.arc.io/arc/references/contract-addresses"
+    },
+    {
+      "topic": "evmDifferences",
+      "url": "https://docs.arc.io/arc/references/evm-differences"
+    },
+    {
+      "topic": "gasAndFees",
+      "url": "https://docs.arc.io/arc/references/gas-and-fees"
+    },
+    {
+      "topic": "usdcSystemEvents",
+      "url": "https://docs.arc.io/arc/references/usdc-system-events"
+    },
+    {
+      "topic": "deterministicFinality",
+      "url": "https://docs.arc.io/arc/concepts/deterministic-finality"
+    },
+    {
+      "topic": "circleUsdcAddresses",
+      "url": "https://developers.circle.com/stablecoins/usdc-contract-addresses"
+    },
+    {
+      "topic": "circleSupportedChains",
+      "url": "https://developers.circle.com/wallets/supported-blockchains"
+    }
+  ],
+  "documentationChecks": [
+    {
+      "topic": "rpcEndpoints",
+      "url": "https://docs.arc.io/arc/references/rpc-endpoints",
+      "status": 200,
+      "finalUrl": "https://docs.arc.io/arc/references/rpc-endpoints",
+      "contentBytes": 395495,
+      "sha256": "8a28e075c0cfe1b1a8df6f5771c47578cfd02e7303f1ffe391015f84c1cb1f3a",
+      "retrievedAt": "2026-10-07T09:42:51.113Z"
+    },
+    {
+      "topic": "contractAddresses",
+      "url": "https://docs.arc.io/arc/references/contract-addresses",
+      "status": 200,
+      "finalUrl": "https://docs.arc.io/arc/references/contract-addresses",
+      "contentBytes": 531567,
+      "sha256": "1de7f6632903b85707f421e5d4cdf9aa04ac20a13f0001be9658eeeeabbe5976",
+      "retrievedAt": "2026-10-07T09:42:51.141Z"
+    },
+    {
+      "topic": "evmDifferences",
+      "url": "https://docs.arc.io/arc/references/evm-differences",
+      "status": 200,
+      "finalUrl": "https://docs.arc.io/arc/references/evm-differences",
+      "contentBytes": 420992,
+      "sha256": "6196f30ec5bc2e4a63573498a9be07b58565885b89d0fefb0e66531485ab8765",
+      "retrievedAt": "2026-10-07T09:42:51.117Z"
+    },
+    {
+      "topic": "gasAndFees",
+      "url": "https://docs.arc.io/arc/references/gas-and-fees",
+      "status": 200,
+      "finalUrl": "https://docs.arc.io/arc/references/gas-and-fees",
+      "contentBytes": 420632,
+      "sha256": "a6c54d36dc8dd9fdeebebd41a64d2623c4d10b4d6d9697fda6daa5ba63952656",
+      "retrievedAt": "2026-10-07T09:42:51.172Z"
+    },
+    {
+      "topic": "usdcSystemEvents",
+      "url": "https://docs.arc.io/arc/references/usdc-system-events",
+      "status": 200,
+      "finalUrl": "https://docs.arc.io/arc/references/usdc-system-events",
+      "contentBytes": 390505,
+      "sha256": "9cfbc47aef8f92b9c4b1c9919940d1efb87fb9c29011d2438997ba807f8c41e2",
+      "retrievedAt": "2026-10-07T09:42:51.178Z"
+    },
+    {
+      "topic": "deterministicFinality",
+      "url": "https://docs.arc.io/arc/concepts/deterministic-finality",
+      "status": 200,
+      "finalUrl": "https://docs.arc.io/arc/concepts/deterministic-finality",
+      "contentBytes": 370120,
+      "sha256": "0ea2d495ea77d8155ba43e728fb8ce32ae39933fd54586780cddfaf1f3660d64",
+      "retrievedAt": "2026-10-07T09:42:51.175Z"
+    },
+    {
+      "topic": "circleUsdcAddresses",
+      "url": "https://developers.circle.com/stablecoins/usdc-contract-addresses",
+      "status": 200,
+      "finalUrl": "https://developers.circle.com/stablecoins/usdc-contract-addresses",
+      "contentBytes": 382949,
+      "sha256": "6c7378a9c4634c4a97d617feba72fa89f07ad1770f12d5877ffb972fccd1ce88",
+      "retrievedAt": "2026-10-07T09:42:51.071Z"
+    },
+    {
+      "topic": "circleSupportedChains",
+      "url": "https://developers.circle.com/wallets/supported-blockchains",
+      "status": 200,
+      "finalUrl": "https://developers.circle.com/wallets/supported-blockchains",
+      "contentBytes": 383714,
+      "sha256": "904431f0a2b08dbb93c948b07f23bcbaa36d489ac9cdcddd86862c3d0c6a37fa",
+      "retrievedAt": "2026-10-07T09:42:51.097Z"
+    }
+  ],
+  "officialDocumentationEvidence": {
+    "chainId": {
+      "value": 5042,
+      "source": "https://docs.arc.io/arc/references/rpc-endpoints"
+    },
+    "mainnetRpcEndpoints": {
+      "primary": "https://rpc.mainnet.arc.io",
+      "blockdaemon": "https://rpc.blockdaemon.mainnet.arc.io",
+      "drpc": "https://rpc.drpc.mainnet.arc.io",
+      "quicknode": "https://rpc.quicknode.mainnet.arc.io"
+    },
+    "usdc": {
+      "arcMainnetAddress": "0x3600000000000000000000000000000000000000",
+      "circleAddress": "0x3600000000000000000000000000000000000000",
+      "addressesMatch": true,
+      "nativeGasDecimals": 18,
+      "erc20Decimals": 6,
+      "sharedUnderlyingBalance": true,
+      "arcSource": "https://docs.arc.io/arc/references/contract-addresses",
+      "circleSource": "https://developers.circle.com/stablecoins/usdc-contract-addresses"
+    },
+    "maxFeePerGasRecommendation": {
+      "gwei": 20,
+      "parametersPageHasTestnetScopeCaveat": true,
+      "mainnetProtocolFloorConfirmed": false,
+      "source": "https://docs.arc.io/arc/references/gas-and-fees",
+      "note": "The page recommends 20 Gwei for maxFeePerGas but states its current fee parameters are Testnet-scoped; this is recorded as a conservative recommendation, not a verified Mainnet protocol floor."
+    },
+    "nativeUsdcSystemEmitter": {
+      "address": "0xffffFFFfFFffffffffffffffFfFFFfffFFFfFFfE",
+      "source": "https://docs.arc.io/arc/references/usdc-system-events"
+    },
+    "zeroAddressBehavior": {
+      "nonZeroValueReverts": true,
+      "zeroValueSucceeds": true
+    },
+    "deterministicFinalityStatement": "deterministic finality delivers irreversible transaction settlement in under one second",
+    "erc8004MainnetAddresses": {
+      "IdentityRegistry": "0x8004A169FB4a3325136EB29fA0ceB6D2e539a432",
+      "ReputationRegistry": "0x8004BAa17C55a88189AE136b182e5fdA19dE9b63",
+      "ValidationRegistry": "0x8004Cc8439f36fd5F9F049D9fF86523Df6dAAB58",
+      "source": "https://docs.arc.io/arc/references/contract-addresses"
+    },
+    "erc8183": {
+      "mainnetListed": false,
+      "testnetOnlyReferenceListed": true,
+      "source": "https://docs.arc.io/arc/references/contract-addresses"
+    }
+  },
+  "documentationClaims": {
+    "chainId": {
+      "documented": 5042,
+      "rpcHex": "0x13b2",
+      "matched": true
+    },
+    "primaryRpc": "https://rpc.mainnet.arc.io",
+    "backupRpcOptions": [
+      "rpc.blockdaemon.mainnet.arc.io",
+      "rpc.drpc.mainnet.arc.io",
+      "rpc.quicknode.mainnet.arc.io"
+    ],
+    "usdcAddress": "0x3600000000000000000000000000000000000000",
+    "usdcAddressSource": "https://docs.arc.io/arc/references/contract-addresses",
+    "nativeUsdcGasDecimals": 18,
+    "erc20UsdcDecimals": 6,
+    "maxFeePerGasRecommendationWei": "20000000000",
+    "mainnetProtocolMaxFeeFloorConfirmed": false,
+    "deterministicFinality": true,
+    "systemUsdcEmitter": "0xffffFFFfFFffffffffffffffFfFFFfffFFFfFFfE",
+    "erc8183MainnetStatus": "NOT_AVAILABLE"
+  },
+  "network": {
+    "name": "Arc Mainnet",
+    "chainId": 5042,
+    "documentationChainId": 5042,
+    "rpcChainIdHex": "0x13b2",
+    "primaryRpc": "https://rpc.mainnet.arc.io",
+    "backupRpcChecks": [
+      {
+        "provider": "rpc.blockdaemon.mainnet.arc.io",
+        "chainId": 5042,
+        "blockNumberHex": "0x1790eb3",
+        "status": "verified_mainnet"
+      },
+      {
+        "provider": "rpc.drpc.mainnet.arc.io",
+        "chainId": 5042,
+        "blockNumberHex": "0x1790eb5",
+        "status": "verified_mainnet"
+      },
+      {
+        "provider": "rpc.quicknode.mainnet.arc.io",
+        "chainId": 5042,
+        "blockNumberHex": "0x1790eb8",
+        "status": "verified_mainnet"
+      }
+    ],
+    "latestBlockObservation": {
+      "ethBlockNumberHex": "0x1790eaa",
+      "ethGetBlockByNumberLatestHex": "0x1790eab",
+      "hash": "0xeafa340577a6bcbc613753dc9d2bc09b3a37c52f376749ea2e99c478586ea617",
+      "timestampHex": "0x6ac6141b",
+      "baseFeePerGasHex": "0x4a817c800"
+    }
+  },
+  "usdc": {
+    "canonicalAddress": "0x3600000000000000000000000000000000000000",
+    "ethGetCode": {
+      "nonEmpty": true,
+      "byteLength": 1798,
+      "runtimeCodeHash": "0xc9987bd3af6b26a030951faa7eacc017b68343aeedf3ce5fe68f821c4b93939d"
+    },
+    "erc20": {
+      "decimals": 6,
+      "decimalsHex": "0x0000000000000000000000000000000000000000000000000000000000000006",
+      "name": "USDC",
+      "symbol": "USDC"
+    },
+    "nativeAccounting": {
+      "asset": "USDC",
+      "precisionDecimals": 18,
+      "semantics": "Native gas balance and ERC-20 USDC are two precision views of the same underlying balance; never sum them."
+    },
+    "erc20SettlementPrecisionDecimals": 6
+  },
+  "gas": {
+    "currency": "USDC",
+    "pricingModel": "EIP-1559",
+    "documentedMaxFeePerGasRecommendationWei": "20000000000",
+    "mainnetProtocolFloorStatus": "NOT_CONFIRMED_BY_CURRENT_MAINNET_DOCUMENTATION",
+    "observedLatestBaseFeePerGasWei": "20000000000",
+    "documentationScopeNote": "Arc gas documentation cautions that fee parameters on the page are currently Testnet-scoped.",
+    "observedLatestBaseFeePerGasHex": "0x4a817c800",
+    "observedFeeHistoryBaseFeesHex": [
+      "0x4a817c800",
+      "0x4a817c800",
+      "0x4a817c800",
+      "0x4a817c800",
+      "0x4a817c800"
+    ],
+    "observedMaxPriorityFeePerGasHex": "0x47f",
+    "finalFeeRule": "Refresh Mainnet fee fields immediately before any separately authorized write."
+  },
+  "finality": {
+    "model": "deterministic BFT finality",
+    "officialExpectation": "Arc documentation describes irreversible, deterministic transaction settlement in under one second."
+  },
+  "systemUsdcEvents": {
+    "nativeTransferEmitter": "0xffffFFFfFFffffffffffffffFfFFFfffFFFfFFfE",
+    "transferTopic0": "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef",
+    "emitterCodeNonEmpty": false,
+    "emitterRuntimeCodeBytes": 0,
+    "latestBlockEthGetLogs": {
+      "available": true,
+      "fromBlockHex": "0x1790ea2",
+      "toBlockHex": "0x1790eab",
+      "count": 55
+    },
+    "indexingRule": "Token-contract and system-emitter Transfer records may describe one underlying balance movement; index by emitter and do not double count."
+  },
+  "zeroAddressValue": {
+    "rule": "non-zero native value to address(0) is expected to revert; zero value remains valid",
+    "readOnlyEthCall": {
+      "result": "reverted_zero_address_not_allowed",
+      "errorCode": 3,
+      "transactionSubmitted": false
+    }
+  },
+  "erc8004": {
+    "mainnetStatus": "MAINNET_AVAILABLE",
+    "source": "https://docs.arc.io/arc/references/contract-addresses",
+    "registries": {
+      "identity": {
+        "address": "0x8004A169FB4a3325136EB29fA0ceB6D2e539a432",
+        "deployed": true,
+        "runtimeCodeBytes": 130,
+        "runtimeCodeHash": "0xd0e45b1d89fa9b6cc7e97c1f155d64180e5c232aaccf9900ef9d4fd738c02b41"
+      },
+      "reputation": {
+        "address": "0x8004BAa17C55a88189AE136b182e5fdA19dE9b63",
+        "deployed": true,
+        "runtimeCodeBytes": 130,
+        "runtimeCodeHash": "0xd0e45b1d89fa9b6cc7e97c1f155d64180e5c232aaccf9900ef9d4fd738c02b41"
+      },
+      "validation": {
+        "address": "0x8004Cc8439f36fd5F9F049D9fF86523Df6dAAB58",
+        "deployed": true,
+        "runtimeCodeBytes": 130,
+        "runtimeCodeHash": "0xd0e45b1d89fa9b6cc7e97c1f155d64180e5c232aaccf9900ef9d4fd738c02b41"
+      }
+    },
+    "reuseDecision": "Available for evaluation only; no identity registration was performed."
+  },
+  "erc8183": {
+    "mainnetStatus": "NOT_AVAILABLE",
+    "mainnetAddress": null,
+    "source": "https://docs.arc.io/arc/references/contract-addresses",
+    "reuseDecision": "No Mainnet deployment is listed by the current official Arc contract-address reference."
+  },
+  "mainnetAccounts": {
+    "deployer": {
+      "status": "PENDING MAINNET SIGNER CONFIGURATION"
+    },
+    "treasury": {
+      "status": "PENDING MAINNET SIGNER CONFIGURATION"
+    }
+  },
+  "walletArchitecture": {
+    "signerProvider": "PENDING MAINNET SIGNER CONFIGURATION",
+    "keyHandling": "No signer secrets were read, stored, logged, or included in this artifact."
+  }
+}

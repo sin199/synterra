@@ -1,0 +1,52 @@
+{
+  "network": "Arc Mainnet",
+  "chainId": 5042,
+  "generatedAt": "2026-10-07T09:54:20.526Z",
+  "mode": "offline_contract_bytecode_manifest",
+  "noMainnetWritesPerformed": true,
+  "contracts": [
+    {
+      "name": "SynterraWorldRegistry",
+      "source": "contracts/src/SynterraWorldRegistry.sol",
+      "constructorSignature": "constructor(bytes16,address,address,address)",
+      "constructorArgumentNames": [
+        "worldId",
+        "owner",
+        "checkpointWriter",
+        "identityWriter"
+      ],
+      "creationBytecodeBytes": 2933,
+      "creationBytecodeHash": "0x75138fae96aa802c87a0823be208ad77b0932163ada4651a5095e498667b0fe8",
+      "runtimeBytecodeBytes": 2473,
+      "runtimeBytecodeHash": "0x2ca1ae6b3c8bef73624be93e416bd7ade37ee965997323a9e26225c5b0de611f"
+    },
+    {
+      "name": "SynterraSettlement",
+      "source": "contracts/src/SynterraSettlement.sol",
+      "constructorSignature": "constructor(bytes16,address,address)",
+      "constructorArgumentNames": [
+        "worldId",
+        "usdc",
+        "emergencyOperator"
+      ],
+      "creationBytecodeBytes": 3883,
+      "creationBytecodeHash": "0x2ffda762c9ee4f9743e13d7c8cf22505de4460cb8a82d94775e9207c9ddee0dc",
+      "runtimeBytecodeBytes": 3554,
+      "runtimeBytecodeHash": "0x5c063c6ddbeb198ccf5cc9bea1f0fea9173cf5a3abf15d72631db9c09d82dbed"
+    },
+    {
+      "name": "SynterraCapabilityProvenance",
+      "source": "contracts/src/SynterraCapabilityProvenance.sol",
+      "constructorSignature": "constructor(bytes16,address,address)",
+      "constructorArgumentNames": [
+        "worldId",
+        "owner",
+        "writer"
+      ],
+      "creationBytecodeBytes": 2550,
+      "creationBytecodeHash": "0xb68bbaa56ad9520ae5dd9d9b85c5aaa62fb24d5224dbb76114e6dfdc4f371329",
+      "runtimeBytecodeBytes": 2198,
+      "runtimeBytecodeHash": "0x3b61fbe73aa56cabaef324fff13954b4c2493db5f73a8b3224a1fad56d370137"
+    }
+  ]
+}

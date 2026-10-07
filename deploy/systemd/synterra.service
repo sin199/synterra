@@ -1,0 +1,30 @@
+[Unit]
+Description=Synterra persistent agent world
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=synterra
+Group=synterra
+WorkingDirectory=/opt/synterra/current
+EnvironmentFile=/etc/synterra/runtime.env
+Environment=SYNTERRA_STATE_DIR=/var/lib/synterra/.synterra
+ExecStart=/usr/bin/node --env-file-if-exists=/etc/synterra/runtime.env src/server.js
+Restart=on-failure
+RestartSec=5s
+KillSignal=SIGTERM
+TimeoutStopSec=45s
+UMask=0077
+StateDirectory=synterra
+StateDirectoryMode=0700
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/synterra
+LockPersonality=true
+MemoryDenyWriteExecute=false
+
+[Install]
+WantedBy=multi-user.target

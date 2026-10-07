@@ -10,6 +10,11 @@
     "start": "node --env-file-if-exists=.env src/server.js",
     "dev": "node --env-file-if-exists=.env --watch src/server.js",
     "test": "node --test",
+    "db:migrate": "node scripts/db/migrate.js",
+    "arc:verify-mainnet": "node scripts/arc/verify-mainnet-readonly.mjs",
+    "arc:deployment-manifest": "forge build --root contracts && node scripts/arc/mainnet-calldata.mjs --manifest-only --output deployments/arc-mainnet-contract-manifest.json",
+    "arc:deployment-calldata": "forge build --root contracts && node scripts/arc/mainnet-calldata.mjs",
+    "arc:contracts:test": "forge test --root contracts",
     "agents:init": "node --env-file-if-exists=.env src/agent-runtime/bootstrap.js",
     "agents:run": "node --env-file-if-exists=.env src/agent-runtime/run.js"
   },

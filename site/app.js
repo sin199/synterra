@@ -25,6 +25,11 @@ const opportunityList = document.querySelector('#world-opportunity-list');
 const projectList = document.querySelector('#world-project-list');
 const organizationList = document.querySelector('#world-organization-list');
 const institutionsList = document.querySelector('#world-institutions-list');
+const worldArcSummary = document.querySelector('#world-arc-summary');
+const worldArcObserverStatus = document.querySelector('#world-arc-observer-status');
+const worldArcStats = document.querySelector('#world-arc-stats');
+const worldArcFindingsList = document.querySelector('#world-arc-findings-list');
+const worldArcSettlementsList = document.querySelector('#world-arc-settlements-list');
 const worldV6LifecycleSummary = document.querySelector('#world-v6-lifecycle-summary');
 const worldV6LifecycleObserverStatus = document.querySelector('#world-v6-lifecycle-observer-status');
 const worldV6LifecycleStats = document.querySelector('#world-v6-lifecycle-stats');
@@ -136,6 +141,15 @@ function formatTime(value, includeDate = false) {
   return new Intl.DateTimeFormat('zh-CN', includeDate
     ? { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }
     : { hour: '2-digit', minute: '2-digit' }).format(date);
+}
+
+function formatUsdcBaseUnits(value) {
+  try {
+    const units = BigInt(value);
+    const whole = units / 1_000_000n;
+    const fraction = String(units % 1_000_000n).padStart(6, '0').replace(/0+$/, '');
+    return `${whole}${fraction ? `.${fraction}` : ''} USDC`;
+  } catch { return '金额未知'; }
 }
 
 function eventLabel(eventType, action) {
@@ -746,6 +760,10 @@ function renderWorldEvolution() {
   const dashboard = evolution.dashboard || {};
   const recovery = evolution.economy?.recovery || {};
   const v6Lifecycle = evolution.v6Lifecycle || {};
+  const arc = evolution.arcMainnet || {};
+  const arcObserver = evolution.arcObserver || {};
+  const arcSettlementWorker = evolution.arcSettlementWorker || {};
+  const arcDatabase = arcObserver.database || {};
   evolutionStats?.replaceChildren();
   for (const [label, value] of [
     ['居民', displayCount(dashboard.residents)], ['地点', displayCount(dashboard.places)],
@@ -828,6 +846,90 @@ function renderWorldEvolution() {
       detail: `${statusLabels[item.status] || item.status} · 范围 ${item.scopeType} · 世界分钟 ${displayCount(item.startedWorldMinute)}` }));
   renderEvolutionList(institutionsList, [...institutionRows, ...organizationCapabilityExperiments],
     '还没有形成制度互动。', (item) => item.detail);
+  if (worldArcSummary) {
+    const sampleTime = arcObserver.lastSampleAt ? new Date(arcObserver.lastSampleAt).toLocaleString() : '尚无样本';
+    worldArcSummary.textContent = `${arcObserver.network?.name || 'Arc'} · chain ID ${displayCount(arc.chainId)} · 只读采样 ${sampleTime}；模拟余额不会计为链上资产。`;
+  }
+  if (worldArcObserverStatus) {
+    worldArcObserverStatus.textContent = arcObserver.running && arcObserver.mode === 'read_only'
+      ? 'Running · Read-only' : 'Observer unavailable';
+    worldArcObserverStatus.dataset.state = !arcObserver.available || !arcObserver.running
+      ? 'unavailable' : arcObserver.lastError ? 'degraded' : 'running';
+  }
+  worldArcStats?.replaceChildren();
+  const walletCounts = arcDatabase.wallets?.byStatus || {};
+  const settlementCounts = arcDatabase.settlements?.byStatus || {};
+  const checkpointCounts = arcDatabase.checkpoints?.byStatus || {};
+  const arcRows = [
+    ['RPC / 最新区块', `${arc.rpcHealthy ? 'Healthy' : 'Unavailable'} · ${arc.latestBlock === null || arc.latestBlock === undefined ? '—' : displayCount(arc.latestBlock)}`],
+    ['USDC 合约验证', arcObserver.usdc?.verified
+      ? `ERC-20 ${arcObserver.usdc.erc20Decimals} 位 · native gas ${arcObserver.usdc.nativeGasDecimals ?? 18} 位；同一 USDC 余额` : '尚未验证'],
+    ['Agent 钱包映射', `${displayCount(walletCounts.active)} 个 active 映射；余额详情不公开`],
+    ['独立钱包映射', `${displayCount(arcDatabase.wallets?.total)} · active ${displayCount(walletCounts.active)}`],
+    ['结算状态', `策略待评估 ${displayCount(settlementCounts.policy_pending)} · 准备 ${displayCount(settlementCounts.prepared)} · 提交中 ${displayCount(settlementCounts.submitting)} · 待核对 ${displayCount(settlementCounts.submission_unknown)} · 已提交 ${displayCount(settlementCounts.submitted)} · final ${displayCount(settlementCounts.final)} · failed ${displayCount(settlementCounts.failed)}`],
+    ['世界检查点', `prepared ${displayCount(checkpointCounts.prepared)} · final ${displayCount(checkpointCounts.final)}`],
+    ['能力来源锚定', displayCount(arcDatabase.capabilityProvenance?.total)],
+    ['Indexer 区块 / lag', `${arc.lastIndexedBlock === null || arc.lastIndexedBlock === undefined ? '—' : displayCount(arc.lastIndexedBlock)} / ${arc.indexerLag === null || arc.indexerLag === undefined ? '—' : displayCount(arc.indexerLag)}`],
+    ['Arc Mainnet 结算启用', arc.settlementEnabled ? '是' : '否'],
+    ['结算处理器', arcSettlementWorker.running
+      ? arcSettlementWorker.mode === 'reconciliation_only' ? '只运行对账 · 主网写入关闭' : '运行中'
+      : `关闭 · ${arcSettlementWorker.reason || '未登记'}`],
+    ['只读完整性发现', displayCount(arcObserver.lastFindingCount)]
+  ];
+  for (const [label, value] of arcRows) {
+    const item = document.createElement('div');
+    item.className = 'world-evolution-stat';
+    const amount = document.createElement('strong');
+    amount.textContent = value;
+    const name = document.createElement('span');
+    name.textContent = label;
+    item.append(amount, name);
+    worldArcStats?.append(item);
+  }
+  const readinessLabels = {
+    settlement_contract_not_deployed: '结算合约尚未部署',
+    world_registry_not_deployed: 'World Registry 尚未部署',
+    capability_provenance_contract_not_deployed: '能力来源合约尚未部署',
+    no_agent_wallets_mapped: '居民链上钱包尚未映射',
+    wallet_provider_not_configured: '安全签名服务尚未配置',
+    mainnet_preflight_not_approved: 'Mainnet preflight 尚未获批'
+    ,arc_schema_migration_required: 'Arc 数据库迁移尚未显式应用'
+  };
+  const arcFindingRows = [
+    ...(!arcObserver.available ? [{ title: 'Observer unavailable',
+      detail: readinessLabels[arcObserver.reason] || arcObserver.reason || 'Arc Observer 尚未启动。' }] : []),
+    ...(arcDatabase.readinessBlockers || []).map((code) => ({
+      title: readinessLabels[code] || code,
+      detail: '准备状态；Observer 不会替居民发起交易，也不会自动修正记录。'
+    })),
+    ...(arcObserver.findings || []).map((finding) => ({
+      title: finding.code,
+      detail: finding.detail || '只读发现；等待人工检查。'
+    }))
+  ];
+  renderEvolutionList(worldArcFindingsList, arcFindingRows,
+    '当前没有 Arc 对账发现。', (item) => item.detail);
+  if (worldArcSettlementsList) {
+    worldArcSettlementsList.replaceChildren();
+    const settlementCounts = arcDatabase.settlements?.byStatus || {};
+    const settledStatuses = Object.entries(settlementCounts).filter(([, count]) => Number(count) > 0);
+    if (!settledStatuses.length) {
+      const empty = document.createElement('li');
+      empty.className = 'world-evolution-empty';
+      empty.textContent = '尚无链上结算记录。';
+      worldArcSettlementsList.append(empty);
+    } else {
+      for (const [status, count] of settledStatuses) {
+        const row = document.createElement('li');
+        const heading = document.createElement('strong');
+        heading.textContent = `${status} · ${displayCount(count)} 条记录`;
+        const detail = document.createElement('span');
+        detail.textContent = '仅显示数据库汇总；钱包地址、余额和交易明细不会进入公开观察 API。';
+        row.append(heading, detail);
+        worldArcSettlementsList.append(row);
+      }
+    }
+  }
   const v6Counts = v6Lifecycle.counts || {};
   const proposalReviews = v6Lifecycle.reviews?.proposal || {};
   const experimentReviews = v6Lifecycle.reviews?.experiment || {};

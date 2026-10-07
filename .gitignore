@@ -2,3 +2,6 @@ node_modules/
 .env
 *.log
 .synterra/
+deploy/container/.env.production
+contracts/out/
+contracts/cache/

@@ -1,0 +1,12 @@
+.env
+.env.*
+!.env.example
+.git
+.synterra
+node_modules
+contracts/out
+contracts/cache
+test
+docs
+deploy
+*.log

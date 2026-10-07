@@ -1263,7 +1263,7 @@ async function recordEconomicBelief(client, { worldId, agentId, businessId, worl
   }
 }
 
-async function completeActivity(client, worldId, agent, runtime, quotes, now, scene) {
+async function completeActivity(client, worldId, agent, runtime, quotes, now, scene, onAutonomousBusinessAction = null) {
   const activity = agent.planned_action;
   const place = agent.location;
   const profile = `${agent.agentId}:${runtime.tick_count}:${activity}`;
@@ -1440,6 +1440,21 @@ async function completeActivity(client, worldId, agent, runtime, quotes, now, sc
   const completionEventId = await recordWorldEvent(client, worldId, agent.agentId, runtime.tick_count, 'world.action_completed', {
     ...result, needs: next, status: 'completed', worldMinutes: finite(runtime.world_minutes)
   });
+  if (activity === 'business_service' && result.initiativeAction === 'business_service'
+      && result.initiative?.status === 'fulfilled' && !result.initiative?.idempotent
+      && typeof onAutonomousBusinessAction === 'function') {
+    await onAutonomousBusinessAction(client, {
+      worldId,
+      worldActionId: actionId(agent.agentId, runtime.tick_count, 'arc-business-service-settlement'),
+      worldEventId: completionEventId,
+      fromAgentId: agent.agentId,
+      toAgentId: result.initiative.businessFounderAgentId,
+      orderId: result.initiative.orderId,
+      businessId: result.initiative.businessId,
+      simulatedAmountUsdc: result.initiative.priceUsdc,
+      worldMinute: finite(runtime.world_minutes)
+    });
+  }
   if (result.initiativeAction) await recordInitiativeOutcome(client, { worldId, agent, activity,
     result, tickCount: runtime.tick_count, worldMinutes: runtime.world_minutes });
   if (activity === 'cooperate' && result.cooperation) {
@@ -1850,6 +1865,7 @@ async function runStrategicTypeSafe(pool, worldId, chooseWithTypeSafe, runtimeSt
 
 export async function startWorldEngine(pool, { worldId: requestedWorldId = null, onError = () => {}, onStatus = () => {}, chooseWithTypeSafe = null,
   chooseCivilizationOption = null, chooseWorldV7Reflection = null,
+  onAutonomousBusinessAction = null,
   runtimeState = null, fruitfly = null, tickMs = WORLD_TICK_MS, nowProvider = () => Date.now(), schedule = true,
   emergencySink = process.stderr } = {}) {
   const readNowMs = () => {
@@ -2329,7 +2345,7 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
             setPhase(completionPhase);
             const placeResult = scenes.find((scene) => scene.name === agent.location);
             const learning = await completeActivity(client, worldId, { ...agent, scene_type: placeResult?.sceneType || null },
-              { tick_count: tickCount, world_minutes: worldMinutes }, quotes, now, placeResult);
+              { tick_count: tickCount, world_minutes: worldMinutes }, quotes, now, placeResult, onAutonomousBusinessAction);
             phaseSucceeded(completionPhase);
             if (learning) fruitflyOutcomes.push(learning);
           } else if (agent.status === 'idle' && new Date(agent.next_decision_at).getTime() <= now.getTime()) {
