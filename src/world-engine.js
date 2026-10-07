@@ -41,6 +41,10 @@ import { reportWorldEngineError, settleOptionalReasoning, worldEngineErrorRecord
   WORLD_TICK_WATCHDOG_INTERVAL_MS } from './world-engine-diagnostics.js';
 import { advanceWorldV7, applyAgentDecisionPolicy, initializeWorldV7, reflectWorldV7Resident,
   WORLD_V7_REFLECTION_INTERVAL_MINUTES } from './world-v7.js';
+import { activityDurationSeconds, activityNeedEffects, activityVariant, applyEnvironmentToCandidates,
+  destinationFeasible, environmentEventIdeas, environmentSnapshot, environmentTransitions, homeActivityCandidates, hourlyNeedUpdate,
+  travelSeconds, worldEnvironment } from './world-environment.js';
+import { writeWorldHistory } from './world-domain.js';
 
 export const WORLD_TICK_MS = 1_000;
 const TYPE_SAFE_INTERVAL_MS = 30 * 60_000;
@@ -134,7 +138,7 @@ function candidate({ id, action, place, goal, description = goal, score, planned
 }
 
 export function buildActivityCandidates(agent, scenes, context = {}) {
-  const options = [];
+  let options = [];
   const energy = clamp(agent.energy), food = clamp(agent.food), social = clamp(agent.social);
   const happiness = clamp(agent.happiness), knowledge = clamp(agent.knowledge);
   const goal = ALLOWED_GOALS.has(agent.goal) ? agent.goal : 'balanced';
@@ -264,6 +268,12 @@ export function buildActivityCandidates(agent, scenes, context = {}) {
     }
   }
 
+  if (context.environment) {
+    // Time, weather, opening hours, capacity, distance and circadian state only
+    // adjust feasibility and Utility scores; Fruitfly still makes the choice.
+    options = applyEnvironmentToCandidates(options, agent, scenes, context);
+    options.push(...homeActivityCandidates(agent, context));
+  }
   for (const option of options) {
     option.score += goalActionUtility(option, agent.goals || []);
     const belief = (Array.isArray(agent.beliefs) ? agent.beliefs : []).find((item) =>
@@ -1263,9 +1273,11 @@ async function recordEconomicBelief(client, { worldId, agentId, businessId, worl
   }
 }
 
-async function completeActivity(client, worldId, agent, runtime, quotes, now, scene, onAutonomousBusinessAction = null) {
+async function completeActivity(client, worldId, agent, runtime, quotes, now, scene, onAutonomousBusinessAction = null,
+  environment = null) {
   const activity = agent.planned_action;
   const place = agent.location;
+  const variant = agent.activity_variant || null;
   const profile = `${agent.agentId}:${runtime.tick_count}:${activity}`;
   let needs = { energy: 0, food: 0, social: 0, happiness: 0, knowledge: 0 };
   let result = { action: activity, place };
@@ -1328,7 +1340,9 @@ async function completeActivity(client, worldId, agent, runtime, quotes, now, sc
       knowledge: 6 + stableInt(`${profile}:study`) % 9 };
     result.learning = { knowledge: needs.knowledge };
   } else if (activity === 'rest') {
-    needs = { energy: 24, food: -1, social: 0, happiness: 5, knowledge: 0 };
+    // Sleep restores energy gradually through the hourly need model instead.
+    needs = variant === 'sleep' ? { energy: 0, food: 0, social: 0, happiness: 0, knowledge: 0 }
+      : { energy: 24, food: -1, social: 0, happiness: 5, knowledge: 0 };
   } else if (activity === 'eat') {
     if (agent.planned_paid_meal) {
       try {
@@ -1414,12 +1428,23 @@ async function completeActivity(client, worldId, agent, runtime, quotes, now, sc
     }
   }
 
+  const environmentalEffects = activityNeedEffects({ action: activity, variant,
+    weather: environment?.weather || null, abandoned: Boolean(result.abandoned) });
+  for (const key of FINITE_STAT_KEYS) needs[key] = (Number(needs[key]) || 0) + (environmentalEffects[key] || 0);
   const next = updatedNeeds(agent, needs);
+  const nextHygiene = incrementStat(agent.hygiene ?? 80, environmentalEffects.hygiene);
+  const nextFun = incrementStat(agent.fun ?? 70, environmentalEffects.fun);
   result.energy = next.energy;
   result.food = next.food;
   result.social = next.social;
+  result.hygiene = nextHygiene;
+  result.fun = nextFun;
+  if (variant) result.variant = variant;
+  if (environment?.weather) result.weather = environment.weather.condition;
   await client.query(`UPDATE world_members SET energy=$3,food=$4,social=$5 WHERE world_id=$1 AND agent_id=$2`,
     [worldId, agent.agentId, next.energy, next.food, next.social]);
+  await client.query(`UPDATE world_agent_states SET hygiene=$3,fun=$4,activity_variant=NULL WHERE world_id=$1 AND agent_id=$2`,
+    [worldId, agent.agentId, nextHygiene, nextFun]);
   await client.query(`UPDATE world_agent_states SET happiness=$3,knowledge=$4,status='idle',planned_action=NULL,
       target_location=NULL,planned_partner_id=NULL,planned_side=NULL,planned_asset=NULL,planned_quote_units=NULL,planned_paid_meal=false,
       planned_context='{}'::jsonb,
@@ -1429,8 +1454,9 @@ async function completeActivity(client, worldId, agent, runtime, quotes, now, sc
   [worldId, agent.agentId, next.happiness, next.knowledge, new Date(now.getTime() + 5_000 + stableInt(`${profile}:think`) % 11_000), now]);
   const summary = activity === 'work' ? `Contributed a work shift at ${place}; shared work does not mint simulated USDC.`
     : activity === 'learn' ? `Studied at ${place} and gained knowledge.`
-      : activity === 'rest' ? `Rested at ${place}.`
-        : activity === 'eat' ? `Ate at ${place}.`
+      : activity === 'rest' ? (variant === 'sleep' ? 'Slept at home.' : variant === 'home_rest' ? 'Washed up and recovered at home.'
+        : `Rested at ${place}.`)
+        : activity === 'eat' ? (variant === 'home_meal' ? 'Cooked and ate a meal at home.' : `Ate at ${place}.`)
       : activity === 'socialize' ? (socialInteraction ? `Met ${socialInteraction.partnerName} at ${place}.` : `Spent time in the social space at ${place}.`)
       : activity === 'cooperate' ? (result.cooperation ? `Worked with ${result.cooperation.partnerName} at ${place}.` : 'The planned cooperation could not take place.')
         : activity === 'trade' ? (result.trade ? `Completed a simulated ${result.trade.side} of ${result.trade.asset} at Exchange.` : 'Skipped an unavailable simulated trade.')
@@ -2051,7 +2077,7 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
       try {
         await client.query('BEGIN');
         await client.query(`SET LOCAL statement_timeout = '${WORLD_DB_STATEMENT_TIMEOUT_MS}ms'`);
-        const clockResult = await client.query(`SELECT tick_count,world_minutes,last_tick_at,typesafe_next_at,market_snapshot
+        const clockResult = await client.query(`SELECT tick_count,world_minutes,last_tick_at,typesafe_next_at,market_snapshot,environment
           FROM world_runtime_state WHERE world_id=$1 FOR UPDATE`, [worldId]);
         if (!clockResult.rowCount) throw new Error('WORLD_RUNTIME_STATE_MISSING');
         const clock = clockResult.rows[0];
@@ -2071,6 +2097,19 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
           WHERE world_id=$1`, [worldId, tickCount, worldMinutes, now]);
       diagnostics.worldMinute = worldMinutes;
       diagnostics.tickCount = tickCount;
+      const environment = worldEnvironment(worldId, worldMinutes);
+      const previousEnvironment = safeJson(clock.environment);
+      const environmentTransitionsDue = newHour > oldHour ? environmentTransitions(previousEnvironment, environment) : [];
+      if (newHour > oldHour || !previousEnvironment.condition) {
+        await client.query(`UPDATE world_runtime_state SET environment=$2::jsonb WHERE world_id=$1`,
+          [worldId, JSON.stringify(environmentSnapshot(environment))]);
+        for (const transition of environmentTransitionsDue) {
+          await writeWorldHistory(client, { worldId, eventKey: transition.eventKey, eventType: transition.eventType,
+            entityType: 'environment', worldTime: worldMinutes, title: transition.title, detail: transition.detail,
+            metadata: { season: environment.calendar.season, weather: environment.weather.condition,
+              temperatureC: environment.weather.temperatureC, previous: previousEnvironment } });
+        }
+      }
       phaseSucceeded('CLOCK_ADVANCE');
       setPhase('DAILY_ECONOMY');
       if (newWorldDay > oldWorldDay) {
@@ -2115,14 +2154,32 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
         await client.query(`UPDATE world_runtime_state SET market_snapshot=$2::jsonb WHERE world_id=$1`, [worldId, JSON.stringify(nextSnapshot)]);
         setPhase('RESIDENT_UPDATE');
         if (decayHours > 0) {
-          await client.query(`UPDATE world_members SET energy=greatest(0,energy-$2),food=greatest(0,food-$3),social=greatest(0,social-$4)
-            WHERE world_id=$1`, [worldId, decayHours, decayHours * 2, decayHours]);
-          await client.query(`UPDATE world_agent_states SET happiness=greatest(0,happiness-$2),updated_at=$3
-            WHERE world_id=$1`, [worldId, decayHours, now]);
+          // Residents without an engine state row keep the original flat decay.
+          await client.query(`UPDATE world_members m SET energy=greatest(0,energy-$2),food=greatest(0,food-$3),social=greatest(0,social-$4)
+            WHERE m.world_id=$1 AND NOT EXISTS (SELECT 1 FROM world_agent_states s WHERE s.world_id=m.world_id AND s.agent_id=m.agent_id)`,
+          [worldId, decayHours, decayHours * 2, decayHours]);
+          const needRows = await client.query(`SELECT m.agent_id AS "agentId",m.energy,m.food,m.social,s.happiness,s.hygiene,s.fun,
+              s.status,s.planned_action AS "plannedAction",s.activity_variant AS "activityVariant"
+            FROM world_members m JOIN world_agent_states s ON s.world_id=m.world_id AND s.agent_id=m.agent_id
+            WHERE m.world_id=$1 ORDER BY m.agent_id FOR UPDATE OF m,s`, [worldId]);
+          const updates = needRows.rows.map((resident) => ({ agentId: resident.agentId,
+            ...hourlyNeedUpdate(resident, { hours: decayHours, calendar: environment.calendar, weather: environment.weather }) }));
+          if (updates.length) {
+            const column = (key) => updates.map((item) => item[key]);
+            await client.query(`UPDATE world_members m SET energy=u.energy,food=u.food,social=u.social
+              FROM unnest($2::uuid[],$3::int[],$4::int[],$5::int[]) AS u(agent_id,energy,food,social)
+              WHERE m.world_id=$1 AND m.agent_id=u.agent_id`,
+            [worldId, column('agentId'), column('energy'), column('food'), column('social')]);
+            await client.query(`UPDATE world_agent_states s SET happiness=u.happiness,hygiene=u.hygiene,fun=u.fun,updated_at=$6
+              FROM unnest($2::uuid[],$3::int[],$4::int[],$5::int[]) AS u(agent_id,happiness,hygiene,fun)
+              WHERE s.world_id=$1 AND s.agent_id=u.agent_id`,
+            [worldId, column('agentId'), column('happiness'), column('hygiene'), column('fun'), now]);
+          }
         }
         const membersResult = await client.query(`SELECT m.world_id,m.agent_id,a.name,m.energy,m.food,m.social,m.location,
             am.archetype,am.traits,am.memories,am.current_goal,am.actions_taken,
-            s.goal,s.risk_tolerance AS risk_tolerance,s.happiness,s.knowledge,s.status,s.planned_action,s.target_location,
+            s.goal,s.risk_tolerance AS risk_tolerance,s.happiness,s.knowledge,s.hygiene,s.fun,s.activity_variant,
+            s.status,s.planned_action,s.target_location,
             s.planned_partner_id AS planned_partner_id,s.planned_side,s.planned_asset,s.planned_quote_units::text AS planned_quote_units,s.planned_paid_meal,
             s.planned_context,s.next_strategic_decision_world_minutes AS next_strategic_decision_world_minutes,
             s.next_institutional_review_world_minutes AS next_institutional_review_world_minutes,
@@ -2219,7 +2276,10 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
         }
         if (dueResidents.length || newHour > oldHour) {
           initiativeState = await loadWorldInitiatives(client, worldId, worldMinutes, membersResult.rows, scenes);
-          if (newHour > oldHour) for (const idea of initiativeState.newIdeas) {
+          const environmentIdeas = newHour > oldHour ? environmentEventIdeas({ scenes, calendar: environment.calendar,
+            weather: environment.weather, previousWeather: previousEnvironment.condition
+              ? { condition: previousEnvironment.condition } : null }) : [];
+          if (newHour > oldHour) for (const idea of [...initiativeState.newIdeas, ...environmentIdeas]) {
             const key = `environment-idea:${idea.dedupeKey}`;
             await recordEmergenceEvent(client, { worldId, worldMinutes, tickCount, system: 'opportunity',
               stage: 'considered', eventKey: `${key}:considered`, candidateId: idea.dedupeKey,
@@ -2235,6 +2295,8 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
           }
         }
         phaseSucceeded('INSTITUTIONAL_EXPIRY');
+        const occupancy = {};
+        for (const member of membersResult.rows) occupancy[member.location] = (occupancy[member.location] || 0) + 1;
         const placeCounts = Object.fromEntries(membersResult.rows.map((member) => [member.location,
           membersResult.rows.filter((other) => other.location === member.location).length - 1]));
 
@@ -2326,14 +2388,21 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
             setPhase('RESIDENT_MOVEMENT');
             const destination = agent.target_location;
             await client.query('UPDATE world_members SET location=$3 WHERE world_id=$1 AND agent_id=$2', [worldId, agent.agentId, destination]);
-            const duration = ACTION_SECONDS[agent.planned_action] || 10;
+            const destinationScene = scenes.find((scene) => scene.name === destination);
+            const arrivalVariant = activityVariant({ action: agent.planned_action, location: destination,
+              sceneType: destinationScene?.sceneType || null, agentId: agent.agentId,
+              calendar: environment.calendar, weather: environment.weather });
+            const duration = activityDurationSeconds(agent.planned_action, ACTION_SECONDS[agent.planned_action] || 10,
+              { variant: arrivalVariant, agentId: agent.agentId, calendar: environment.calendar });
             await client.query(`UPDATE world_agent_states SET status='performing',movement_started_at=NULL,movement_ends_at=NULL,
-                action_started_at=$3,action_ends_at=$4,updated_at=$3 WHERE world_id=$1 AND agent_id=$2`,
-            [worldId, agent.agentId, now, new Date(now.getTime() + duration * 1_000)]);
+                action_started_at=$3,action_ends_at=$4,activity_variant=$5,updated_at=$3 WHERE world_id=$1 AND agent_id=$2`,
+            [worldId, agent.agentId, now, new Date(now.getTime() + duration * 1_000), arrivalVariant]);
+            row.activity_variant = arrivalVariant;
             await recordWorldEvent(client, worldId, agent.agentId, tickCount, 'world.agent_arrived',
               { place: destination, action: agent.planned_action, worldMinutes, at: now.toISOString() });
             await recordWorldEvent(client, worldId, agent.agentId, tickCount, 'world.action_started',
-              { place: destination, action: agent.planned_action, worldMinutes, at: now.toISOString() });
+              { place: destination, action: agent.planned_action, variant: arrivalVariant, worldMinutes, at: now.toISOString(),
+                weather: environment.weather.condition });
             await setMindGoal(client, worldId, agent.agentId, agent.current_goal || agent.goal, agent.planned_action, null);
             phaseSucceeded('RESIDENT_MOVEMENT');
           } else if (agent.status === 'performing' && new Date(agent.action_ends_at).getTime() <= now.getTime()) {
@@ -2345,7 +2414,8 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
             setPhase(completionPhase);
             const placeResult = scenes.find((scene) => scene.name === agent.location);
             const learning = await completeActivity(client, worldId, { ...agent, scene_type: placeResult?.sceneType || null },
-              { tick_count: tickCount, world_minutes: worldMinutes }, quotes, now, placeResult, onAutonomousBusinessAction);
+              { tick_count: tickCount, world_minutes: worldMinutes }, quotes, now, placeResult, onAutonomousBusinessAction,
+              environment);
             phaseSucceeded(completionPhase);
             if (learning) fruitflyOutcomes.push(learning);
           } else if (agent.status === 'idle' && new Date(agent.next_decision_at).getTime() <= now.getTime()) {
@@ -2359,11 +2429,12 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
                     lastInteractionWorldMinutes: relationship?.lastInteractionWorldMinutes };
                 })]));
           const nativeUtilityCandidates = buildActivityCandidates(agent, scenes, { tick: tickCount, worldMinutes, nowMs, quotes,
-            previousQuotes: priorSnapshot, residentsAt: placeCounts, residentsAtLocation });
+            previousQuotes: priorSnapshot, residentsAt: placeCounts, residentsAtLocation, environment, occupancy });
           const capabilityCandidates = await buildCapabilityUseCandidates(agent, capabilityOptions, {
             worldMinutes, residentsAtLocation, placeIdsByName,
             maxAlternativeScore: Math.max(0, ...nativeUtilityCandidates.map((candidate) => Number(candidate.score) || 0)) });
-          const utilityCandidates = [...nativeUtilityCandidates, ...capabilityCandidates];
+          const utilityCandidates = [...nativeUtilityCandidates,
+            ...capabilityCandidates.filter((candidate) => destinationFeasible(candidate, agent, scenes, environment))];
             let strategicDue = false;
             let nextStrategicAt = agent.next_strategic_decision_world_minutes === null
               || agent.next_strategic_decision_world_minutes === undefined
@@ -2439,7 +2510,7 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
               const needsBlocked = agent.energy < minimumEnergy || agent.food < minimumFood;
               permittedInitiatives = needsBlocked ? [] : initiativeCandidates.filter((candidate) => {
                 if (candidate.action === 'project_contribute' && (agent.energy < 20 || agent.food < 10)) return false;
-                return true;
+                return destinationFeasible(candidate, agent, scenes, environment);
               });
               qualifiedStrategicCandidates = qualifyLayeredStrategicCandidates(permittedInitiatives);
               for (const gap of explainBusinessOpportunityGaps(agent, businessContext, businessCandidates)) {
@@ -2470,6 +2541,7 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
                 const reasonCode = needsBlocked ? (agent.energy < minimumEnergy ? 'ENERGY_LOW' : 'FOOD_LOW')
                   : eligible ? 'NONE' : candidate.action === 'project_contribute'
                     && (agent.energy < 20 || agent.food < 10) ? 'NEEDS_HARD_GATE'
+                    : !destinationFeasible(candidate, agent, scenes, environment) ? 'PLACE_CLOSED'
                     : candidate.action.startsWith('business_')
                       ? (qualifiedStrategicCandidates.length >= 8 ? 'NO_STRATEGIC_SLOT' : 'OTHER')
                       : 'UTILITY_BELOW_THRESHOLD';
@@ -2678,7 +2750,12 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
             await client.query(`DELETE FROM world_decision_traces WHERE id IN (
               SELECT id FROM world_decision_traces WHERE world_id=$1 AND agent_id=$2
               ORDER BY tick_count DESC,id DESC OFFSET 50)`, [worldId, agent.agentId]);
-            const duration = ACTION_SECONDS[activity.action] || 10;
+            const localScene = scenes.find((scene) => scene.name === agent.location);
+            const localVariant = activity.targetLocation === agent.location ? activityVariant({ action: activity.action,
+              location: agent.location, sceneType: localScene?.sceneType || null, agentId: agent.agentId,
+              calendar: environment.calendar, weather: environment.weather }) : null;
+            const duration = activityDurationSeconds(activity.action, ACTION_SECONDS[activity.action] || 10,
+              { variant: localVariant, agentId: agent.agentId, calendar: environment.calendar });
             const tradeFields = activity.action === 'trade'
               ? [activity.side, activity.asset, activity.quoteUnits] : [null, null, null];
             const plannedContext = Object.fromEntries(['opportunityId','opportunityProposal','projectId','decision','projectProposal','goalReviewProposal',
@@ -2696,9 +2773,11 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
               plannedContext.capabilitySelectionSource = usedFruitfly ? 'fruitfly' : 'utility_fallback';
             }
             if (activity.targetLocation !== agent.location) {
-              const travelSeconds = 6 + stableInt(`${agent.agentId}:${tickCount}:travel`) % 11;
-              const movementEnd = new Date(now.getTime() + travelSeconds * 1_000);
-              await client.query(`UPDATE world_agent_states SET status='walking',planned_action=$3,target_location=$4,
+              const walkSeconds = travelSeconds(scenes.find((scene) => scene.name === agent.location) || agent.location,
+                scenes.find((scene) => scene.name === activity.targetLocation) || activity.targetLocation,
+                { weather: environment.weather, seed: `${agent.agentId}:${tickCount}` });
+              const movementEnd = new Date(now.getTime() + walkSeconds * 1_000);
+              await client.query(`UPDATE world_agent_states SET status='walking',planned_action=$3,target_location=$4,activity_variant=NULL,
                   planned_side=$5,planned_asset=$6,planned_quote_units=$7,planned_paid_meal=$8,planned_partner_id=$9,
                   fruitfly_observation=$12::jsonb,fruitfly_candidates=$13::jsonb,fruitfly_selected=$14::jsonb,
                   planned_context=$15::jsonb,
@@ -2715,7 +2794,7 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
               row.status = 'walking';
               row.planned_action = activity.action;
             } else {
-              await client.query(`UPDATE world_agent_states SET status='performing',planned_action=$3,target_location=NULL,
+              await client.query(`UPDATE world_agent_states SET status='performing',planned_action=$3,target_location=NULL,activity_variant=$15,
                   planned_side=$4,planned_asset=$5,planned_quote_units=$6,planned_paid_meal=$7,planned_partner_id=$8,
                   fruitfly_observation=$11::jsonb,fruitfly_candidates=$12::jsonb,fruitfly_selected=$13::jsonb,
                   planned_context=$14::jsonb,
@@ -2723,10 +2802,12 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
                 WHERE world_id=$1 AND agent_id=$2`,
               [worldId, agent.agentId, activity.action, ...tradeFields, Boolean(activity.plannedPaidMeal), activity.socialPartnerId, now,
                 new Date(now.getTime() + duration * 1_000), JSON.stringify(flyObservation || {}),
-                JSON.stringify(flyCandidates), JSON.stringify(flySelected || {}), JSON.stringify(plannedContext)]);
+                JSON.stringify(flyCandidates), JSON.stringify(flySelected || {}), JSON.stringify(plannedContext), localVariant]);
+              row.activity_variant = localVariant;
               await setMindGoal(client, worldId, agent.agentId, activity.goal, activity.action, null);
               await recordWorldEvent(client, worldId, agent.agentId, tickCount, 'world.action_started',
-                { place: agent.location, action: activity.action, worldMinutes, at: now.toISOString() });
+                { place: agent.location, action: activity.action, variant: localVariant, worldMinutes, at: now.toISOString(),
+                  weather: environment.weather.condition });
               row.status = 'performing';
               row.planned_action = activity.action;
               if (activity.action === 'cooperate' && activity.socialPartnerId) {

@@ -15,6 +15,7 @@ import { loadState, STATE_DIR } from './agent-runtime/client.js';
 import { createFruitflyRuntime } from './agent-runtime/fruitfly.js';
 import { chooseCivilizationOption, chooseWithTypeSafe, chooseWorldV7Reflection } from './agent-runtime/typesafe.js';
 import { startWorldEngine, worldClock } from './world-engine.js';
+import { enrichMapEnvironment } from './world-environment.js';
 import { buildWorldLiveness, reportWorldEngineError } from './world-engine-diagnostics.js';
 import { arcNetworkConfig } from './arc/config.js';
 import { ArcRpcClient } from './arc/rpc.js';
@@ -374,6 +375,7 @@ app.get('/local/map-data', async (_request, reply) => {
         coalesce(ws.happiness,60) AS happiness,coalesce(ws.knowledge,20) AS knowledge,
         coalesce(ws.goal,'balanced') AS goal,ws.risk_tolerance::text AS "riskTolerance",
         coalesce(ws.status,'idle') AS "currentStatus",ws.planned_action AS "currentAction",
+        coalesce(ws.hygiene,80) AS hygiene,coalesce(ws.fun,70) AS fun,ws.activity_variant AS "activityVariant",
         ws.target_location AS "targetLocation",ws.movement_started_at AS "movementStartedAt",
         ws.movement_ends_at AS "movementEndsAt",ws.action_started_at AS "actionStartedAt",ws.action_ends_at AS "actionEndsAt",
         am.archetype,am.current_goal AS "currentGoal",am.actions_taken AS "actionsTaken",am.updated_at AS "mindUpdatedAt",
@@ -412,12 +414,14 @@ app.get('/local/map-data', async (_request, reply) => {
       ) recent ON true
       WHERE m.world_id=$1 ORDER BY m.joined_at,a.name`, [worldId]),
     pool.query(`SELECT a.name AS "agentName",e.event_type AS "eventType",coalesce(e.data->>'place',e.data->>'to') AS place,
-        e.data->>'action' AS action,e.data->>'side' AS side,e.data->>'asset' AS asset,e.created_at AS "createdAt"
+        e.data->>'action' AS action,e.data->>'side' AS side,e.data->>'asset' AS asset,e.created_at AS "createdAt",
+        e.data->>'variant' AS variant,e.data->>'weather' AS weather
       FROM world_events e JOIN agents a ON a.id=e.actor_id
       WHERE e.world_id=$1 AND (e.event_type LIKE 'action.%' OR e.event_type='scene.created' OR e.event_type LIKE 'crypto.%' OR e.event_type LIKE 'world.%')
       ORDER BY e.id DESC LIMIT 24`, [worldId]),
     pool.query(`SELECT a.name AS "agentName",e.event_type AS "eventType",coalesce(e.data->>'place',e.data->>'to') AS place,
-        e.data->>'action' AS action,e.data->>'side' AS side,e.data->>'asset' AS asset,e.created_at AS "createdAt"
+        e.data->>'action' AS action,e.data->>'side' AS side,e.data->>'asset' AS asset,e.created_at AS "createdAt",
+        e.data->>'variant' AS variant,e.data->>'weather' AS weather
       FROM world_events e JOIN agents a ON a.id=e.actor_id
       WHERE e.world_id=$1 AND (e.event_type LIKE 'action.%' OR e.event_type='scene.created' OR e.event_type LIKE 'crypto.%' OR e.event_type LIKE 'world.%')
       ORDER BY e.id DESC LIMIT 100`, [worldId]),
@@ -462,6 +466,8 @@ app.get('/local/map-data', async (_request, reply) => {
   const recentTrades = [...cryptoTrades.rows, ...recentMemeTrades]
     .sort((left, right) => new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime()).slice(0, 50);
   const worldMinutes = Number(clock?.worldMinutes) || 0;
+  const environment = enrichMapEnvironment({ worldSeed: worldId, worldMinutes, scenes: scenes.rows,
+    residents: residents.rows, events: [...events.rows, ...dataCenterLogs.rows] });
   const emergence = await readEmergenceReport(pool, { worldId, worldMinutes });
   const recoveryMetrics = await readEconomicRecoveryMetrics(pool, { worldId, worldMinutes });
   const [economyDashboard, businesses, economicDemand, economyHistory] = await Promise.all([
@@ -527,7 +533,7 @@ app.get('/local/map-data', async (_request, reply) => {
     demand: economicDemand.rows, history: economyHistory.rows, recovery: recoveryMetrics,
     settlement: 'simulated_internal_ledger', chainSettlementEnabled: false };
   worldEvolution.emergence = emergence;
-  return { world: { ...world.rows[0], engine: clock || { running: false } }, scenes: scenes.rows, residents: residents.rows, events: events.rows,
+  return { world: { ...world.rows[0], engine: clock || { running: false }, environment }, scenes: scenes.rows, residents: residents.rows, events: events.rows,
     dataCenterLogs: dataCenterLogs.rows, trading: { simulated: true, quotes: cryptoQuotes, robinhood: robinhoodMarket,
       portfolios: cryptoPortfolios.rows, recentTrades }, worldEvolution, generatedAt: new Date().toISOString() };
 });
