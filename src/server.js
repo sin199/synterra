@@ -226,7 +226,7 @@ app.addHook('preHandler', async (request, reply) => {
   const localResidentDetail = /^\/local\/map-data\/residents\/[^/]+$/.test(pathOnly)
     && ['127.0.0.1', '::1', 'localhost'].includes(HOST);
   if (pathOnly === '/' || pathOnly === '/styles.css' || pathOnly === '/app.js' || pathOnly === '/world3d.js' ||
-      pathOnly === '/v6-observer-status.js' || pathOnly === '/public/stats' ||
+      pathOnly === '/vendor/three.module.min.js' || pathOnly === '/v6-observer-status.js' || pathOnly === '/public/stats' ||
       pathOnly === '/local/map-data' || localResidentDetail || pathOnly === '/health' || pathOnly === '/v1/agents/challenges' || pathOnly === '/v1/agents') return;
 
   const agentId = request.headers['x-agent-id'];
@@ -279,6 +279,13 @@ app.get('/world3d.js', async (_request, reply) => {
   reply.header('Content-Type', 'text/javascript; charset=utf-8');
   reply.header('X-Content-Type-Options', 'nosniff');
   return readFile(path.join(SITE_ROOT, 'world3d.js'));
+});
+
+app.get('/vendor/three.module.min.js', async (_request, reply) => {
+  reply.header('Content-Type', 'text/javascript; charset=utf-8');
+  reply.header('X-Content-Type-Options', 'nosniff');
+  reply.header('Cache-Control', 'public, max-age=86400');
+  return readFile(path.join(SITE_ROOT, 'vendor', 'three.module.min.js'));
 });
 
 app.get('/v6-observer-status.js', async (_request, reply) => {

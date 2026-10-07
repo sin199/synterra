@@ -71,7 +71,7 @@
       <section class="section wrap resident-map-section" id="map">
         <div class="section-heading map-heading">
           <div><div class="eyebrow muted">03 / THE RESIDENTS</div><h2>Watch the world<br><em>take shape.</em></h2></div>
-          <div class="map-intro-copy"><p>Synterra 交易空间 · 中央交易大厅显示模拟行情；居民会按需求自主移动和行动。</p><p class="map-disclosure">拖动旋转、滚轮缩放、点选居民查看状态。行情、工资和成交均为内部模拟，不涉及链上资金；本机页面只读取世界状态。</p></div>
+          <div class="map-intro-copy"><p>Synterra 交易空间 · 中央交易大厅显示模拟行情；居民会按需求自主移动和行动。</p><p class="map-disclosure">拖动旋转、右键平移、滚轮缩放、点选居民查看状态；昼夜随世界时钟变化。行情、工资和成交均为内部模拟，不涉及链上资金；本机页面只读取世界状态。</p></div>
         </div>
         <div class="map-summary" aria-label="Synterra 当前居民摘要">
           <div><strong id="map-resident-total">—</strong><span>居民</span></div>
@@ -104,7 +104,7 @@
         <div class="resident-map-layout">
           <div class="map-frame">
             <div id="scene-map" class="scene-map" role="region" aria-label="Synterra 程序化三维交易空间">
-              <canvas id="world3d-canvas" class="world3d-canvas" aria-label="三维交易大厅。拖动旋转，滚轮缩放，使用方向键切换居民。" tabindex="0"></canvas>
+              <canvas id="world3d-canvas" class="world3d-canvas" aria-label="三维小镇与交易大厅。拖动旋转，右键或 Shift 拖动平移，滚轮缩放，双击聚焦，使用方向键切换居民。" tabindex="0"></canvas>
               <div id="world3d-labels" class="world3d-labels" aria-hidden="false"></div>
               <svg class="map-terrain" viewBox="0 0 1000 600" preserveAspectRatio="none" aria-hidden="true">
                 <path class="map-route" d="M500 300 C420 250 300 230 180 170 S90 120 120 100 M500 300 C600 260 700 190 850 150 M500 300 C610 340 720 400 850 470 M500 300 C400 390 280 440 150 490 M500 300 C490 410 510 490 520 545 M500 300 C360 300 220 310 95 330 M500 300 C650 285 790 300 920 315" />
@@ -114,7 +114,7 @@
               <div class="map-center"><span>✳</span><small>SYN TERRA</small></div>
               <div id="map-locations" class="map-locations" aria-live="polite"><p class="map-loading">地图加载中…</p></div>
             </div>
-            <div class="map-legend"><span><i class="legend-agent"></i>居民</span><span><i class="legend-empty"></i>场景</span><span class="world3d-hint">模拟交易大厅 · 拖动旋转 · 滚轮缩放 · 点居民查看</span><span id="map-updated">尚未更新</span></div>
+            <div class="map-legend"><span><i class="legend-agent"></i>居民</span><span><i class="legend-empty"></i>场景</span><span class="world3d-hint">模拟交易大厅 · 拖动旋转 · 右键/Shift 平移 · 滚轮缩放 · 点居民查看 · 双击聚焦</span><span id="map-updated">尚未更新</span></div>
           </div>
           <aside id="agent-panel" class="agent-panel" aria-live="polite">
             <div class="agent-panel-empty"><span class="panel-orb">◎</span><p>选择一位居民<br>查看他的世界状态。</p></div>

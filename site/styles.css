@@ -113,21 +113,30 @@
 .world3d-canvas:focus-visible{box-shadow:inset 0 0 0 2px rgba(201,243,106,.8)}
 .world3d-labels{position:absolute;inset:0;z-index:2;pointer-events:none;overflow:hidden}
 .world3d-labels [hidden]{display:none!important}
-.world3d-scene-label{position:absolute;transform:translate(-50%,-50%);max-width:96px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:3px 6px;border:1px solid rgba(205,232,184,.22);background:rgba(17,26,20,.88);color:#d6e2cc;font:8px var(--mono);letter-spacing:.2px;text-shadow:0 1px 4px #0a100c}
-.world3d-agent-label{position:absolute;transform:translate(-50%,-50%);display:grid;place-items:center;width:22px;height:22px;padding:0;border-radius:50%;border:1px solid rgba(201,243,106,.82);background:#c9f36a;color:#1b2816;font:700 7px var(--mono);box-shadow:0 0 0 3px rgba(201,243,106,.16),0 3px 9px rgba(0,0,0,.4);cursor:pointer;pointer-events:auto}
-.world3d-agent-label:hover,.world3d-agent-label:focus-visible,.world3d-agent-label.is-selected{transform:translate(-50%,-55%) scale(1.17);background:#efffc5;outline:2px solid rgba(239,255,197,.48);outline-offset:2px}
-.world3d-market-label{position:absolute;z-index:2;transform:translate(-50%,-50%);width:min(205px,34vw);display:grid;gap:3px;padding:7px 9px;border:1px solid rgba(101,220,196,.5);background:linear-gradient(135deg,rgba(11,31,30,.96),rgba(15,23,20,.94));box-shadow:0 0 25px rgba(75,213,191,.13),inset 0 0 20px rgba(64,170,153,.08);color:#d7eee5;text-align:left;pointer-events:none}
-.world3d-market-title{color:#b8f2dc;font:700 9px var(--mono);letter-spacing:1.1px}
+.world3d-scene-label{position:absolute;transform:translate(-50%,-50%);display:inline-flex;align-items:center;gap:5px;max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:3px 8px 3px 6px;border:1px solid rgba(255,255,255,.18);border-radius:999px;background:rgba(14,22,17,.78);backdrop-filter:blur(4px);color:#eef4e6;font:600 9px var(--mono);letter-spacing:.2px;box-shadow:0 4px 12px rgba(0,0,0,.28);text-shadow:none}
+.world3d-scene-label::before{content:"";flex:0 0 auto;width:7px;height:7px;border-radius:50%;background:var(--place-color,#c9f36a);box-shadow:0 0 0 2px rgba(255,255,255,.12)}
+.world3d-agent-label{position:absolute;transform:translate(-50%,-50%);display:grid;place-items:center;width:22px;height:22px;padding:0;border-radius:50%;border:2px solid #fbfff0;background:var(--agent-color,#c9f36a);color:#fff;font:700 7px var(--mono);text-shadow:0 1px 2px rgba(0,0,0,.45);box-shadow:0 3px 9px rgba(0,0,0,.35);cursor:pointer;pointer-events:auto;transition:transform .15s ease}
+.world3d-agent-label::after{content:"";position:absolute;left:50%;bottom:-5px;width:6px;height:6px;background:inherit;border-right:2px solid #fbfff0;border-bottom:2px solid #fbfff0;transform:translateX(-50%) rotate(45deg);z-index:-1}
+.world3d-agent-label:hover,.world3d-agent-label:focus-visible,.world3d-agent-label.is-selected{transform:translate(-50%,-58%) scale(1.2);outline:2px solid rgba(201,243,106,.9);outline-offset:2px;z-index:3}
+.world3d-market-label{position:absolute;z-index:2;transform:translate(-50%,-50%);width:min(180px,32vw);display:grid;gap:2px;padding:6px 9px;border:1px solid rgba(101,220,196,.5);border-radius:6px;background:linear-gradient(135deg,rgba(11,31,30,.9),rgba(15,23,20,.86));backdrop-filter:blur(4px);box-shadow:0 6px 20px rgba(0,0,0,.3),inset 0 0 20px rgba(64,170,153,.08);color:#d7eee5;text-align:left;pointer-events:none}
+.world3d-market-title{color:#b8f2dc;font:700 8px var(--mono);letter-spacing:1.1px}
 .world3d-market-ticker{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#f2f5df;font:600 10px var(--mono)}
-.world3d-market-status{color:#8eaa9f;font:8px var(--mono);letter-spacing:.35px}
+.world3d-market-status{color:#8eaa9f;font:7px var(--mono);letter-spacing:.35px}
 .world3d-market-label[data-live="true"] .world3d-market-status{color:#98e9b1}
 .world3d-agent-label{overflow:visible}
 .world3d-agent-initials{display:grid;place-items:center;width:100%;height:100%;border-radius:50%}
-.world3d-agent-action{position:absolute;left:50%;top:100%;transform:translate(-50%,-1px);max-width:68px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:2px 4px;border:1px solid rgba(211,236,198,.22);border-radius:2px;background:rgba(15,24,18,.94);color:#d5e8c6;font:7px var(--mono);pointer-events:none}
+.world3d-agent-action{position:absolute;left:50%;bottom:calc(100% + 5px);top:auto;transform:translateX(-50%);display:inline-flex;align-items:center;gap:3px;max-width:86px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:2px 6px 2px 4px;border:1px solid rgba(255,255,255,.2);border-radius:999px;background:rgba(15,24,18,.86);color:#e4efd8;font:600 8px var(--mono);text-shadow:none;box-shadow:0 3px 8px rgba(0,0,0,.25);pointer-events:none}
+.world3d-agent-action::before{content:"•";display:inline-grid;place-items:center;width:12px;height:12px;border-radius:50%;background:#55625a;color:#fff;font:700 8px/1 var(--sans,sans-serif)}
 .world3d-agent-action[hidden]{display:none}
-.world3d-agent-action[data-kind="trade"]{border-color:rgba(104,223,191,.6);background:rgba(13,48,40,.96);color:#a6f1d8}
-.world3d-agent-action[data-kind="work"]{border-color:rgba(201,243,106,.45);color:#d9f28d}
-.world3d-agent-action[data-kind="travel"]{border-color:rgba(111,185,228,.45);color:#b3def7}
+.world3d-agent-action[data-kind="trade"]{border-color:rgba(104,223,191,.6);background:rgba(13,48,40,.92);color:#a6f1d8}
+.world3d-agent-action[data-kind="trade"]::before{content:"$";background:#2fae8c}
+.world3d-agent-action[data-kind="work"]{border-color:rgba(201,243,106,.45);color:#e3f6a6}
+.world3d-agent-action[data-kind="work"]::before,.world3d-agent-action[data-kind="build"]::before{content:"⚒";background:#b98a2e}
+.world3d-agent-action[data-kind="travel"]{border-color:rgba(111,185,228,.45);color:#c3e5fa}
+.world3d-agent-action[data-kind="travel"]::before{content:"➜";background:#3c86c4}
+.world3d-agent-action[data-kind="learn"]::before{content:"✎";background:#5d6fd0}
+.world3d-agent-action[data-kind="socialize"]::before{content:"♪";background:#d0679b}
+.world3d-agent-action[data-kind="care"]::before{content:"♥";background:#d9604c}
 
 /* Synterra internal simulated spot market */
 .market-dashboard{margin:0 0 22px;padding:22px;border:1px solid rgba(201,243,106,.2);background:linear-gradient(145deg,rgba(20,31,23,.96),rgba(16,24,18,.96));scroll-margin-top:24px}
