@@ -5,6 +5,7 @@ import { inspectAgentTokenSpecification, AGENT_TOKEN_PILOT_GENERATION, AGENT_TOK
   AGENT_TOKEN_OWNERSHIP_MODELS, AGENT_TOKEN_UNALLOCATED_SUPPLY_HANDLING } from './arc/token-issuance.js';
 import { createWorldExtensionRequest } from './world-v7.js';
 import { authorAgentCurrencyProposal } from './agent-runtime/currency-genesis-authoring.js';
+import { currencyGenesisInfrastructureFacts } from './arc/currency-genesis-context.js';
 
 const SPEC_FIELDS = ['name','symbol','meaning','purpose','rationale','decimals','distribution','reserveAmount',
   'unallocatedSupplyHandling','ownershipModel','authorityModel'];
@@ -491,7 +492,8 @@ async function currencyAuthoringInput(client, { worldId, agent, worldMinute, req
       meaning: intent.meaning, purpose: intent.purpose, rationale: intent.rationale,
       existingSpecification: agentTokenSpecificationFromIntentRow(intent) };
   }
-  return { resident: agent, worldFacts: { currencyRequirement: 'CURRENCY_GENESIS_REQUIRED',
+  return { resident: agent, worldFacts: { ...currencyGenesisInfrastructureFacts({ requirement }),
+    currencyRequirement: 'CURRENCY_GENESIS_REQUIRED',
     requirementStatus: requirement.status, currentWorldMinute: Number(worldMinute),
     currentEconomicEvidence: economicEvidence.rows.map((row) =>
       `${row.service_type} had ${row.unmet_count} unmet requests on world day ${row.world_day}.`) },
@@ -594,7 +596,8 @@ export async function advanceWorldCurrencyGenesis(client, { worldId, agent, worl
 
   const input = await currencyAuthoringInput(client, { worldId, agent, worldMinute, requirement, intent: currentIntent });
   const selected = await chooseCurrencyReviewOption(chooseWithTypeSafe, { worldId, agent, worldMinute, requirement,
-    state: { residentGoal: agent.primaryGoal || agent.currentGoal || agent.goal || null,
+    state: { worldFacts: input.worldFacts,
+      residentGoal: agent.primaryGoal || agent.currentGoal || agent.goal || null,
       activeGoals: Array.isArray(agent.goals) ? agent.goals.slice(0, 8) : [],
       currentNeeds: { energy: agent.energy, food: agent.food, social: agent.social, knowledge: agent.knowledge },
       ownRecentMemories: (agent.recentMemories || []).slice(0, 10),

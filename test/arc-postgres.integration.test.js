@@ -16,6 +16,7 @@ import { ARC_SETTLEMENT_POLICY_INTERFACE, enqueueArcAgentEconomicAction } from '
 import { ArcReadOnlyObserver } from '../src/arc/observer.js';
 import { ArcSettlementOutboxWorker } from '../src/arc/settlement-worker.js';
 import { ArcAgentTokenIssuanceWorker } from '../src/arc/token-issuance-worker.js';
+import { currencyGenesisInfrastructureFacts } from '../src/arc/currency-genesis-context.js';
 import { confirmWorldTokenIssuance } from '../src/world-token-issuance.js';
 import { reserveArcMainnetPilotCost, releaseArcMainnetPilotCost,
   setArcMainnetPilotCostStatus } from '../src/arc/pilot-budget.js';
@@ -184,10 +185,16 @@ test('Arc Mainnet Agent action reaches persistent outbox, policy evaluation, and
     let responseRecorded = false;
     let authoringContextObserved = null;
     const cognitionChoices = [];
+    const cognitionFacts = new Map();
     engine = await startWorldEngine(pool, { worldId, nowProvider: () => engineNowMs, schedule: false,
       currencyGenesisEnabled: true,
       chooseCivilizationOption: async (request) => {
         if (request.choiceType !== 'currency_genesis') return null;
+        cognitionFacts.set(request.agentId, request.state.worldFacts);
+        for (const [key, value] of Object.entries(currencyGenesisInfrastructureFacts({
+          requirement: { status: request.state.requirementStatus } }))) {
+          assert.equal(request.state.worldFacts[key], value);
+        }
         const options = request.options || [];
         const choose = options.find((option) => option.id === 'no_action');
         let selected = choose;
@@ -212,6 +219,8 @@ test('Arc Mainnet Agent action reaches persistent outbox, policy evaluation, and
         return selected ? { choice: { id: selected.id }, confidence: 0.99, model: 'isolated-resident-cognition' } : null;
       },
       authorCurrencyProposal: async (input) => {
+        assert.strictEqual(input.worldFacts, cognitionFacts.get(input.resident.agentId),
+          'cognition and authoring receive the very same world facts object');
         authoringContextObserved = { agentId: input.resident.agentId, currentGoal: input.resident.currentGoal,
           goalCount: input.resident.goals.length, memories: input.resident.recentMemories.map((memory) => memory.summary),
           requirementStatus: input.worldFacts.requirementStatus,
@@ -261,6 +270,11 @@ test('Arc Mainnet Agent action reaches persistent outbox, policy evaluation, and
     assert.equal(Number((await pool.query(`SELECT count(*)::int AS count FROM arc_token_issuance_intents WHERE world_id=$1`,
       [worldId])).rows[0].count), 0, 'no proposal is created before a resident chooses one');
     assert.ok(cognitionChoices.some((entry) => entry.choice === 'no_action'));
+    assert.equal(authoringContextObserved, null, 'network facts alone do not invoke authoring');
+    for (const table of ['arc_token_issuance_issuer_candidates', 'arc_token_issuance_decisions', 'arc_agent_tokens']) {
+      assert.equal((await pool.query(`SELECT count(*)::int AS count FROM ${table} WHERE world_id=$1`, [worldId])).rows[0].count, 0);
+    }
+    assert.equal(cognitionFacts.get(payerId).mainnetWriteGate, false);
 
     allowProposal = true;
     await runCurrencyReview();

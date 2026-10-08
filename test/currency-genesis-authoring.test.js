@@ -1,5 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { currencyGenesisInfrastructureFacts } from '../src/arc/currency-genesis-context.js';
+import { arcNetworkConfig } from '../src/arc/config.js';
 import { authorAgentCurrencyProposal } from '../src/agent-runtime/currency-genesis-authoring.js';
 
 const SPECIFICATION = { name: 'Exchange', symbol: 'EX', meaning: 'A resident expression.', purpose: 'A resident purpose.' };
@@ -13,7 +15,7 @@ test('local authoring receives resident-specific state and only expresses a prio
       energy: 0.7, food: 0.8, social: 0.6, knowledge: 0.9,
       traits: { curiosity: 0.8 }, skills: { research: 0.9 }
     },
-    worldFacts: { currencyRequirement: 'CURRENCY_GENESIS_REQUIRED', requirementStatus: 'UNRESOLVED',
+    worldFacts: { ...currencyGenesisInfrastructureFacts({ requirement: { status: 'UNRESOLVED' } }), currencyRequirement: 'CURRENCY_GENESIS_REQUIRED', requirementStatus: 'UNRESOLVED',
       currentWorldMinute: 55, currentEconomicEvidence: ['Two unmet research exchanges.'] },
     publicCurrencyHistory: [{ type: 'proposal', agent: 'resident-b', decision: 'support',
       summary: 'A peer supported keeping exchange records.', worldMinute: 50 }],
@@ -36,6 +38,9 @@ test('local authoring receives resident-specific state and only expresses a prio
   assert.equal(context.resident.currentGoal, 'coordinate research exchange');
   assert.equal(context.resident.goals[0].description, 'Share research notes');
   assert.equal(context.resident.recentMemories[0].summary, 'A peer lacked a way to record exchange.');
+  for (const [key, value] of Object.entries(currencyGenesisInfrastructureFacts({ requirement: { status: 'UNRESOLVED' } }))) {
+    assert.equal(context.worldFacts[key], value);
+  }
   assert.equal(context.worldFacts.currentEconomicEvidence[0], 'Two unmet research exchanges.');
   assert.equal(context.publicCurrencyHistory[0].decision, 'support');
   assert.equal(context.currentProposal.existingSpecification.purpose, 'Resident authored purpose.');
@@ -57,4 +62,43 @@ test('missing resident context remains unresolved without calling the local mode
   });
   assert.equal(called, false);
   assert.deepEqual(result, { specification: null, reason: 'resident_context_missing' });
+});
+
+
+test('infrastructure facts follow Arc config and reconciled requirement, not execution preparation', () => {
+  const config = arcNetworkConfig({});
+  const facts = currencyGenesisInfrastructureFacts({ config, requirement: { status: 'UNRESOLVED' } });
+  assert.deepEqual(facts, { executionNetwork: 'Arc Mainnet', chainId: 5042,
+    tokenCreationTarget: 'Arc Mainnet', networkRole: 'the blockchain execution environment for this pilot',
+    mainnetWriteGate: false, onchainStatus: 'not yet created' });
+  for (const status of ['UNRESOLVED', 'PROPOSAL_FORMED', 'EXECUTION_READY', 'SATISFIED']) {
+    assert.equal(currencyGenesisInfrastructureFacts({ config, requirement: { status } }).onchainStatus, 'not yet created');
+  }
+  assert.equal(currencyGenesisInfrastructureFacts({ config, requirement: {
+    status: 'SATISFIED', satisfied_token_id: 'reconciled-token-id' } }).onchainStatus, 'created');
+  assert.equal(currencyGenesisInfrastructureFacts({ config, requirement: {
+    status: 'EXECUTION_READY', satisfied_token_id: 'not-reconciled' } }).onchainStatus, 'not yet created');
+});
+
+test('network context preserves undecided fields and makes no call beyond local authoring', async () => {
+  const undecided = Object.fromEntries(['name','symbol','meaning','purpose','rationale','decimals',
+    'distribution','reserveAmount','unallocatedSupplyHandling','ownershipModel','authorityModel'].map(key => [key, null]));
+  const facts = currencyGenesisInfrastructureFacts({ requirement: { status: 'UNRESOLVED' } });
+  const calls = [];
+  const result = await authorAgentCurrencyProposal({ resident: { agentId: 'resident-a' }, worldFacts: facts }, {
+    fetchImpl: async (url, options) => {
+      calls.push(url);
+      const body = JSON.parse(options.body);
+      const context = JSON.parse(body.messages[1].content);
+      for (const [key, value] of Object.entries(facts)) assert.equal(context.worldFacts[key], value);
+      assert.equal(context.currentProposal, null);
+      assert.deepEqual(context.availableRecipients, []);
+      assert.match(body.messages[0].content, /infrastructure facts, not token attributes/);
+      assert.match(body.messages[0].content, /does not mean a token will never be deployed/);
+      assert.match(body.messages[0].content, /do not favor proposing over no action/);
+      return { ok: true, text: async () => JSON.stringify({ message: { content: JSON.stringify(undecided) } }) };
+    }
+  });
+  assert.deepEqual(result.specification, undecided);
+  assert.deepEqual(calls, ['http://127.0.0.1:11434/api/chat']);
 });
