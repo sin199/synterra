@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { formatUnits, parsePositiveUnits } from './crypto-market.js';
+import { formatUnits, parsePositiveUnits } from './units.js';
 import { ensureEconomicAccount, getEconomicAccount, postEconomicTransfer, transferBetweenAccounts } from './economic-ledger.js';
 import { activeServicePriceAgreement, createSystemEmploymentAgreement, recordAgreementExecutionStage,
   recordEmploymentShift, resolveBusinessAgreementsOnClosure, resolveEmploymentAgreementOnExit,
@@ -2486,9 +2486,10 @@ export function economicDashboardSql(worldIdPlaceholder = '$1') {
         AND NOT (child.asset_type||':'||child.asset_id::text)=ANY(parent.path)
     ), entity_values AS (
       SELECT account.account_type AS asset_type,account.owner_id AS asset_id,
-        sum(account.balance*COALESCE(quote.price_usd,0)) AS value_usd
-      FROM world_economic_accounts account LEFT JOIN crypto_market_quotes quote ON quote.symbol=account.asset_symbol
+        sum(account.balance) AS value_usd
+      FROM world_economic_accounts account
       WHERE account.world_id=${world} AND account.account_type IN ('business','organization','project')
+        AND account.asset_symbol='USDC'
       GROUP BY account.account_type,account.owner_id
     )
     SELECT
@@ -2515,9 +2516,9 @@ export function economicDashboardSql(worldIdPlaceholder = '$1') {
         AND tx.transaction_type IN ('business_investment','business_reopen','project_investment')) AS investment_volume,
       (SELECT COALESCE(sum(balance),0)::text FROM world_economic_accounts WHERE world_id=${world}
         AND account_type<>'system' AND asset_symbol='USDC') AS usdc_circulation,
-      ((SELECT COALESCE(sum(account.balance*COALESCE(quote.price_usd,0)),0)
-        FROM world_economic_accounts account LEFT JOIN crypto_market_quotes quote ON quote.symbol=account.asset_symbol
-        WHERE account.world_id=${world} AND account.account_type='resident')
+      ((SELECT COALESCE(sum(account.balance),0)
+        FROM world_economic_accounts account
+        WHERE account.world_id=${world} AND account.account_type='resident' AND account.asset_symbol='USDC')
         +(SELECT COALESCE(sum(resident_assets.share*entity_values.value_usd),0)
           FROM resident_assets JOIN entity_values USING(asset_type,asset_id)))::text AS total_resident_net_worth_usd`;
 }

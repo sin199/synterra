@@ -44,13 +44,13 @@ test('V7 declarative policy parameters have distinct effects and genealogy suppo
   assert.equal(applyAgentDecisionPolicy(base).score, 50, 'the substrate default retains V6 candidate ranking');
   assert.ok(applyAgentDecisionPolicy(base, { ...{}, planningHorizonMinutes: 2_880, explorationPreference: 1,
     memoryEmphasis: 0.9, socialInfluencePreference: 0.5, riskToleranceBias: 0 }).score > 50);
-  const longHorizonTrade = applyAgentDecisionPolicy({ action: 'trade', score: 50 },
+  const longHorizonResearch = applyAgentDecisionPolicy({ action: 'business_market_observe', score: 50 },
     { planningHorizonMinutes: 2_880, explorationPreference: 0.5, memoryEmphasis: 0.5,
       socialInfluencePreference: 0.5, riskToleranceBias: 0 });
-  const shortHorizonTrade = applyAgentDecisionPolicy({ action: 'trade', score: 50 },
+  const shortHorizonResearch = applyAgentDecisionPolicy({ action: 'business_market_observe', score: 50 },
     { planningHorizonMinutes: 60, explorationPreference: 0.5, memoryEmphasis: 0.5,
       socialInfluencePreference: 0.5, riskToleranceBias: 0 });
-  assert.ok(shortHorizonTrade.score > longHorizonTrade.score, 'planning horizon changes candidate preference');
+  assert.ok(longHorizonResearch.score > shortHorizonResearch.score, 'planning horizon changes market research preference');
   const capabilities = ['a','b','c','d'].map((id) => ({ id, name: id, creatorType: id === 'a' ? 'system' : 'resident' }));
   const edges = [{ capabilityId: 'b', dependsOnCapabilityId: 'a' },
     { capabilityId: 'c', dependsOnCapabilityId: 'b' }, { capabilityId: 'd', dependsOnCapabilityId: 'c' }];
@@ -127,8 +127,8 @@ test('V7 migration, reflection, fluid entities, concepts, policy evaluation, rol
 
     for (const minute of [1_000,2_000,3_000,4_000,5_000,6_000]) {
       await pool.query(`INSERT INTO agent_memories(world_id,agent_id,memory_type,summary,importance,world_minutes,metadata)
-        VALUES($1,$2,'failure','A personally observed unfavorable simulated trade.',0.8,$3,
-          jsonb_build_object('action','trade','asset','BTC','outcome',-0.3,'realizedPnlUsd',-30))`,
+        VALUES($1,$2,'failure','A personally observed unfavorable market research outcome.',0.8,$3,
+          jsonb_build_object('action','business_market_observe','outcome',-0.3))`,
       [worldId, agentIds[0], minute]);
     }
     const choose = (id) => async ({ options }) => ({ decision: { id: options.some((option) => option.id === id) ? id : 'no_change' } });
@@ -178,7 +178,7 @@ test('V7 migration, reflection, fluid entities, concepts, policy evaluation, rol
         (SELECT count(*)::int FROM world_agent_goals WHERE world_id=$1 AND agent_id=$2 AND source='self_generated') AS goals,
         (SELECT count(*)::int FROM world_agent_questions WHERE world_id=$1 AND creator_agent_id=$2) AS questions
       FROM world_agent_self_models WHERE world_id=$1 AND agent_id=$2`, [worldId, agentIds[0]]);
-    assert.match(continuous.rows[0].identity, /repeatedly used trade/);
+    assert.match(continuous.rows[0].identity, /repeatedly used business_market_observe/);
     assert.equal(continuous.rows[0].goals, 1);
     assert.equal(continuous.rows[0].questions, 1);
 
@@ -201,12 +201,14 @@ test('V7 migration, reflection, fluid entities, concepts, policy evaluation, rol
     for (const offset of [1_000,4_000,9_000]) {
       await pool.query(`INSERT INTO agent_memories(world_id,agent_id,memory_type,summary,importance,world_minutes,metadata)
         VALUES($1,$2,'failure','Baseline result for policy evaluation.',0.7,$3,
-          jsonb_build_object('action','trade','outcome',-0.15))`, [worldId, agentIds[0], policyStartMinute - 9_500 + offset]);
+          jsonb_build_object('action','business_market_observe','outcome',-0.15))`,
+      [worldId, agentIds[0], policyStartMinute - 9_500 + offset]);
     }
     for (const offset of [200,4_000,9_000]) {
       await pool.query(`INSERT INTO agent_memories(world_id,agent_id,memory_type,summary,importance,world_minutes,metadata)
-        VALUES($1,$2,'trade','Later result for policy evaluation.',0.5,$3,
-          jsonb_build_object('action','trade','outcome',0.35))`, [worldId, agentIds[0], policyStartMinute + offset]);
+        VALUES($1,$2,'market_research','Later result for policy evaluation.',0.5,$3,
+          jsonb_build_object('action','business_market_observe','outcome',0.35))`,
+      [worldId, agentIds[0], policyStartMinute + offset]);
     }
     const evaluationMinute = policyStartMinute + WORLD_V7_REFLECTION_INTERVAL_MINUTES;
     const evaluation = await inTransaction(pool, (client) => advanceWorldV7(client, { worldId, worldMinute: evaluationMinute,
@@ -224,9 +226,10 @@ test('V7 migration, reflection, fluid entities, concepts, policy evaluation, rol
     const priorPolicy = (await pool.query(`SELECT policy,version,source FROM world_agent_decision_policies
       WHERE world_id=$1 AND agent_id=$2`, [worldId, agentIds[0]])).rows[0];
     const rollbackExperiment = await inTransaction(pool, (client) => createPolicyExperiment(client, {
-      worldId, agentId: agentIds[0], proposedPolicy: { ...priorPolicy.policy, attentionWeights: { trade: -0.18 } },
+      worldId, agentId: agentIds[0], proposedPolicy: { ...priorPolicy.policy,
+        attentionWeights: { business_market_observe: -0.18 } },
       reason: 'Test a reversible policy change with insufficient later observations.', worldMinute: evaluationMinute + 120,
-      durationWorldMinutes: 60, actionId: 'v7-policy-revert-01', evidence: { targetAction: 'trade' }
+      durationWorldMinutes: 60, actionId: 'v7-policy-revert-01', evidence: { targetAction: 'business_market_observe' }
     }));
     const rollback = await inTransaction(pool, (client) => advanceWorldV7(client,
       { worldId, worldMinute: evaluationMinute + 180 }));
@@ -243,8 +246,8 @@ test('V7 migration, reflection, fluid entities, concepts, policy evaluation, rol
     const metaPatternMinute = evaluationMinute + 30_000;
     for (const offset of [0,1_000,2_000,3_000,4_000]) await pool.query(
       `INSERT INTO agent_memories(world_id,agent_id,memory_type,summary,importance,world_minutes,metadata)
-        VALUES($1,$2,'failure','A second resident repeatedly observed an unfavorable simulated outcome.',0.8,$3,
-          jsonb_build_object('action','trade','outcome',-0.3))`,
+        VALUES($1,$2,'failure','A second resident repeatedly observed an unfavorable market research outcome.',0.8,$3,
+          jsonb_build_object('action','business_market_observe','outcome',-0.3))`,
       [worldId, agentIds[1], metaPatternMinute - 4_000 + offset]);
     const localQuestion = await inTransaction(pool, (client) => reflectWorldV7Resident(client,
       { worldId, agent: localResident, worldMinute: metaPatternMinute }));

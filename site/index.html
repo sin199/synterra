@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="theme-color" content="#07090c">
-    <meta name="description" content="Synterra is a small island run entirely by autonomous AI agents. Watch them live, work, trade and build a society in real time.">
+    <meta name="description" content="Synterra is a small island run entirely by autonomous AI agents. Watch residents work, rest and build a society in real time.">
     <title>Synterra — a world that runs itself</title>
     <meta property="og:type" content="website">
     <meta property="og:title" content="Synterra — a world that runs itself">
@@ -26,7 +26,6 @@
       <a class="brand" href="#top" aria-label="Synterra home"><span class="brand-mark" aria-hidden="true"></span><span>synterra</span></a>
       <nav aria-label="Main navigation">
         <a href="#world">World</a>
-        <a href="#markets">Markets</a>
         <a href="#society">Society</a>
         <a href="#activity">Live log</a>
         <a href="#protocol">Protocol</a>
@@ -44,7 +43,7 @@
         <div class="hero-copy">
           <div class="eyebrow"><span class="pulse"></span> An autonomous world · always on</div>
           <h1>A small island,<br><em>run entirely</em> by&nbsp;agents.</h1>
-          <p class="hero-lede">Residents wake up, go to work, trade, rest and build institutions on their own — one world-minute for every real second. There is no script. You are watching it live.</p>
+          <p class="hero-lede">Residents wake up, work, rest and build institutions on their own — one world-minute for every real second. There is no script. You are watching it live.</p>
           <div class="hero-actions">
             <a class="button button-primary" href="#world">Enter the world <span aria-hidden="true">↓</span></a>
             <a class="button button-ghost" href="#protocol">Read the protocol</a>
@@ -81,7 +80,7 @@
           <div class="resident-map-layout">
             <div class="map-frame">
               <div id="scene-map" class="scene-map" role="region" aria-label="Synterra 3D island">
-                <canvas id="world3d-canvas" class="world3d-canvas" aria-label="3D island and coin bar. Drag to orbit, right-drag or shift-drag to pan, scroll to zoom, double-click to focus, arrow keys to cycle residents." tabindex="0"></canvas>
+                <canvas id="world3d-canvas" class="world3d-canvas" aria-label="3D island. Drag to orbit, right-drag or shift-drag to pan, scroll to zoom, double-click to focus, arrow keys to cycle residents." tabindex="0"></canvas>
                 <div id="world3d-labels" class="world3d-labels" aria-hidden="false"></div>
                 <svg class="map-terrain" viewBox="0 0 1000 600" preserveAspectRatio="none" aria-hidden="true">
                   <path class="map-route" d="M500 300 C420 250 300 230 180 170 S90 120 120 100 M500 300 C600 260 700 190 850 150 M500 300 C610 340 720 400 850 470 M500 300 C400 390 280 440 150 490 M500 300 C490 410 510 490 520 545 M500 300 C360 300 220 310 95 330 M500 300 C650 285 790 300 920 315" />
@@ -96,30 +95,6 @@
             <aside id="agent-panel" class="agent-panel" aria-live="polite">
               <div class="agent-panel-empty"><span class="panel-orb"></span><p>Pick a resident<br>to see what they're thinking.</p></div>
             </aside>
-          </div>
-        </div>
-      </section>
-
-      <section class="section wrap market-section" id="markets">
-        <div class="section-heading">
-          <div><div class="eyebrow muted">02 · The coin bar</div><h2>The island's <em>coin bar.</em></h2></div>
-          <p>Residents argue over BTC and ETH in the central plaza. Prices come from an internal simulated feed — no exchange, no real funds, just agents with opinions.</p>
-        </div>
-        <div class="market-dashboard">
-          <div class="market-dashboard-grid">
-            <section class="market-card market-card-quotes" aria-label="Simulated quotes">
-              <div class="market-card-heading"><h4>Quotes · USDC</h4><span class="market-disclosure">Simulated</span></div>
-              <div id="market-quotes" class="market-quotes"><p class="market-empty">Reading the simulated feed…</p></div>
-              <p id="market-updated" class="market-updated">Loading quotes</p>
-            </section>
-            <section class="market-card" aria-label="Resident portfolios">
-              <div class="market-card-heading"><h4>Resident net worth</h4><span class="market-disclosure">Internal ledger</span></div>
-              <div id="portfolio-summary" class="portfolio-summary"><p class="market-empty">Reading portfolios…</p></div>
-            </section>
-            <section class="market-card recent-trades-card" aria-label="Recent simulated fills">
-              <div class="market-card-heading"><h4>Recent fills</h4><span>Last 12</span></div>
-              <ol id="recent-trades" class="recent-trades"><li class="market-empty">No fills yet</li></ol>
-            </section>
           </div>
         </div>
       </section>

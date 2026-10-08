@@ -5,8 +5,8 @@ import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Pool } from 'pg';
-import { ensureCryptoAccount } from '../src/crypto-trading.js';
 import { ensureEconomicAccount, getEconomicAccount, postEconomicTransfer } from '../src/economic-ledger.js';
+import { fundTestResidents } from './helpers/economic-fixtures.js';
 import { applyToWorldBusinessJob, closeWorldBusiness, completeWorldBusinessShift,
   decideWorldBusinessApplication, distributeWorldBusinessProfit, distributeWorldProjectRevenue,
   economicDashboardSql, foundWorldBusiness, investInWorldBusiness, investInWorldProject,
@@ -78,15 +78,9 @@ test('V4 economy settles business, project, organization and place value without
       SELECT $1,id,'Cafe',100,100,100 FROM agents WHERE id=ANY($2::uuid[])`, [worldId, agents]);
     await pool.query(`INSERT INTO world_agent_skills(world_id,agent_id,skill_name,skill_value)
       VALUES($1,$2,'research',40)`, [worldId, workerId]);
-    await pool.query(`INSERT INTO crypto_risk_limits(world_id,starting_usdc) VALUES($1,10000)
-      ON CONFLICT(world_id) DO NOTHING`, [worldId]);
-    await pool.query(`INSERT INTO crypto_market_quotes(symbol,price_usd,quote_version,as_of,source) VALUES
-      ('USDC',1,1,now(),'synterra_simulated_market'),('BTC',60000,1,now(),'synterra_simulated_market'),
-      ('ETH',3000,1,now(),'synterra_simulated_market') ON CONFLICT(symbol) DO UPDATE SET
-      price_usd=EXCLUDED.price_usd,quote_version=EXCLUDED.quote_version,as_of=EXCLUDED.as_of,source=EXCLUDED.source`);
-    await inTransaction(pool, async (client) => {
-      for (const agentId of agents) await ensureCryptoAccount(client, { worldId, agentId });
-    });
+    await inTransaction(pool, (client) => fundTestResidents(client, { worldId, agentIds: agents }));
+    const legacyBalancesBefore = await pool.query(`SELECT agent_id,asset_symbol,balance::text AS balance
+      FROM crypto_balances WHERE world_id=$1 ORDER BY agent_id,asset_symbol`, [worldId]);
     await pool.query(`INSERT INTO world_scenes(world_id,created_by,name,scene_type,description,status,
         purpose,capacity,features,position) VALUES($1,$2,'Exchange','commons','Shared economic workspace.','active',
         'A place to meet and buy services.',24,'{}','{}')`, [worldId, founderId]);
@@ -335,11 +329,10 @@ test('V4 economy settles business, project, organization and place value without
         JOIN world_economic_postings posting ON posting.transaction_id=tx.id WHERE tx.world_id=$1 GROUP BY tx.id
       ) postings`, [worldId]);
     assert.equal(ledger.rows[0].unbalanced, 0);
-    const mirror = await pool.query(`SELECT count(*)::int AS drift FROM world_economic_accounts account
-      LEFT JOIN crypto_balances legacy ON legacy.world_id=account.world_id AND legacy.agent_id=account.owner_id
-        AND legacy.asset_symbol=account.asset_symbol
-      WHERE account.world_id=$1 AND account.account_type='resident' AND account.balance<>COALESCE(legacy.balance,0)`, [worldId]);
-    assert.equal(mirror.rows[0].drift, 0);
+    const legacyBalancesAfter = await pool.query(`SELECT agent_id,asset_symbol,balance::text AS balance
+      FROM crypto_balances WHERE world_id=$1 ORDER BY agent_id,asset_symbol`, [worldId]);
+    assert.deepEqual(legacyBalancesAfter.rows, legacyBalancesBefore.rows,
+      'internal resident business transactions do not mirror into legacy paper-trading balances');
 
     const orphanBusiness = await inTransaction(pool, (client) => foundWorldBusiness(client, { worldId, agentId: customerId,
       actionId: 'v4-bankruptcy-business', proposal: { ...proposal, name: 'Short Lived Studio', placeId: null }, worldTime: 800 }));

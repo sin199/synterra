@@ -5,8 +5,8 @@ import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Pool } from 'pg';
-import { ensureCryptoAccount } from '../src/crypto-trading.js';
 import { getEconomicAccount } from '../src/economic-ledger.js';
+import { fundTestResidents } from './helpers/economic-fixtures.js';
 import { closeWorldBusiness, foundWorldBusiness, observeWorldBusinessMarket, reopenWorldBusiness } from '../src/world-businesses.js';
 
 const databaseUrl = process.env.SYNTERRA_TEST_DATABASE_URL;
@@ -51,16 +51,7 @@ test('V5.2 shortage observation can fund and reopen a failed provider without le
       VALUES($1,$2,'V5.2 Reopen Integration',5042,true)`, [worldId, founderId]);
     await pool.query(`INSERT INTO world_members(world_id,agent_id,location,energy,food,social)
       VALUES($1,$2,'Exchange',90,80,70),($1,$3,'Exchange',90,80,70)`, [worldId, founderId, customerId]);
-    await pool.query(`INSERT INTO crypto_risk_limits(world_id,starting_usdc) VALUES($1,10000)
-      ON CONFLICT(world_id) DO NOTHING`, [worldId]);
-    await pool.query(`INSERT INTO crypto_market_quotes(symbol,price_usd,quote_version,as_of,source)
-      VALUES('USDC',1,1,now(),'synterra_simulated_market') ON CONFLICT(symbol) DO UPDATE SET
-      price_usd=EXCLUDED.price_usd,quote_version=EXCLUDED.quote_version,as_of=EXCLUDED.as_of,
-      source=EXCLUDED.source`);
-    await inTransaction(pool, async (client) => {
-      await ensureCryptoAccount(client, { worldId, agentId: founderId });
-      await ensureCryptoAccount(client, { worldId, agentId: customerId });
-    });
+    await inTransaction(pool, (client) => fundTestResidents(client, { worldId, agentIds: [founderId, customerId] }));
     const placeId = randomUUID();
     await pool.query(`INSERT INTO world_scenes(id,world_id,created_by,name,scene_type,description,status,purpose,
         capacity,features,position) VALUES($1,$2,$3,'Exchange','commons','A shared market research place.',

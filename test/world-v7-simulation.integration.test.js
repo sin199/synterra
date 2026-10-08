@@ -64,17 +64,17 @@ async function recordExternalDay(pool, { worldId, seed, day, worldMinute, reside
   const experiences = residents.map((resident) => {
     const signal = SIGNALS[(day - 1 + seed + resident.index) % SIGNALS.length];
     const state = policyByAgent.get(resident.agentId) || { policy: {}, activeExperiment: false, version: 1, source: 'substrate' };
-    const baseTradeScore = state.activeExperiment && resident.experimentMode === 'insufficient' ? 49
+    const baseResearchScore = state.activeExperiment && resident.experimentMode === 'insufficient' ? 49
       : 50;
     const candidates = [
-      applyAgentDecisionPolicy({ action: 'trade', score: baseTradeScore + signal }, state.policy),
+      applyAgentDecisionPolicy({ action: 'business_market_observe', score: baseResearchScore + signal }, state.policy),
       applyAgentDecisionPolicy({ action: 'learn', score: 49.8 }, state.policy)
     ].sort((left, right) => right.score - left.score || left.action.localeCompare(right.action));
     const action = candidates[0].action;
     let outcome = action === 'learn' ? 0.12 : resident.hasRecurringProblem
       ? (signal >= 0.7 ? 0.2 : -0.5) : 0.18;
-    if (state.activeExperiment && resident.experimentMode === 'worse' && action === 'trade') outcome = -0.45;
-    if (state.activeExperiment && resident.experimentMode === 'insufficient' && action === 'trade') outcome = -0.4;
+    if (state.activeExperiment && resident.experimentMode === 'worse' && action === 'business_market_observe') outcome = -0.45;
+    if (state.activeExperiment && resident.experimentMode === 'insufficient' && action === 'business_market_observe') outcome = -0.4;
     const utilityScores = Object.fromEntries(candidates.map((candidate) => [candidate.action, candidate.score]));
     return { agentId: resident.agentId, action, outcome, signal, utilityScores,
       decisionPolicyVersion: state.version, decisionPolicySource: state.source, worldMinute,
@@ -114,9 +114,10 @@ async function recordExternalDay(pool, { worldId, seed, day, worldMinute, reside
       RETURNING id,actor_id,action_id,data
     )
     INSERT INTO agent_memories(world_id,agent_id,memory_type,summary,importance,world_minutes,location,metadata,source_event_id)
-    SELECT $1,event.actor_id,CASE WHEN (event.data->>'action')='trade' AND (event.data->>'outcome')::numeric < -0.05
-        THEN 'failure' WHEN event.data->>'action'='learn' THEN 'learning' ELSE event.data->>'action' END,
-      CASE WHEN event.data->>'action'='trade' THEN 'Simulated market action completed with a recorded outcome.'
+    SELECT $1,event.actor_id,CASE WHEN event.data->>'action'='business_market_observe'
+          AND (event.data->>'outcome')::numeric < -0.05 THEN 'failure'
+        WHEN event.data->>'action'='learn' THEN 'learning' ELSE event.data->>'action' END,
+      CASE WHEN event.data->>'action'='business_market_observe' THEN 'Market research observation completed with a recorded outcome.'
         ELSE 'Simulated observation action completed with a recorded outcome.' END,
       0.64,(event.data->>'day')::bigint*1440,'Exchange',
       event.data||jsonb_build_object('action',event.data->>'action','outcome',(event.data->>'outcome')::numeric,

@@ -41,21 +41,15 @@ test('low food can choose a meal paid from internal units', () => {
   assert.equal(chosen.plannedPaidMeal, true);
 });
 
-test('utility decision offers bounded BTC/ETH orders only for a market-capable resident', () => {
-  const quotes = [
+test('legacy crypto balances and quotes do not create resident trading candidates', () => {
+  const legacyMarket = { tick: 11, quotes: [
     { symbol: 'BTC', priceUsd: '64000.00000000' },
     { symbol: 'ETH', priceUsd: '3200.00000000' }
-  ];
-  const trader = agent({ goal: 'wealth', riskTolerance: 0.78, energy: 90, food: 90,
-    lastTradeAt: null, usdc: '10000', btc: '0', eth: '0' });
-  const candidates = buildActivityCandidates(trader, scenes, { tick: 11, quotes, previousQuotes: { BTC: '63900', ETH: '3190' } });
-  const order = candidates.find((item) => item.action === 'trade');
-  assert.ok(order);
-  assert.equal(order.targetLocation, 'Exchange');
-  assert.equal(order.side, 'buy');
-  assert.ok(Number(order.quoteUnits) <= 50);
-  const nonTrader = buildActivityCandidates(agent({ goal: 'learn', riskTolerance: 0.2 }), scenes, { tick: 11, quotes });
-  assert.equal(nonTrader.some((item) => item.action === 'trade'), false);
+  ], previousQuotes: { BTC: '63900', ETH: '3190' } };
+  const candidates = buildActivityCandidates(agent({ goal: 'wealth', riskTolerance: 0.78, energy: 90, food: 90,
+    usdc: '10000', btc: '2', eth: '3' }), scenes, legacyMarket);
+  assert.ok(!candidates.some((item) => ['trade', 'trade_crypto', 'trade_meme', 'trade_hold'].includes(item.action)));
+  assert.ok(candidates.some((item) => item.action === 'work'), 'ordinary world work remains available');
 });
 
 test('resident-created studio and commons are valid destinations for autonomous activities', () => {

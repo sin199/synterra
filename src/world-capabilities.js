@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { ensureEconomicAccount, ensureResidentEconomicAccounts, transferBetweenAccounts } from './economic-ledger.js';
-import { parsePositiveUnits } from './crypto-market.js';
+import { parsePositiveUnits } from './units.js';
 import { actionIdentifier, boundedNumber, jsonObject, requireWorldMember, requiredText, worldError, writeWorldHistory } from './world-domain.js';
 import { contributeOrganizationEffort } from './world-organizations.js';
 import { contributeToProject } from './world-projects.js';

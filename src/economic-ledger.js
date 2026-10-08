@@ -1,6 +1,6 @@
-import { parsePositiveUnits, formatUnits } from './crypto-market.js';
+import { parsePositiveUnits, formatUnits } from './units.js';
 
-const ASSETS = new Set(['USDC', 'BTC', 'ETH']);
+const ASSETS = new Set(['USDC']);
 const ACCOUNT_TYPES = new Set(['resident', 'organization', 'business', 'project', 'system']);
 
 function ledgerError(code, statusCode = 409) {
@@ -11,8 +11,7 @@ function accountKey(type, ownerId, explicitKey) {
   if (explicitKey) return String(explicitKey).slice(0, 160);
   if (type === 'system') throw ledgerError('SYSTEM_ACCOUNT_KEY_REQUIRED', 400);
   if (!ownerId) throw ledgerError('ECONOMIC_ACCOUNT_OWNER_REQUIRED', 400);
-  // Legacy opening balances use the resident UUID as the account key. Keep
-  // that canonical form so V4 never creates a second balance for old assets.
+  // Resident accounts use the resident UUID as their stable account key.
   return type === 'resident' ? String(ownerId) : `${type}:${ownerId}`.slice(0, 160);
 }
 
@@ -33,22 +32,8 @@ export async function ensureEconomicAccount(client, { worldId, accountType, owne
 }
 
 export async function ensureResidentEconomicAccounts(client, { worldId, agentId, worldTime = 0 }) {
-  const legacy = await client.query(`SELECT asset_symbol AS asset,balance::text AS balance FROM crypto_balances
-    WHERE world_id=$1 AND agent_id=$2 ORDER BY asset_symbol`, [worldId, agentId]);
-  const balances = new Map(legacy.rows.map((row) => [row.asset, row.balance]));
-  for (const asset of ASSETS) {
-    const inserted = await client.query(`INSERT INTO world_economic_accounts(world_id,account_type,account_key,owner_id,asset_symbol,balance)
-      VALUES($1,'resident',$2,$3,$4,0) ON CONFLICT(world_id,account_key,asset_symbol) DO NOTHING RETURNING id`,
-    [worldId, String(agentId), agentId, asset]);
-    if (!inserted.rowCount) continue;
-    const amount = balances.get(asset) || '0.00000000';
-    if (parsePositiveUnits(amount, { allowZero: true }) === 0n) continue;
-    const source = await ensureEconomicAccount(client, { worldId, accountType: 'system', key: `system:simulation-seed:${asset}`, asset });
-    const destination = await ensureEconomicAccount(client, { worldId, accountType: 'resident', ownerId: agentId, asset });
-    await postEconomicTransfer(client, { worldId, sourceAccountId: source.id, destinationAccountId: destination.id,
-      asset, amount, transactionType: 'simulation_seed', reason: 'One-time simulated resident starting balance.',
-      worldTime, actionId: `resident-seed:${agentId}:${asset}`, referenceId: `resident:${agentId}` });
-  }
+  void worldTime;
+  await ensureEconomicAccount(client, { worldId, accountType: 'resident', ownerId: agentId, asset: 'USDC' });
 }
 
 export async function getEconomicAccount(client, { worldId, accountType, ownerId = null, key = null, asset = 'USDC', forUpdate = false }) {
@@ -116,13 +101,6 @@ export async function postEconomicTransfer(client, { worldId, sourceAccountId, d
     RETURNING account_type AS "accountType",owner_id AS "ownerId",asset_symbol AS asset,balance::text AS balance`,
   [worldId, sourceAccountId, normalized]);
   if (!debited.rowCount) throw ledgerError('INSUFFICIENT_SIMULATED_USDC');
-  for (const row of [changed.rows[0], debited.rows[0]]) {
-    if (row.accountType === 'resident') {
-      await client.query(`INSERT INTO crypto_balances(world_id,agent_id,asset_symbol,balance)
-        VALUES($1,$2,$3,$4) ON CONFLICT(world_id,agent_id,asset_symbol)
-        DO UPDATE SET balance=EXCLUDED.balance,updated_at=now()`, [worldId, row.ownerId, row.asset, row.balance]);
-    }
-  }
   return { transactionId, amount: normalized, asset, idempotent: false };
 }
 

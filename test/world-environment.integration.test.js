@@ -41,7 +41,6 @@ test('an isolated night follows opening hours, circadian sleep at home, and the 
       ($1,$2,'Library','library','A place to study and learn.','{"x":0.2,"z":-0.6}'),
       ($1,$2,'Observatory','observatory','A place to study the simulated sky.','{"x":-0.8,"z":-0.2}')`,
     [worldId, agentIds[0]]);
-    await pool.query(`INSERT INTO crypto_risk_limits(world_id) VALUES($1) ON CONFLICT DO NOTHING`, [worldId]);
     // Start on day 1 at 19:00 and run through the night to 10:00.
     await pool.query(`INSERT INTO world_runtime_state(world_id,tick_count,world_minutes,last_tick_at,typesafe_next_at)
       VALUES($1,0,1140,now(),now()+interval '1 day')`, [worldId]);

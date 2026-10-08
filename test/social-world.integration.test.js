@@ -8,6 +8,7 @@ import { randomUUID } from 'node:crypto';
 import { Pool } from 'pg';
 import { createFruitflyRuntime } from '../src/agent-runtime/fruitfly.js';
 import { pruneResidentMemories, startWorldEngine } from '../src/world-engine.js';
+import { fundTestResidents } from './helpers/economic-fixtures.js';
 
 const databaseUrl = process.env.SYNTERRA_TEST_DATABASE_URL;
 const testEnabled = process.env.SYNTERRA_TEST_ISOLATED === '1' && Boolean(databaseUrl);
@@ -21,7 +22,82 @@ function assertIsolatedTestDatabase(connectionString) {
   assert.ok(databaseName.endsWith('_test'), 'integration tests require a database name ending in _test');
 }
 
-test('isolated 24-hour world keeps social state durable and records real simulated actions', {
+async function inTransaction(pool, operation) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await operation(client);
+    await client.query('COMMIT');
+    return result;
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally { client.release(); }
+}
+
+async function legacyPaperTradingSnapshot(pool, worldId, tokenAddress) {
+  const globalTables = new Set(['crypto_market_quotes', 'robinhood_market_state']);
+  const tokenTables = new Set(['robinhood_tokens', 'robinhood_market_quotes']);
+  const tables = [
+    ['crypto_risk_limits', 'SELECT to_jsonb(row) AS data FROM crypto_risk_limits row WHERE world_id=$1'],
+    ['crypto_market_quotes', 'SELECT to_jsonb(row) AS data FROM crypto_market_quotes row ORDER BY symbol'],
+    ['crypto_balances', 'SELECT to_jsonb(row) AS data FROM crypto_balances row WHERE world_id=$1 ORDER BY agent_id,asset_symbol'],
+    ['crypto_ledger', 'SELECT to_jsonb(row) AS data FROM crypto_ledger row WHERE world_id=$1 ORDER BY id'],
+    ['crypto_orders', 'SELECT to_jsonb(row) AS data FROM crypto_orders row WHERE world_id=$1 ORDER BY id'],
+    ['crypto_trades', 'SELECT to_jsonb(row) AS data FROM crypto_trades row WHERE world_id=$1 ORDER BY id'],
+    ['robinhood_market_state', 'SELECT to_jsonb(row) AS data FROM robinhood_market_state row WHERE id=1'],
+    ['robinhood_tokens', 'SELECT to_jsonb(row) AS data FROM robinhood_tokens row WHERE token_address=$1'],
+    ['robinhood_market_quotes', 'SELECT to_jsonb(row) AS data FROM robinhood_market_quotes row WHERE token_address=$1'],
+    ['robinhood_paper_positions', 'SELECT to_jsonb(row) AS data FROM robinhood_paper_positions row WHERE world_id=$1 ORDER BY agent_id,token_address'],
+    ['robinhood_paper_orders', 'SELECT to_jsonb(row) AS data FROM robinhood_paper_orders row WHERE world_id=$1 ORDER BY id'],
+    ['robinhood_paper_ledger', 'SELECT to_jsonb(row) AS data FROM robinhood_paper_ledger row WHERE world_id=$1 ORDER BY id']
+  ];
+  const snapshot = {};
+  for (const [table, sql] of tables) {
+    const params = globalTables.has(table) ? [] : tokenTables.has(table) ? [tokenAddress] : [worldId];
+    snapshot[table] = (await pool.query(sql, params)).rows;
+  }
+  return snapshot;
+}
+
+async function seedLegacyPaperTradingHistory(pool, worldId, agentId) {
+  const makeAddress = () => `0x${randomUUID().replaceAll('-', '').repeat(2).slice(0, 40)}`;
+  const tokenAddress = makeAddress();
+  const curveAddress = makeAddress();
+  const pairTokenAddress = makeAddress();
+  const launchTxHash = `0x${randomUUID().replaceAll('-', '').padEnd(64, '0')}`;
+  const cryptoOrderId = randomUUID();
+  const robinhoodOrderId = randomUUID();
+  await pool.query(`INSERT INTO crypto_risk_limits(world_id) VALUES($1)`, [worldId]);
+  await pool.query(`INSERT INTO crypto_balances(world_id,agent_id,asset_symbol,balance) VALUES
+    ($1,$2,'USDC',10000),($1,$2,'BTC',0.25)`, [worldId, agentId]);
+  await pool.query(`INSERT INTO crypto_ledger(world_id,agent_id,asset_symbol,amount,entry_type,reference_id,reason) VALUES
+    ($1,$2,'USDC',10000,'seed','legacy-seed','legacy paper balance'),
+    ($1,$2,'BTC',0.25,'buy','legacy-buy','legacy paper purchase')`, [worldId, agentId]);
+  await pool.query(`INSERT INTO crypto_orders(id,world_id,agent_id,action_id,side,asset_symbol,quote_version,quantity,
+      price_usd,notional_usd,fee_usdc,status,data) VALUES($1,$2,$3,'legacy-crypto-order','buy','BTC',1,0.25,64000,
+      16000,16,'filled','{"historical":true}'::jsonb)`, [cryptoOrderId, worldId, agentId]);
+  await pool.query(`INSERT INTO crypto_trades(order_id,world_id,agent_id,side,asset_symbol,quantity,price_usd,notional_usd,fee_usdc)
+    VALUES($1,$2,$3,'buy','BTC',0.25,64000,16000,16)`, [cryptoOrderId, worldId, agentId]);
+  await pool.query(`INSERT INTO robinhood_tokens(token_address,curve_address,symbol,name,decimals,pair_token_address,
+      launch_config_id,launch_block,launch_tx_hash,last_quote_at)
+    VALUES($1,$2,'HIST','Historical token',18,$3,1,9876,$4,now())`, [tokenAddress, curveAddress, pairTokenAddress, launchTxHash]);
+  await pool.query(`INSERT INTO robinhood_market_quotes(token_address,quote_version,block_number,curve_address,quote_asset,
+      quote_reserve_raw,token_reserve_raw,sellable_tokens_raw,fee_bps,tax_bps,graduated,native_per_token,native_usd_price,
+      price_usd,as_of,source,trade_supported) VALUES($1,1,9876,$2,'WETH',1000000000000000000,1000000000000000000000,
+      500000000000000000000,100,200,false,0.001,2400,2.4,now(),'legacy-test-snapshot',true)`, [tokenAddress, curveAddress]);
+  await pool.query(`INSERT INTO robinhood_paper_positions(world_id,agent_id,token_address,quantity_raw)
+    VALUES($1,$2,$3,1000000000000000000)`, [worldId, agentId, tokenAddress]);
+  await pool.query(`INSERT INTO robinhood_paper_orders(id,world_id,agent_id,action_id,side,token_address,quote_version,
+      token_amount_raw,native_quote_raw,notional_usd,fee_usdc,status,data)
+    VALUES($1,$2,$3,'legacy-robinhood-order','buy',$4,1,1000000000000000000,1000000000000000,2.4,0.024,'filled','{"historical":true}'::jsonb)`,
+  [robinhoodOrderId, worldId, agentId, tokenAddress]);
+  await pool.query(`INSERT INTO robinhood_paper_ledger(world_id,agent_id,token_address,order_id,side,quantity_delta_raw)
+    VALUES($1,$2,$3,$4,'buy',1000000000000000000)`, [worldId, agentId, tokenAddress, robinhoodOrderId]);
+  return tokenAddress;
+}
+
+test('isolated 24-hour world keeps social state durable and leaves legacy paper trading records untouched', {
   skip: !testEnabled,
   timeout: 180_000
 }, async (t) => {
@@ -53,13 +129,13 @@ test('isolated 24-hour world keeps social state durable and records real simulat
       ($1,$2,'Data Center','data_center','A place to operate shared infrastructure.'),
       ($1,$2,'Library','library','A place to study and learn.'),
       ($1,$2,'Observatory','observatory','A place to study the simulated sky.')`, [worldId, agentIds[0]]);
-    await pool.query(`INSERT INTO crypto_risk_limits(world_id) VALUES($1) ON CONFLICT DO NOTHING`, [worldId]);
-    await pool.query(`INSERT INTO crypto_market_quotes(symbol,price_usd,quote_version,as_of,source) VALUES
-      ('USDC',1,1,now(),'synterra_simulated_market'),
-      ('BTC',64000,1,now(),'synterra_simulated_market'),
-      ('ETH',3200,1,now(),'synterra_simulated_market')
-      ON CONFLICT(symbol) DO UPDATE SET price_usd=EXCLUDED.price_usd,quote_version=EXCLUDED.quote_version,
-        as_of=EXCLUDED.as_of,source=EXCLUDED.source`);
+    const legacyTokenAddress = await seedLegacyPaperTradingHistory(pool, worldId, agentIds[0]);
+    const legacyHistoryBefore = await legacyPaperTradingSnapshot(pool, worldId, legacyTokenAddress);
+    await pool.query(schema);
+    const importedPaperAccounts = await pool.query(`SELECT account_type,asset_symbol,balance::text AS balance
+      FROM world_economic_accounts WHERE world_id=$1 AND owner_id=$2`, [worldId, agentIds[0]]);
+    assert.equal(importedPaperAccounts.rowCount, 0,
+      'reapplying the schema must retain historical paper balances without importing them into active resident accounts');
 
     let simulatedNow = Date.now();
     const onErrors = [];
@@ -71,34 +147,26 @@ test('isolated 24-hour world keeps social state durable and records real simulat
       import('../src/agent-runtime/typesafe.js'), import('../src/agent-runtime/client.js')
     ]);
     const runtimeState = await loadState();
-    const engineOptions = { worldId, schedule: false, fruitfly, nowProvider: () => simulatedNow,
+    let forcedSocialAction = false;
+    const residentFruitfly = {
+      choose(agentId, observation, candidates, preferred) {
+        const choice = fruitfly.choose(agentId, observation, candidates, preferred);
+        const social = candidates.find((candidate) => candidate.action === 'socialize' && candidate.socialPartnerId);
+        if (agentId === agentIds[0] && !forcedSocialAction && social) {
+          forcedSocialAction = true;
+          return { ...choice, candidate: social, action: 'socialize',
+            behaviorProbability: choice.probabilities.socialize || 0,
+            fruitflyProbability: choice.fruitflyProbabilities.socialize || 0 };
+        }
+        return choice;
+      },
+      learn: (...args) => fruitfly.learn(...args)
+    };
+    const engineOptions = { worldId, schedule: false, fruitfly: residentFruitfly, nowProvider: () => simulatedNow,
       chooseWithTypeSafe, runtimeState,
       onError: (error, phase) => onErrors.push({ message: error.message, phase }),
       onStatus: (status) => { if (status.typeSafe) typeSafeResults.push(status.typeSafe); } };
     const start = () => startWorldEngine(pool, engineOptions);
-    const observedTradeIds = new Set();
-    const verifyNewExchangeTrades = async () => {
-      const orders = await pool.query(`SELECT trade.order_id::text AS "orderId",trade.agent_id AS "agentId",
-          fill.id AS "fillEventId",fill.data AS "fillData",
-          EXISTS(SELECT 1 FROM world_events arrival WHERE arrival.world_id=trade.world_id
-            AND arrival.actor_id=trade.agent_id AND arrival.event_type='world.agent_arrived'
-            AND arrival.data->>'place'='Exchange' AND arrival.data->>'action'='trade' AND arrival.id<fill.id) AS arrived,
-          EXISTS(SELECT 1 FROM world_events complete WHERE complete.world_id=trade.world_id
-            AND complete.actor_id=trade.agent_id AND complete.event_type='world.action_completed'
-            AND complete.data->'trade'->>'id'=trade.order_id::text
-            AND complete.data->>'place'='Exchange' AND complete.id>fill.id) AS completed_at_exchange
-        FROM crypto_trades trade LEFT JOIN world_events fill ON fill.world_id=trade.world_id
-          AND fill.actor_id=trade.agent_id AND fill.event_type='crypto.trade_filled'
-          AND fill.data->>'id'=trade.order_id::text WHERE trade.world_id=$1`, [worldId]);
-      for (const order of orders.rows) {
-        if (observedTradeIds.has(order.orderId)) continue;
-        assert.ok(order.fillEventId, `simulated order ${order.orderId} should have a fill event before audit pruning`);
-        assert.equal(order.fillData.place, 'Exchange');
-        assert.equal(order.arrived, true, `order ${order.orderId} should follow a resident arrival at Exchange`);
-        assert.equal(order.completed_at_exchange, true, `order ${order.orderId} should complete at Exchange`);
-        observedTradeIds.add(order.orderId);
-      }
-    };
     engine = await start();
     assert.equal(engine.running, true);
     let profileBeforeRestart;
@@ -112,12 +180,10 @@ test('isolated 24-hour world keeps social state durable and records real simulat
     for (let minute = 0; minute < 719; minute++) {
       simulatedNow += 1_000;
       await engine.tickOnce();
-      if (minute % 15 === 14) await verifyNewExchangeTrades();
     }
     profileBeforeRestart = (await pool.query(`SELECT primary_goal,sociability FROM world_social_profiles
       WHERE world_id=$1 AND agent_id=$2`, [worldId, agentIds[0]])).rows[0];
     await engine.stop();
-    await verifyNewExchangeTrades();
     engine = null;
 
     const memoriesBeforeRestart = Number((await pool.query(`SELECT count(*)::int AS count FROM agent_memories WHERE world_id=$1`,
@@ -149,17 +215,21 @@ test('isolated 24-hour world keeps social state durable and records real simulat
     for (let minute = 0; minute < 719; minute++) {
       simulatedNow += 1_000;
       await engine.tickOnce();
-      if (minute % 15 === 14) await verifyNewExchangeTrades();
     }
     await engine.stop();
-    await verifyNewExchangeTrades();
     engine = null;
 
     const runtime = (await pool.query('SELECT world_minutes FROM world_runtime_state WHERE world_id=$1', [worldId])).rows[0];
     const interaction = await pool.query(`SELECT count(*)::int AS count FROM world_relationships WHERE world_id=$1`, [worldId]);
     const socialMemories = await pool.query(`SELECT count(*)::int AS count FROM agent_memories
       WHERE world_id=$1 AND memory_type='social'`, [worldId]);
-    const trades = await pool.query(`SELECT count(*)::int AS count FROM crypto_trades WHERE world_id=$1`, [worldId]);
+    const legacyHistoryAfter = await legacyPaperTradingSnapshot(pool, worldId, legacyTokenAddress);
+    const tradingActions = await pool.query(`SELECT count(*)::int AS count FROM world_events
+      WHERE world_id=$1 AND (event_type LIKE 'crypto.%'
+        OR data->>'action' IN ('trade','trade_crypto','trade_meme','trade_hold'))`, [worldId]);
+    const tradingCandidates = await pool.query(`SELECT count(*)::int AS count FROM world_agent_states state
+      CROSS JOIN LATERAL jsonb_array_elements(COALESCE(state.fruitfly_candidates,'[]'::jsonb)) candidate
+      WHERE state.world_id=$1 AND candidate->>'action' IN ('trade','trade_crypto','trade_meme','trade_hold')`, [worldId]);
     const reflections = await pool.query(`SELECT count(*)::int AS count FROM world_agent_reflections WHERE world_id=$1`, [worldId]);
     const decisionTraces = await pool.query(`SELECT count(*)::int AS count FROM world_decision_traces WHERE world_id=$1`, [worldId]);
     const activeGoals = await pool.query(`SELECT count(*)::int AS count FROM world_agent_goals WHERE world_id=$1 AND status='active'`, [worldId]);
@@ -170,8 +240,6 @@ test('isolated 24-hour world keeps social state durable and records real simulat
           count(*) FILTER(WHERE goal_type='secondary') AS secondary_count,count(*) FILTER(WHERE goal_type='short') AS short_count
         FROM world_agent_goals WHERE world_id=$1 AND status='active' GROUP BY agent_id) per_agent`, [worldId]);
     const beliefs = await pool.query(`SELECT count(*)::int AS count FROM world_agent_beliefs WHERE world_id=$1`, [worldId]);
-    const invalidBalances = await pool.query(`SELECT count(*)::int AS count FROM crypto_balances
-      WHERE world_id=$1 AND (balance<0 OR balance::text IN ('NaN','Infinity','-Infinity'))`, [worldId]);
     const completed = await pool.query(`SELECT count(*)::int AS count FROM world_events
       WHERE world_id=$1 AND event_type='world.action_completed'`, [worldId]);
     const actionKinds = await pool.query(`SELECT count(DISTINCT data->>'action')::int AS count,
@@ -182,9 +250,9 @@ test('isolated 24-hour world keeps social state durable and records real simulat
     const residentPaths = await pool.query(`SELECT a.name,p.primary_goal AS goal,p.dominant_role AS role,
         COALESCE((SELECT jsonb_object_agg(skill_name,skill_value) FROM world_agent_skills sk
           WHERE sk.world_id=m.world_id AND sk.agent_id=m.agent_id),'{}'::jsonb) AS skills,
-        COALESCE((SELECT sum(b.balance * CASE WHEN b.asset_symbol='USDC' THEN 1 ELSE q.price_usd END)
-          FROM crypto_balances b LEFT JOIN crypto_market_quotes q ON q.symbol=b.asset_symbol
-          WHERE b.world_id=m.world_id AND b.agent_id=m.agent_id),0)::text AS wealth,
+        COALESCE((SELECT account.balance::text FROM world_economic_accounts account
+          WHERE account.world_id=m.world_id AND account.account_type='resident' AND account.owner_id=m.agent_id
+            AND account.asset_symbol='USDC'),'0.00000000') AS wealth,
         (SELECT count(*)::int FROM world_relationships r WHERE r.world_id=m.world_id
           AND (r.agent_a_id=m.agent_id OR r.agent_b_id=m.agent_id)) AS relationships,
         (SELECT count(*)::int FROM agent_memories memory WHERE memory.world_id=m.world_id AND memory.agent_id=m.agent_id) AS memories,
@@ -198,7 +266,10 @@ test('isolated 24-hour world keeps social state durable and records real simulat
     assert.equal(Number(runtime.world_minutes), 1_920, 'the simulation should advance exactly 24 world hours');
     assert.ok(interaction.rows[0].count > 0, 'at least one co-located social interaction should complete');
     assert.ok(socialMemories.rows[0].count >= 2, 'both participants should retain a memory of the interaction');
-    assert.ok(trades.rows[0].count > 0, 'at least one bounded simulated trade should settle');
+    assert.deepEqual(legacyHistoryAfter, legacyHistoryBefore,
+      'legacy balances, quotes, orders, positions and scan observations remain unchanged');
+    assert.equal(tradingActions.rows[0].count, 0, 'the engine must not record new resident trading actions');
+    assert.equal(tradingCandidates.rows[0].count, 0, 'resident candidate sets must not contain removed trading actions');
     assert.ok(reflections.rows[0].count > 0, 'low-frequency reflection should persist its evidence and result');
     assert.ok(decisionTraces.rows[0].count > 0, 'selected actions should persist their decision explanation');
     assert.ok(activeGoals.rows[0].count > 0, 'open-ended goal records should remain active after the run');
@@ -206,16 +277,11 @@ test('isolated 24-hour world keeps social state durable and records real simulat
     assert.ok(goalCaps.rows[0].maxTotal <= 7 && goalCaps.rows[0].maxPrimary <= 1
       && goalCaps.rows[0].maxSecondary <= 3 && goalCaps.rows[0].maxShort <= 3,
     'active goal counts should stay bounded for each resident');
-    assert.equal(invalidBalances.rows[0].count, 0, 'simulation should not create negative or non-finite token balances');
     assert.ok(completed.rows[0].count > 0, 'completed actions should be persisted');
     assert.ok(actionKinds.rows[0].count >= 3, 'the cohort should perform multiple action types');
     assert.ok(changedNeeds.rows[0].count > 0, 'needs should change as actions complete');
-    assert.equal(observedTradeIds.size, trades.rows[0].count,
-      'every simulated order should retain its Exchange arrival, fill and completion audit history');
     assert.ok(new Set(residentPaths.rows.map((resident) => resident.goal)).size >= 4,
       'residents should retain distinct long-term goals');
-    assert.ok(new Set(residentPaths.rows.map((resident) => resident.wealth)).size > 1,
-      'resident simulated wealth should diverge');
     assert.ok(new Set(residentPaths.rows.map((resident) => JSON.stringify(resident.skills))).size > 1,
       'resident skills should diverge through completed actions');
     assert.ok(new Set(residentPaths.rows.map((resident) => JSON.stringify(resident.actions))).size > 1,
@@ -224,7 +290,8 @@ test('isolated 24-hour world keeps social state durable and records real simulat
     if (process.env.TYPESAFE_API_KEY) assert.ok(typeSafeResults.some((result) => result.reason === 'selected'),
       'configured TypeSafe should select a strategic goal during the simulation');
     t.diagnostic(JSON.stringify({ worldMinutes: Number(runtime.world_minutes), relationships: interaction.rows[0].count,
-      socialMemories: socialMemories.rows[0].count, simulatedTrades: trades.rows[0].count,
+      socialMemories: socialMemories.rows[0].count, legacyTradingRows: Object.fromEntries(
+        Object.entries(legacyHistoryAfter).map(([table, rows]) => [table, rows.length])),
       reflections: reflections.rows[0].count,
       decisionTraces: decisionTraces.rows[0].count, activeGoals: activeGoals.rows[0].count,
       beliefs: beliefs.rows[0].count, maxGoalsPerResident: goalCaps.rows[0].maxTotal,
@@ -298,11 +365,11 @@ test('a trusted cooperative action settles for both residents and reserves the p
       [worldId, actorId]);
     await pool.query(`INSERT INTO world_members(world_id,agent_id,location,energy,food,social)
       VALUES($1,$2,'Workshop',100,100,100),($1,$3,'Workshop',100,100,100)`, [worldId, actorId, partnerId]);
+    await inTransaction(pool, (client) => fundTestResidents(client, { worldId, agentIds }));
     await pool.query(`INSERT INTO world_scenes(world_id,created_by,name,scene_type,description)
       VALUES($1,$2,'Workshop','workshop','A shared cooperative worksite.')`, [worldId, actorId]);
     await pool.query(`INSERT INTO world_relationships(world_id,agent_a_id,agent_b_id,familiarity,trust,affinity,interaction_count)
       VALUES($1,$2,$3,80,24,35,4)`, [worldId, actorId, partnerId]);
-    await pool.query(`INSERT INTO crypto_risk_limits(world_id) VALUES($1) ON CONFLICT DO NOTHING`, [worldId]);
     const fruitfly = await createFruitflyRuntime(stateDir);
     let forcedActionUsed = false;
     const actorCandidateHistory = [];
@@ -340,8 +407,8 @@ test('a trusted cooperative action settles for both residents and reserves the p
       WHERE world_id=$1 AND event_type='world.action_completed' AND data->>'action'='cooperate'`, [worldId]);
     const freeWages = await pool.query(`SELECT count(*)::int AS count FROM world_economic_transactions
       WHERE world_id=$1 AND transaction_type='world_reward' AND reason='simulated cooperative work income'`, [worldId]);
-    const balances = await pool.query(`SELECT agent_id,balance::text AS balance FROM crypto_balances
-      WHERE world_id=$1 AND asset_symbol='USDC' ORDER BY agent_id`, [worldId]);
+    const balances = await pool.query(`SELECT owner_id AS agent_id,balance::text AS balance FROM world_economic_accounts
+      WHERE world_id=$1 AND account_type='resident' AND asset_symbol='USDC' ORDER BY owner_id`, [worldId]);
     const memories = await pool.query(`SELECT count(DISTINCT agent_id)::int AS count FROM agent_memories
       WHERE world_id=$1 AND memory_type='cooperation'`, [worldId]);
     const skillActions = await pool.query(`SELECT count(*)::int AS count FROM world_agent_skills
@@ -356,7 +423,8 @@ test('a trusted cooperative action settles for both residents and reserves the p
     assert.equal(skillActions.rows[0].count, 2, 'both residents should gain engineering experience');
     assert.equal(needsChanged.rows[0].count, 2, 'both residents should incur real work needs');
     assert.equal(balances.rows.length, 2);
-    assert.ok(balances.rows.every((row) => Number(row.balance) === 10_000), 'cooperative work preserves both residents\' cash balances');
+    assert.ok(balances.rows.every((row) => Number(row.balance) === 10_000),
+      'cooperative work preserves residents\' internally funded USDC balances');
   } finally {
     if (engine) await engine.stop();
     if (priorStateDir === undefined) delete process.env.SYNTERRA_STATE_DIR;

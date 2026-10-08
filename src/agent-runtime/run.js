@@ -123,21 +123,6 @@ async function actOnce(agent) {
     result = await apiRequest(identity, 'POST', `/v1/worlds/${state.worldId}/messages`, {
       actionId, ...decision.message, mindUpdate: decision.mindUpdate
     });
-  } else if (decision.action === 'trade_meme') {
-    result = await apiRequest(identity, 'POST', `/v1/worlds/${state.worldId}/trading/robinhood-orders`, {
-      actionId, side: decision.side, tokenAddress: decision.tokenAddress,
-      quoteUnits: decision.quoteUnits, tokenAmountRaw: decision.tokenAmountRaw,
-      quoteVersion: decision.quoteVersion, mindUpdate: decision.mindUpdate
-    });
-  } else if (decision.action === 'trade_crypto') {
-    result = await apiRequest(identity, 'POST', `/v1/worlds/${state.worldId}/trading/orders`, {
-      actionId, side: decision.side, asset: decision.asset, quoteUnits: decision.quoteUnits,
-      quoteVersion: decision.quoteVersion, mindUpdate: decision.mindUpdate
-    });
-  } else if (decision.action === 'trade_hold') {
-    result = await apiRequest(identity, 'POST', `/v1/worlds/${state.worldId}/trading/hold`, {
-      actionId, quoteVersion: decision.quoteVersion, mindUpdate: decision.mindUpdate
-    });
   } else {
     const body = { action: decision.action, actionId, mindUpdate: decision.mindUpdate };
     if (decision.action === 'work') body.mineId = activeMine.id;
@@ -163,8 +148,6 @@ async function actOnce(agent) {
     goal: decision.goal, place: result.place, scene: result.scene?.name || null, energy: result.energy, food: result.food,
     social: result.social, rewardUnits: result.rewardUnits, spentUnits: result.spentUnits || null,
     balanceUnits: result.balanceUnits || null, mineId: result.mineId || null, decisionSource,
-    ...(decision.action === 'trade_meme' ? { paperOrderId: result.orderId, tokenAddress: result.tokenAddress,
-      side: result.side, notionalUsd: result.notionalUsd, feeUsdc: result.feeUsdc, simulated: result.simulated } : {}),
     ...(fruitflyChoice ? { fruitfly: { chosenFamily: fruitflyChoice.action, confidence: fruitflyChoice.confidence,
       updatesBefore: fruitflyChoice.updates, ...(fruitflyLearning || {}) } } : {}),
     skills: decision.skillIds || skillsForAction(decision.action),

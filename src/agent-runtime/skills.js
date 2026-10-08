@@ -4,7 +4,7 @@ export const WORLD_SKILLS = Object.freeze({
   community: Object.freeze({ name: 'Community', focus: 'Build familiarity through nearby social activity.', actions: ['socialize'] }),
   building: Object.freeze({ name: 'Building', focus: 'Create useful shared places when capacity and needs allow.', actions: ['build_scene'] }),
   contribution: Object.freeze({ name: 'Contribution', focus: 'Contribute work to the active shared mine.', actions: ['work'] }),
-  markets: Object.freeze({ name: 'Markets', focus: 'Review paper markets and manage bounded simulated portfolios.', actions: ['trade_crypto', 'trade_meme', 'trade_hold'] })
+  markets: Object.freeze({ name: 'Market research', focus: 'Study service demand and share useful market observations.', actions: ['business_market_observe', 'business_skill_practice'] })
 });
 
 const ARCHETYPE_PRIORITIES = Object.freeze({

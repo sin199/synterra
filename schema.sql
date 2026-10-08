@@ -204,20 +204,10 @@ CREATE TABLE IF NOT EXISTS crypto_risk_limits (
   spread_bps integer NOT NULL DEFAULT 5 CHECK (spread_bps BETWEEN 0 AND 1000)
 );
 
-INSERT INTO crypto_risk_limits(world_id)
-SELECT id FROM worlds ON CONFLICT(world_id) DO NOTHING;
-INSERT INTO crypto_balances(world_id,agent_id,asset_symbol,balance)
-SELECT world_id,agent_id,'USDC',10000 FROM world_members
-ON CONFLICT(world_id,agent_id,asset_symbol) DO NOTHING;
-INSERT INTO crypto_ledger(world_id,agent_id,asset_symbol,amount,entry_type,reference_id,reason)
-SELECT world_id,agent_id,'USDC',10000,'seed','seed:v1','initial simulated trading balance'
-FROM crypto_balances WHERE asset_symbol='USDC'
-ON CONFLICT(world_id,agent_id,asset_symbol,reference_id) DO NOTHING;
-
 CREATE INDEX IF NOT EXISTS crypto_trades_world_recent_idx ON crypto_trades(world_id,created_at DESC);
 CREATE INDEX IF NOT EXISTS crypto_ledger_balance_idx ON crypto_ledger(world_id,agent_id,asset_symbol,created_at DESC);
 
--- Read-only Robinhood Chain Pons V2 market observations and internal paper trades.
+-- Legacy Robinhood Chain Pons V2 observations and paper-trade history, retained as records.
 CREATE TABLE IF NOT EXISTS robinhood_market_state (
   id integer PRIMARY KEY CHECK (id = 1),
   chain_id integer NOT NULL CHECK (chain_id = 4663),
@@ -1016,8 +1006,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS world_scenes_project_place_unique_idx
 CREATE UNIQUE INDEX IF NOT EXISTS world_projects_opportunity_unique_idx
   ON world_projects(world_id,opportunity_id) WHERE opportunity_id IS NOT NULL;
 
--- V4 simulated economy. USDC/BTC/ETH assets below remain simulated; internal
--- mining units stay in token_ledger and are intentionally not exchangeable.
+-- Internal resident and organization economy. Mining units stay in token_ledger
+-- and are intentionally not exchangeable for USDC.
 CREATE TABLE IF NOT EXISTS world_economic_accounts (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   world_id uuid NOT NULL REFERENCES worlds(id) ON DELETE CASCADE,
@@ -1993,34 +1983,6 @@ CREATE CONSTRAINT TRIGGER world_economic_posting_balance_check
   AFTER INSERT OR UPDATE OR DELETE ON world_economic_postings DEFERRABLE INITIALLY DEFERRED
   FOR EACH ROW EXECUTE FUNCTION verify_world_economic_transaction_balance();
 
--- Idempotently import current simulated portfolios as opening balances. The
--- resident balances are not changed; old crypto_ledger rows remain history.
-INSERT INTO world_economic_accounts(world_id,account_type,account_key,owner_id,asset_symbol,balance)
-SELECT world_id,'resident',agent_id::text,agent_id,asset_symbol,balance
-FROM crypto_balances ON CONFLICT(world_id,account_key,asset_symbol) DO NOTHING;
-INSERT INTO world_economic_accounts(world_id,account_type,account_key,asset_symbol)
-SELECT DISTINCT world_id,'system','system:opening:'||asset_symbol,asset_symbol FROM crypto_balances
-ON CONFLICT(world_id,account_key,asset_symbol) DO NOTHING;
-INSERT INTO world_economic_transactions(world_id,action_id,transaction_type,source_account_id,destination_account_id,
-    asset_symbol,amount,reason,world_time,reference_id)
-SELECT resident.world_id,'legacy-opening:'||resident.owner_id::text||':'||resident.asset_symbol,'opening_balance',
-    system.id,resident.id,resident.asset_symbol,resident.balance,
-    'Preserved pre-V4 simulated portfolio as an opening balance.',0,resident.owner_id::text
-FROM world_economic_accounts resident
-JOIN world_economic_accounts system ON system.world_id=resident.world_id
-  AND system.account_key='system:opening:'||resident.asset_symbol AND system.asset_symbol=resident.asset_symbol
-WHERE resident.account_type='resident' AND resident.balance>0
-ON CONFLICT(world_id,action_id) DO NOTHING;
-INSERT INTO world_economic_postings(transaction_id,account_id,amount)
-SELECT tx.id,tx.destination_account_id,tx.amount
-FROM world_economic_transactions tx
-WHERE tx.transaction_type='opening_balance'
-ON CONFLICT(transaction_id,account_id) DO NOTHING;
-INSERT INTO world_economic_postings(transaction_id,account_id,amount)
-SELECT tx.id,tx.source_account_id,-tx.amount
-FROM world_economic_transactions tx
-WHERE tx.transaction_type='opening_balance'
-ON CONFLICT(transaction_id,account_id) DO NOTHING;
 UPDATE world_economic_accounts account SET balance=COALESCE(posted.total,0),updated_at=now()
 FROM (SELECT posting.account_id,sum(posting.amount) AS total FROM world_economic_postings posting GROUP BY posting.account_id) posted
 WHERE account.id=posted.account_id AND account.account_type='system';

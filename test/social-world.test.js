@@ -5,7 +5,7 @@ import {
   DECISION_MIX, SOCIAL_COOLDOWN_WORLD_MINUTES, addSkillGain, canCooperatePair, canSocializePair,
   chooseMixedCandidate, clampPersonality, clampRelationship, clampSkill, deriveDominantRole,
   effectivePersonality, goalActionUtility, goalProgress, initialSkillValues, initialSocialProfile,
-  lastRealizedSalePnl, memoryForCompletedAction, mixedDecisionDistribution, qualifyUtilityCandidates, recentMemoryUtility,
+  memoryForCompletedAction, mixedDecisionDistribution, qualifyUtilityCandidates, recentMemoryUtility,
   qualifyLayeredStrategicCandidates, fruitflyFamily, reflectionDue, reflectionProposal, seededGoalSet,
   skillGainForAction, socialCooldownReady, updateRelationship
 } from '../src/social-world.js';
@@ -23,7 +23,7 @@ function agent(overrides = {}) {
   return { agentId: 'resident-01', status: 'idle', goal: 'balanced', primaryGoal: 'BALANCED_LIFE', riskTolerance: 0.8,
     sociability: 0.5, curiosity: 0.5, discipline: 0.5, ambition: 0.5,
     energy: 80, food: 80, social: 70, happiness: 60, knowledge: 20, internalUnits: '0', usdc: '10000',
-    btc: '0', eth: '0', skills: { trading: 10, research: 10, engineering: 10, social: 10 }, relationships: [],
+    skills: { trading: 10, research: 10, engineering: 10, social: 10 }, relationships: [],
     recentMemories: [], ...overrides };
 }
 
@@ -52,7 +52,7 @@ test('all social state clamps handle malformed and out-of-range values', () => {
 
 test('skills grow only for mapped completed actions and growth per action is small', () => {
   assert.deepEqual(skillGainForAction('work', 'Data Center'), { engineering: 0.35, research: 0.2 });
-  assert.deepEqual(skillGainForAction('trade', 'Exchange'), { trading: 0.45 });
+  assert.deepEqual(skillGainForAction('trade', 'Exchange'), {});
   assert.deepEqual(skillGainForAction('socialize', 'Cafe', false), {});
   assert.deepEqual(skillGainForAction('socialize', 'Cafe', true), { social: 0.5 });
   assert.equal(addSkillGain(20, 0.5), 20.5);
@@ -63,24 +63,11 @@ test('memories describe only completed actions with observed results', () => {
   const work = memoryForCompletedAction({ action: 'work', place: 'Workshop', result: { income: { amount: '63.00000000' } } });
   assert.match(work.summary, /earned 63\.00000000 simulated USDC/);
   assert.equal(work.memoryType, 'work');
-  const trade = memoryForCompletedAction({ action: 'trade', place: 'Exchange', result: { trade: {
+  assert.equal(memoryForCompletedAction({ action: 'trade', place: 'Exchange', result: { trade: {
     side: 'sell', asset: 'BTC', notionalUsd: '49', priceUsd: '60000', feeUsdc: '0.05', realizedPnlUsd: -3
-  } } });
-  assert.equal(trade.memoryType, 'failure');
-  assert.equal(trade.importance, 0.76);
-  assert.equal(memoryForCompletedAction({ action: 'trade', place: 'Exchange', result: { abandoned: 'quote_missing' } }), null);
+  } } }), null, 'legacy trade outcomes are no longer interpreted as resident actions');
   assert.equal(memoryForCompletedAction({ action: 'socialize', place: 'Cafe', result: {} }), null);
   assert.equal(memoryForCompletedAction({ action: 'work', place: 'Workshop', result: {} }), null);
-});
-
-test('average-cost realized sale PnL uses simulated fills and fees', () => {
-  const pnl = lastRealizedSalePnl([
-    { side: 'buy', quantity: '2', notionalUsd: '200', feeUsdc: '1' },
-    { side: 'buy', quantity: '2', notionalUsd: '240', feeUsdc: '1' },
-    { side: 'sell', quantity: '1', notionalUsd: '125', feeUsdc: '1' }
-  ]);
-  assert.equal(pnl, 13.5);
-  assert.equal(lastRealizedSalePnl([]), null);
 });
 
 test('relationships are symmetric single-pair values with bounded deltas', () => {
@@ -155,15 +142,11 @@ test('sociability and relationship familiarity alter social Utility', () => {
     .some((candidate) => candidate.action === 'socialize'), false);
 });
 
-test('recent simulated trading loss reduces Exchange utility temporarily', () => {
-  const context = { tick: 11, worldMinutes: 1_000, nowMs: Date.now(),
-    quotes: [{ symbol: 'BTC', priceUsd: '64000' }, { symbol: 'ETH', priceUsd: '3200' }], previousQuotes: {} };
-  const trader = agent({ agentId: 'trader', goal: 'wealth', primaryGoal: 'MASTER_TRADING', lastTradeAt: null });
-  const before = buildActivityCandidates(trader, scenes, context).find((candidate) => candidate.action === 'trade');
-  const after = buildActivityCandidates({ ...trader, recentMemories: [{ memoryType: 'failure', worldMinutes: 900,
-    metadata: { asset: 'BTC', realizedPnlUsd: -40 } }] }, scenes, context).find((candidate) => candidate.action === 'trade');
-  assert.ok(before);
-  assert.ok(after.score < before.score);
+test('market-research goals favor learning and service research, not simulated trades', () => {
+  const researchGoal = [{ category: 'MASTER_TRADING', priority: 1, goalType: 'primary', status: 'active' }];
+  assert.ok(goalActionUtility({ action: 'business_market_observe' }, researchGoal) > 0);
+  assert.ok(goalActionUtility({ action: 'learn' }, researchGoal) > 0);
+  assert.equal(goalActionUtility({ action: 'trade' }, researchGoal), 0);
   assert.equal(recentMemoryUtility({ recentMemories: [{ memoryType: 'failure', worldMinutes: 200,
     metadata: { asset: 'BTC', realizedPnlUsd: -40 } }] }, 'trade', 1_000), 0);
   const learningMemory = [{ memoryType: 'learning', worldMinutes: 1_000, metadata: { action: 'learn' } }];
@@ -176,15 +159,15 @@ test('personal history changes Utility eligibility instead of weighting Fruitfly
     { id: 'work', action: 'work', score: 100 },
     { id: 'learn', action: 'learn', score: 90 },
     { id: 'socialize', action: 'socialize', score: 80 },
-    { id: 'trade', action: 'trade', score: 78 },
+    { id: 'research', action: 'business_market_observe', score: 78 },
     { id: 'rest', action: 'rest', score: 70 }
   ];
-  const afterLoss = historyEvidence.map((candidate) => candidate.id === 'trade'
+  const afterLoss = historyEvidence.map((candidate) => candidate.id === 'research'
     ? { ...candidate, score: 50 } : candidate);
   const beforeEligible = qualifyUtilityCandidates(historyEvidence);
   const afterEligible = qualifyUtilityCandidates(afterLoss);
-  assert.ok(beforeEligible.some((candidate) => candidate.id === 'trade'));
-  assert.ok(!afterEligible.some((candidate) => candidate.id === 'trade'));
+  assert.ok(beforeEligible.some((candidate) => candidate.id === 'research'));
+  assert.ok(!afterEligible.some((candidate) => candidate.id === 'research'));
 });
 
 test('strategic Top-K reserves distinct Fruitfly families so repeated production cannot crowd out hiring', () => {
@@ -220,12 +203,13 @@ test('high-effort actions lose eligibility when needs are critically low', () =>
 test('history Utility and Fruitfly probabilities mix without removing feasible action families', () => {
   const candidates = [
     { action: 'work', id: 'work', score: 100 }, { action: 'learn', id: 'learn', score: 80 },
-    { action: 'socialize', id: 'social', score: -100 }, { action: 'trade', id: 'trade-buy', score: 60 },
-    { action: 'trade', id: 'trade-sell', score: 55 }, { action: 'eat', id: 'eat', score: 10 }
+    { action: 'socialize', id: 'social', score: -100 }, { action: 'business_market_observe', id: 'market', score: 60 },
+    { action: 'business_skill_practice', id: 'practice', score: 55 }, { action: 'eat', id: 'eat', score: 10 }
   ];
-  const fruitfly = { work: 0.25, travel: 0.25, socialize: 0.1, trade_crypto: 0.2, eat: 0.2 };
+  const fruitfly = { work: 0.25, travel: 0.25, socialize: 0.1, business_learn: 0.2, eat: 0.2 };
   const distribution = mixedDecisionDistribution(candidates, fruitfly);
-  assert.deepEqual(distribution.families.map((candidate) => candidate.action).sort(), ['eat', 'learn', 'socialize', 'trade', 'work']);
+  assert.deepEqual(distribution.families.map((candidate) => candidate.action).sort(),
+    ['business_market_observe', 'eat', 'learn', 'socialize', 'work']);
   assert.equal(Object.keys(distribution.probabilities).length, 5);
   assert.ok(Math.abs(Object.values(distribution.probabilities).reduce((sum, value) => sum + value, 0) - 1) < 1e-12);
   assert.ok(Object.values(distribution.probabilities).every((probability) => probability > 0));
@@ -244,17 +228,17 @@ test('goals and reflections use experience, create next steps and keep personali
   const proposal = reflectionProposal({
     profile: { riskModifier: 0, personalityModifiers: { sociability: 0, curiosity: 0, discipline: 0, ambition: 0 } },
     memories: [
-      { memoryType: 'failure', metadata: { realizedPnlUsd: -25 } },
-      { memoryType: 'failure', metadata: { realizedPnlUsd: -12 } },
-      { memoryType: 'failure', metadata: { realizedPnlUsd: -8 } }
+      { memoryType: 'failure', metadata: { reason: 'incomplete_work' } },
+      { memoryType: 'failure', metadata: { reason: 'missed_goal' } },
+      { memoryType: 'failure', metadata: { reason: 'low_need' } }
     ],
     skills: { research: 52, engineering: 15 }, needs: { energy: 80, food: 80, social: 70 }, worldMinutes: 700
   });
-  assert.equal(proposal.nextGoal.category, 'RECOVER_FINANCIAL_STABILITY');
-  assert.equal(proposal.riskModifier, -0.01);
-  assert.equal(proposal.modifiers.discipline, 0.01);
+  assert.equal(proposal.nextGoal.category, 'DEVELOP_RESEARCH');
+  assert.equal(proposal.riskModifier, 0);
+  assert.equal(proposal.modifiers.discipline, 0);
   const capped = reflectionProposal({ profile: { riskModifier: -0.15, personalityModifiers: { sociability: 0.15 } },
-    memories: [{ memoryType: 'social' }, { memoryType: 'social' }, { memoryType: 'failure', metadata: { realizedPnlUsd: -1 } }],
+    memories: [{ memoryType: 'social' }, { memoryType: 'social' }, { memoryType: 'failure', metadata: { reason: 'low_need' } }],
     skills: {}, needs: {}, worldMinutes: 800 });
   assert.equal(capped.modifiers.sociability, 0.15);
   assert.equal(capped.riskModifier, -0.15);

@@ -5,8 +5,8 @@ import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Pool } from 'pg';
-import { ensureCryptoAccount } from '../src/crypto-trading.js';
 import { getEconomicAccount } from '../src/economic-ledger.js';
+import { fundTestResidents } from './helpers/economic-fixtures.js';
 import { applyToWorldBusinessJob, completeWorldBusinessShift, decideWorldBusinessApplication,
   closeWorldBusiness, foundWorldBusiness, purchaseWorldBusinessService } from '../src/world-businesses.js';
 import { startWorldEngine } from '../src/world-engine.js';
@@ -63,11 +63,7 @@ test('V5 agreements negotiate, execute against V4 ledger, affect cognition, gove
       [worldId, founderId]);
     await pool.query(`INSERT INTO world_members(world_id,agent_id,location,energy,food,social)
       SELECT $1,id,'Workshop',90,90,90 FROM agents WHERE id=ANY($2::uuid[])`, [worldId, residents]);
-    await pool.query(`INSERT INTO crypto_risk_limits(world_id,starting_usdc) VALUES($1,10000)
-      ON CONFLICT(world_id) DO NOTHING`, [worldId]);
-    await inTransaction(pool, async (client) => {
-      for (const agentId of residents) await ensureCryptoAccount(client, { worldId, agentId });
-    });
+    await inTransaction(pool, (client) => fundTestResidents(client, { worldId, agentIds: residents }));
     await pool.query(`INSERT INTO world_agent_skills(world_id,agent_id,skill_name,skill_value,actions_completed)
       VALUES($1,$2,'research',50,5),($1,$3,'research',50,5)`, [worldId, founderId, workerId]);
     const [leftId, rightId] = [founderId, workerId].sort();

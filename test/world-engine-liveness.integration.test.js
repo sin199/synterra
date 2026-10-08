@@ -37,7 +37,6 @@ test('tick failures remain visible and the scheduled engine commits a later tick
       VALUES($1,$2,'Garden',100,100,100),($1,$3,'Garden',100,100,100)`, [worldId, ...agentIds]);
     await pool.query(`INSERT INTO world_runtime_state(world_id,tick_count,world_minutes,last_tick_at,typesafe_next_at)
       VALUES($1,0,480,now()-interval '8 hours',now()-interval '1 second')`, [worldId]);
-    await pool.query(`INSERT INTO crypto_risk_limits(world_id) VALUES($1) ON CONFLICT DO NOTHING`, [worldId]);
     await pool.query(`CREATE OR REPLACE FUNCTION synterra_v61_fail_tick_fixture() RETURNS trigger AS $$
       BEGIN
         IF NEW.world_id::text = TG_ARGV[0] AND NEW.tick_count > OLD.tick_count THEN

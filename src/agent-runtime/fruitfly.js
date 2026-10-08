@@ -9,8 +9,11 @@ export const FRUITFLY_POLICY_VERSION = 'synterra-fruitfly-candidate-policy-v3';
 
 // One stable action family per output neuron. The mapping is an experimental
 // software convention, not a claim about the fly's biological action semantics.
-const ACTIONS = ['eat', 'rest', 'socialize', 'work', 'cooperate', 'travel', 'trade_crypto', 'trade_hold',
-  'business', 'invest', 'job', 'business_learn'];
+const ACTION_NEURONS = Object.freeze([
+  ['eat', 0], ['rest', 1], ['socialize', 2], ['work', 3], ['cooperate', 4], ['travel', 5],
+  ['business', 8], ['invest', 9], ['job', 10], ['business_learn', 11]
+]);
+const ACTIONS = ACTION_NEURONS.map(([action]) => action);
 const SENSORS = [
   ['synterra:state:food:low', 'synterra:state:food:high'],
   ['synterra:state:energy:low', 'synterra:state:energy:high'],
@@ -36,8 +39,9 @@ function nextRandom(model) {
 }
 function outputMap(brain) {
   const mbon = brain.sets.mbon || [];
-  if (mbon.length < ACTIONS.length) throw new Error('Fruitfly connectome has too few MBON outputs.');
-  return Object.fromEntries(ACTIONS.map((action, index) => [action, mbon[index]]));
+  const requiredOutputs = Math.max(...ACTION_NEURONS.map(([, index]) => index)) + 1;
+  if (mbon.length < requiredOutputs) throw new Error('Fruitfly connectome has too few MBON outputs.');
+  return Object.fromEntries(ACTION_NEURONS.map(([action, index]) => [action, mbon[index]]));
 }
 function validCheckpoint(saved, learner) {
   return saved?.version === 1 && Array.isArray(saved.edges) && Array.isArray(saved.efficacies)

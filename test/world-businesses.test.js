@@ -416,7 +416,7 @@ test('business hiring and service candidates require funded payroll and reflect 
   assert.equal(fruitflyFamily(buyer), 'travel');
   assert.equal(fruitflyFamily({ action: 'business_service', serviceType: 'engineering_service' }), 'work');
   assert.equal(fruitflyFamily({ action: 'business_service', serviceType: 'social_service' }), 'socialize');
-  assert.equal(fruitflyFamily({ action: 'business_service', serviceType: 'trading_service' }), 'trade_crypto');
+  assert.equal(fruitflyFamily({ action: 'business_service', serviceType: 'trading_service' }), 'business');
 
   const foodBuyer = { ...resident, agentId: 'resident-worker', usdc: '10000', energy: 80, food: 20,
     social: 80, knowledge: 80, location: 'Exchange', primaryGoal: 'CARE_FOR_NEEDS',

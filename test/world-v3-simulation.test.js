@@ -101,11 +101,6 @@ test(`isolated Fruitfly world simulation runs 10 seeded scenarios for ${hours} w
         VALUES($1,$2,$3,$4::jsonb,$5)`,
       [worldId, agentId, mind.archetype, JSON.stringify(mind.traits), mind.currentGoal]);
     }
-    await pool.query(`INSERT INTO crypto_market_quotes(symbol,price_usd,quote_version,as_of,source) VALUES
-      ('USDC',1,1,$1,'synterra_simulated_market'),('BTC',65000,1,$1,'synterra_simulated_market'),
-      ('ETH',2500,1,$1,'synterra_simulated_market')
-      ON CONFLICT(symbol) DO UPDATE SET price_usd=EXCLUDED.price_usd,quote_version=EXCLUDED.quote_version,
-        as_of=EXCLUDED.as_of,source=EXCLUDED.source`, [new Date(baseMs)]);
     await pool.query(`INSERT INTO world_runtime_state(world_id,tick_count,world_minutes,last_tick_at,typesafe_next_at)
       VALUES($1,0,0,$2,$3)`, [worldId, new Date(baseMs - stepSeconds * 1_000), new Date(baseMs + 24 * 60 * 60 * 1_000)]);
 

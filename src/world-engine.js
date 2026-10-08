@@ -1,11 +1,9 @@
 import { createHash } from 'node:crypto';
 import { chargeMeal, MEAL_COST_UNITS, canAffordUnits } from './economy.js';
-import { formatUnits, multiplyUnits, parsePositiveUnits, parseSignedUnits } from './crypto-market.js';
-import { ensureCryptoAccount, executeCryptoTrade } from './crypto-trading.js';
 import {
   DECISION_MIX, SOCIAL_COOLDOWN_WORLD_MINUTES, SOCIAL_SKILLS, addSkillGain, canCooperatePair, canSocializePair,
   chooseSocialPartner, clampPersonality, canonicalPair, clampSkill, deriveDominantRole, effectivePersonality,
-  goalActionUtility, goalDescription, goalProgress, initialSkillValues, initialSocialProfile, lastRealizedSalePnl,
+  goalActionUtility, goalDescription, goalProgress, initialSkillValues, initialSocialProfile,
   qualifyUtilityCandidates, qualifyLayeredStrategicCandidates,
   memoryForCompletedAction, recentMemoryUtility, reflectionDue, reflectionProposal, seededGoalSet,
   skillGainForAction
@@ -46,6 +44,7 @@ import { activityDurationSeconds, activityNeedEffects, activityVariant, applyEnv
   travelSeconds, worldEnvironment } from './world-environment.js';
 import { writeWorldHistory } from './world-domain.js';
 import { advanceWorldCurrencyGenesis, ensureWorldCurrencyGenesisRequirement } from './world-token-issuance.js';
+import { ensureResidentEconomicAccounts } from './economic-ledger.js';
 
 export const WORLD_TICK_MS = 1_000;
 const TYPE_SAFE_INTERVAL_MS = 30 * 60_000;
@@ -54,7 +53,7 @@ const CIVILIZATION_REASONING_BUDGET_MS = 15_000;
 const WORLD_DB_STATEMENT_TIMEOUT_MS = 30_000;
 const MAX_CATCH_UP_SECONDS = 30;
 const INSTITUTIONAL_RETRY_WORLD_MINUTES = 60;
-const ACTION_SECONDS = Object.freeze({ work: 16, cooperate: 16, learn: 11, rest: 9, eat: 8, socialize: 12, trade: 7,
+const ACTION_SECONDS = Object.freeze({ work: 16, cooperate: 16, learn: 11, rest: 9, eat: 8, socialize: 12,
   opportunity: 12, opportunity_reject: 8, opportunity_propose: 10, project_propose: 12, project_join: 10, project_reject: 8, project_contribute: 16,
   project_leave: 8, organization_found: 14, organization_join: 10, organization_reject: 8,
   organization_leave: 8, organization_invite: 10, organization_contribute: 12, information_share: 10,
@@ -121,21 +120,13 @@ export function movementProgress(startedAt, endsAt, now = Date.now()) {
   return clamp((now - start) / (end - start), 0, 1);
 }
 
-function priceTrend(asset, quotes, previous) {
-  const quote = quotes.find((item) => item.symbol === asset);
-  const before = finite(previous?.[asset]);
-  const current = finite(quote?.priceUsd);
-  return before > 0 && current > 0 ? (current - before) / before : 0;
-}
-
 function sceneOptions(scenes, types) {
   return scenes.filter((scene) => scene.status === 'active' && types.includes(scene.sceneType));
 }
 
-function candidate({ id, action, place, goal, description = goal, score, plannedPaidMeal = false, side, asset, quoteUnits,
+function candidate({ id, action, place, goal, description = goal, score, plannedPaidMeal = false,
   socialPartnerId = null, socialPartnerName = null }) {
-  return { id, action, targetLocation: place, goal, description, score, plannedPaidMeal, side: side || null,
-    asset: asset || null, quoteUnits: quoteUnits || null, socialPartnerId, socialPartnerName };
+  return { id, action, targetLocation: place, goal, description, score, plannedPaidMeal, socialPartnerId, socialPartnerName };
 }
 
 export function buildActivityCandidates(agent, scenes, context = {}) {
@@ -149,15 +140,6 @@ export function buildActivityCandidates(agent, scenes, context = {}) {
   const skills = Object.fromEntries(SOCIAL_SKILLS.map((skill) => [skill, clampSkill(agent.skills?.[skill])]));
   const units = String(agent.internalUnits ?? '0');
   const cash = finite(agent.usdc);
-  const btc = finite(agent.btc), eth = finite(agent.eth);
-  const btcQuote = finite(context.quotes?.find((item) => item.symbol === 'BTC')?.priceUsd);
-  const ethQuote = finite(context.quotes?.find((item) => item.symbol === 'ETH')?.priceUsd);
-  const nav = cash + btc * btcQuote + eth * ethQuote;
-  const recentTradeMs = agent.lastTradeAt ? finite(context.nowMs, Date.now()) - new Date(agent.lastTradeAt).getTime() : Infinity;
-  const canTrade = energy >= 20 && food >= 10 && finite(agent.riskTolerance) >= 0.65
-    && (['wealth','balanced'].includes(goal) || ['BUILD_WEALTH','MASTER_TRADING','RECOVER_FINANCIAL_STABILITY'].includes(primaryGoal))
-    && recentTradeMs >= 180_000 && cash >= 75 && nav > 0;
-
   const workshops = sceneOptions(scenes, ['workshop', 'studio']);
   const dataCenters = sceneOptions(scenes, ['data_center']);
   const libraries = sceneOptions(scenes, ['library']);
@@ -243,30 +225,6 @@ export function buildActivityCandidates(agent, scenes, context = {}) {
       score: 34 + personality.sociability * 8 + personality.discipline * 5 + skills.engineering * 0.1
         + Math.min(12, Number(relation.familiarity || 0) * 0.08 + Number(relation.trust || 0) * 0.35)
         + mentorship + recentMemoryUtility(agent, 'cooperate', context.worldMinutes) }));
-  }
-
-  if (canTrade) {
-    const risk = finite(agent.riskTolerance);
-    for (const [asset, balance, price] of [['BTC', btc, btcQuote], ['ETH', eth, ethQuote]]) {
-      if (!(price > 0)) continue;
-      const holdingValue = balance * price;
-      const momentum = priceTrend(asset, context.quotes || [], context.previousQuotes || {});
-      const buyAllowed = cash >= 75 && holdingValue + 50 <= nav * 0.5 && momentum >= -0.008;
-      if (buyAllowed) options.push(candidate({ id: `trade:buy:${asset}`, action: 'trade', place: 'Exchange', side: 'buy', asset,
-        quoteUnits: '50.00000000', goal: `Review the simulated ${asset} market at Exchange and buy a bounded amount if risk remains acceptable.`,
-        score: 34 + risk * 28 + (goal === 'wealth' ? 12 : 0) + Math.max(-5, Math.min(7, momentum * 1000))
-          + skills.trading * 0.14 + personality.ambition * 6
-          + (primaryGoal === 'BUILD_WEALTH' ? 15 : 0) + (primaryGoal === 'MASTER_TRADING' ? 24 : 0)
-          + recentMemoryUtility(agent, 'trade', context.worldMinutes) }));
-      if (holdingValue >= 20 && momentum < 0.002) {
-        const notional = Math.min(holdingValue * 0.1, nav * 0.1, 50);
-        if (notional >= 10) options.push(candidate({ id: `trade:sell:${asset}`, action: 'trade', place: 'Exchange', side: 'sell', asset,
-          quoteUnits: notional.toFixed(8), goal: `Trim a small ${asset} position at Exchange while keeping the order within risk limits.`,
-          score: 30 + risk * 20 + Math.max(-3, Math.min(12, -momentum * 1000))
-            + skills.trading * 0.14 + (primaryGoal === 'MASTER_TRADING' ? 18 : 0)
-            + recentMemoryUtility(agent, 'trade', context.worldMinutes) }));
-      }
-    }
   }
 
   if (context.environment) {
@@ -605,11 +563,14 @@ async function refreshSocialProfile(client, worldId, agentId, worldMinutes, sour
         r.interaction_count AS "interactionCount" FROM world_relationships r
       JOIN agents other ON other.id=CASE WHEN r.agent_a_id=$2 THEN r.agent_b_id ELSE r.agent_a_id END
       WHERE r.world_id=$1 AND (r.agent_a_id=$2 OR r.agent_b_id=$2)`, [worldId, agentId]);
-  const wealthResult = await client.query(`SELECT COALESCE(sum(b.balance * CASE WHEN b.asset_symbol='USDC' THEN 1 ELSE q.price_usd END),0)::text AS value
-      FROM crypto_balances b LEFT JOIN crypto_market_quotes q ON q.symbol=b.asset_symbol
-      WHERE b.world_id=$1 AND b.agent_id=$2 AND b.asset_symbol IN ('USDC','BTC','ETH')`, [worldId, agentId]);
-  const incomeResult = await client.query(`SELECT COALESCE(sum(amount),0)::text AS value FROM crypto_ledger
-      WHERE world_id=$1 AND agent_id=$2 AND asset_symbol='USDC' AND entry_type='work_income'`, [worldId, agentId]);
+  const wealthResult = await client.query(`SELECT COALESCE(sum(balance),0)::text AS value
+      FROM world_economic_accounts WHERE world_id=$1 AND account_type='resident' AND account_key=$2 AND asset_symbol='USDC'`,
+  [worldId, agentId]);
+  const incomeResult = await client.query(`SELECT COALESCE(sum(posting.amount),0)::text AS value
+    FROM world_economic_accounts account JOIN world_economic_postings posting ON posting.account_id=account.id
+    JOIN world_economic_transactions tx ON tx.id=posting.transaction_id
+    WHERE tx.world_id=$1 AND account.account_type='resident' AND account.account_key=$2
+      AND account.asset_symbol='USDC' AND posting.amount>0`, [worldId, agentId]);
   const actionResult = await client.query(`SELECT actions_taken FROM agent_minds WHERE world_id=$1 AND agent_id=$2`, [worldId, agentId]);
   const needResult = await client.query(`SELECT energy,food,social FROM world_members WHERE world_id=$1 AND agent_id=$2`, [worldId, agentId]);
   const recentActionResult = await client.query(`SELECT memory_type,metadata FROM agent_memories
@@ -667,11 +628,14 @@ async function reflectResident(client, worldId, agent, tickCount, worldMinutes, 
       r.interaction_count AS "interactionCount"
     FROM world_relationships r JOIN agents other ON other.id=CASE WHEN r.agent_a_id=$2 THEN r.agent_b_id ELSE r.agent_a_id END
     WHERE r.world_id=$1 AND (r.agent_a_id=$2 OR r.agent_b_id=$2)`, [worldId, agent.agentId]);
-  const wealthResult = await client.query(`SELECT COALESCE(sum(b.balance * CASE WHEN b.asset_symbol='USDC' THEN 1 ELSE q.price_usd END),0)::text AS value
-    FROM crypto_balances b LEFT JOIN crypto_market_quotes q ON q.symbol=b.asset_symbol
-    WHERE b.world_id=$1 AND b.agent_id=$2 AND b.asset_symbol IN ('USDC','BTC','ETH')`, [worldId, agent.agentId]);
-  const incomeResult = await client.query(`SELECT COALESCE(sum(amount),0)::text AS value FROM crypto_ledger
-    WHERE world_id=$1 AND agent_id=$2 AND asset_symbol='USDC' AND entry_type='work_income'`, [worldId, agent.agentId]);
+  const wealthResult = await client.query(`SELECT COALESCE(sum(balance),0)::text AS value
+    FROM world_economic_accounts WHERE world_id=$1 AND account_type='resident' AND account_key=$2 AND asset_symbol='USDC'`,
+  [worldId, agent.agentId]);
+  const incomeResult = await client.query(`SELECT COALESCE(sum(posting.amount),0)::text AS value
+    FROM world_economic_accounts account JOIN world_economic_postings posting ON posting.account_id=account.id
+    JOIN world_economic_transactions tx ON tx.id=posting.transaction_id
+    WHERE tx.world_id=$1 AND account.account_type='resident' AND account.account_key=$2
+      AND account.asset_symbol='USDC' AND posting.amount>0`, [worldId, agent.agentId]);
   const goalResult = await client.query(`SELECT id,goal_type AS "goalType",category,description,priority::text AS priority,
       progress::text AS progress,status,source,metadata,updated_world_minutes AS "updatedWorldMinutes" FROM world_agent_goals
     WHERE world_id=$1 AND agent_id=$2 AND status='active' ORDER BY CASE goal_type WHEN 'primary' THEN 0 WHEN 'secondary' THEN 1 ELSE 2 END,
@@ -701,7 +665,7 @@ async function reflectResident(client, worldId, agent, tickCount, worldMinutes, 
 
   const outcomes = new Map();
   for (const memory of newMemories) {
-    const action = memory.metadata?.action || ({ work: 'work', learning: 'learn', trade: 'trade', failure: 'trade',
+    const action = memory.metadata?.action || ({ work: 'work', learning: 'learn',
       social: 'socialize', cooperation: 'cooperate' })[memory.memoryType];
     const outcome = Number(memory.metadata?.outcome);
     if (!action || !Number.isFinite(outcome)) continue;
@@ -862,21 +826,6 @@ async function setMindGoal(client, worldId, agentId, goal, action, summary) {
       memories=EXCLUDED.memories,actions_taken=agent_minds.actions_taken+$7,updated_at=now()`,
   [worldId, agentId, row?.archetype || 'observer', JSON.stringify(row?.traits || { curiosity: 0.6, sociability: 0.5, craft: 0.5 }),
     String(goal).slice(0, 160), JSON.stringify(memories.slice(-24)), summary ? 1 : 0]);
-}
-
-async function adjustUsdc(client, worldId, agentId, amount, type, referenceId, reason) {
-  const currentResult = await client.query(`SELECT balance::text AS balance FROM crypto_balances
-    WHERE world_id=$1 AND agent_id=$2 AND asset_symbol='USDC' FOR UPDATE`, [worldId, agentId]);
-  const before = parsePositiveUnits(currentResult.rows[0]?.balance || '0', { allowZero: true });
-  const after = before + parseSignedUnits(amount);
-  if (after < 0n) throw Object.assign(new Error('SIMULATED_USDC_BALANCE_TOO_LOW'), { statusCode: 409 });
-  await client.query(`INSERT INTO crypto_balances(world_id,agent_id,asset_symbol,balance)
-    VALUES($1,$2,'USDC',$3) ON CONFLICT(world_id,agent_id,asset_symbol)
-    DO UPDATE SET balance=EXCLUDED.balance,updated_at=now()`, [worldId, agentId, formatUnits(after)]);
-  await client.query(`INSERT INTO crypto_ledger(world_id,agent_id,asset_symbol,amount,entry_type,reference_id,reason)
-    VALUES($1,$2,'USDC',$3,$4,$5,$6) ON CONFLICT(world_id,agent_id,asset_symbol,reference_id) DO NOTHING`,
-  [worldId, agentId, amount, type, referenceId, reason]);
-  return formatUnits(after);
 }
 
 function incrementStat(value, delta) { return Math.trunc(clamp(finite(value) + delta)); }
@@ -1274,7 +1223,7 @@ async function recordEconomicBelief(client, { worldId, agentId, businessId, worl
   }
 }
 
-async function completeActivity(client, worldId, agent, runtime, quotes, now, scene, onAutonomousBusinessAction = null,
+async function completeActivity(client, worldId, agent, runtime, now, scene, onAutonomousBusinessAction = null,
   environment = null) {
   const activity = agent.planned_action;
   const place = agent.location;
@@ -1361,28 +1310,6 @@ async function completeActivity(client, worldId, agent, runtime, quotes, now, sc
     if (socialInteraction) result.socialInteraction = socialInteraction;
     needs = { energy: -2, food: -1, social: socialInteraction ? 20 : 0,
       happiness: socialInteraction ? 6 : 0, knowledge: socialInteraction ? 1 : 0 };
-  } else if (activity === 'trade') {
-    const quote = quotes.find((item) => item.symbol === agent.planned_asset);
-    if (place !== 'Exchange' || !quote || !agent.planned_side || !agent.planned_quote_units) {
-      result.abandoned = 'exchange_or_quote_unavailable';
-    } else {
-      const trade = await executeCryptoTrade(client, { worldId, agentId: agent.agentId,
-        actionId: actionId(agent.agentId, runtime.tick_count, 'trade'), side: agent.planned_side,
-        asset: agent.planned_asset, quoteUnits: String(agent.planned_quote_units), quote: { ...quote, all: quotes } });
-      result.trade = { id: trade.orderId, side: trade.side, asset: trade.asset, quantity: trade.quantity,
-        priceUsd: trade.executionPriceUsd, notionalUsd: trade.notionalUsd, feeUsdc: trade.feeUsdc, simulated: true };
-      if (trade.side === 'sell') {
-        const history = await client.query(`SELECT side,quantity::text AS quantity,notional_usd::text AS "notionalUsd",
-            fee_usdc::text AS "feeUsdc" FROM crypto_trades WHERE world_id=$1 AND agent_id=$2 AND asset_symbol=$3 ORDER BY id`,
-        [worldId, agent.agentId, trade.asset]);
-        result.trade.realizedPnlUsd = lastRealizedSalePnl(history.rows);
-      }
-      await recordWorldEvent(client, worldId, agent.agentId, runtime.tick_count, 'crypto.trade_filled',
-        { ...result.trade, action: 'trade', place, timestamp: now.toISOString() });
-      await client.query(`UPDATE world_agent_states SET last_trade_at=$3 WHERE world_id=$1 AND agent_id=$2`,
-        [worldId, agent.agentId, now]);
-      needs.energy = -1;
-    }
   } else if (activity === 'capability_use') {
     try {
       const use = await performWorldCapabilityUse(client, { worldId, agentId: agent.agentId,
@@ -1460,7 +1387,6 @@ async function completeActivity(client, worldId, agent, runtime, quotes, now, sc
         : activity === 'eat' ? (variant === 'home_meal' ? 'Cooked and ate a meal at home.' : `Ate at ${place}.`)
       : activity === 'socialize' ? (socialInteraction ? `Met ${socialInteraction.partnerName} at ${place}.` : `Spent time in the social space at ${place}.`)
       : activity === 'cooperate' ? (result.cooperation ? `Worked with ${result.cooperation.partnerName} at ${place}.` : 'The planned cooperation could not take place.')
-        : activity === 'trade' ? (result.trade ? `Completed a simulated ${result.trade.side} of ${result.trade.asset} at Exchange.` : 'Skipped an unavailable simulated trade.')
           : result.abandoned ? `The planned ${activity.replaceAll('_', ' ')} could not proceed.`
             : `${activity.replaceAll('_', ' ')} completed${result.initiative?.title ? `: ${result.initiative.title}` : ''}.`;
   await setMindGoal(client, worldId, agent.agentId, agent.current_goal || agent.goal, activity, summary);
@@ -1520,7 +1446,7 @@ async function completeActivity(client, worldId, agent, runtime, quotes, now, sc
       const type = result.opportunity?.type;
       skillAction = initiativeAction === 'opportunity_reject' ? null : type === 'RESEARCH' || type === 'LEARNING' ? 'learn'
         : type === 'SOCIAL' || type === 'COOPERATION' ? 'socialize'
-          : type === 'TRADE' ? 'trade' : 'work';
+          : type === 'TRADE' ? 'work' : 'work';
       if (initiativeAction === 'opportunity_reject') { memoryType = 'opportunity'; importance = 0.4; }
       else if (result.opportunity?.status === 'failed') { memoryType = 'failure'; importance = 0.62; }
       else { memoryType = 'opportunity'; importance = 0.56; }
@@ -1540,7 +1466,7 @@ async function completeActivity(client, worldId, agent, runtime, quotes, now, sc
         [worldId, agent.planned_context?.projectId]);
       const type = projectResult.rows[0]?.project_type;
       skillAction = type === 'RESEARCH' || type === 'LEARNING' ? 'learn'
-        : type === 'TRADE' ? 'trade' : type === 'SOCIAL' ? 'socialize' : 'work';
+        : type === 'TRADE' ? 'work' : type === 'SOCIAL' ? 'socialize' : 'work';
       summary = `${result.initiative?.completed ? 'Helped complete' : 'Contributed to'} a shared project${result.initiative?.progress !== undefined
         ? ` (${Number(result.initiative.progress).toFixed(1)}% complete)` : ''}.`;
       if (result.initiative?.completed) {
@@ -1665,7 +1591,7 @@ async function completeActivity(client, worldId, agent, runtime, quotes, now, sc
     }
     await refreshSocialProfile(client, worldId, agent.agentId, runtime.world_minutes, completionEventId);
   } else if (activity !== 'socialize' && !result.abandoned) {
-    const meaningful = activity === 'work' && result.work || activity === 'learn' && result.learning || activity === 'trade' && result.trade;
+  const meaningful = activity === 'work' && result.work || activity === 'learn' && result.learning;
     if (meaningful) {
       await applySkillGains(client, worldId, agent.agentId, activity, place);
       const memory = memoryForCompletedAction({ action: activity, result, place, worldMinutes: runtime.world_minutes });
@@ -1680,11 +1606,6 @@ async function completeActivity(client, worldId, agent, runtime, quotes, now, sc
   return selected.learnerUsed && observation.self && candidates.length && selected.id
     ? { agentId: agent.agentId, observation, candidates, selected, result }
     : null;
-}
-
-function marketSnapshot(quotes) {
-  return Object.fromEntries(quotes.filter((quote) => ['BTC','ETH'].includes(quote.symbol))
-    .map((quote) => [quote.symbol, String(quote.priceUsd)]));
 }
 
 function publicWorldClock(row, running = true) {
@@ -1707,8 +1628,13 @@ async function ensureAgentRows(pool, worldId) {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    await client.query(`INSERT INTO world_runtime_state(world_id,tick_count,world_minutes,last_tick_at,market_snapshot,typesafe_next_at)
-      VALUES($1,0,480,now(),'{}'::jsonb,now()) ON CONFLICT(world_id) DO NOTHING`, [worldId]);
+    await client.query(`UPDATE world_agent_states SET status='idle',planned_action=NULL,target_location=NULL,
+        planned_side=NULL,planned_asset=NULL,planned_quote_units=NULL,fruitfly_observation='{}'::jsonb,
+        fruitfly_candidates='[]'::jsonb,fruitfly_selected='{}'::jsonb,movement_started_at=NULL,
+        movement_ends_at=NULL,action_started_at=NULL,action_ends_at=NULL,next_decision_at=now(),updated_at=now()
+      WHERE world_id=$1 AND planned_action IN ('trade','trade_crypto','trade_meme','trade_hold')`, [worldId]);
+    await client.query(`INSERT INTO world_runtime_state(world_id,tick_count,world_minutes,last_tick_at,typesafe_next_at)
+      VALUES($1,0,480,now(),now()) ON CONFLICT(world_id) DO NOTHING`, [worldId]);
     const runtime = (await client.query('SELECT world_minutes FROM world_runtime_state WHERE world_id=$1', [worldId])).rows[0];
     const worldMinutes = Math.max(0, Math.trunc(finite(runtime?.world_minutes, 480)));
     for (const [index, member] of members.rows.entries()) {
@@ -1716,7 +1642,7 @@ async function ensureAgentRows(pool, worldId) {
       await client.query(`INSERT INTO world_agent_states(world_id,agent_id,goal,risk_tolerance,happiness,knowledge,next_decision_at)
         VALUES($1,$2,$3,$4,$5,$6,now()+($7::text || ' seconds')::interval) ON CONFLICT(world_id,agent_id) DO NOTHING`,
       [worldId, member.agent_id, profile.goal, profile.riskTolerance, profile.happiness, profile.knowledge, String(3 + index * 3)]);
-      await ensureCryptoAccount(client, { worldId, agentId: member.agent_id });
+      await ensureResidentEconomicAccounts(client, { worldId, agentId: member.agent_id, worldTime: worldMinutes });
       const social = initialSocialProfile(member.agent_id, index);
       const skills = initialSkillValues(member.agent_id, index);
       await client.query(`INSERT INTO world_social_profiles(world_id,agent_id,sociability,curiosity,discipline,ambition,
@@ -1767,7 +1693,7 @@ async function ensureAgentRows(pool, worldId) {
 }
 
 async function readEngineSnapshot(pool, worldId) {
-  const [world, members, scenes, quotes] = await Promise.all([
+  const [world, members, scenes] = await Promise.all([
     pool.query('SELECT name FROM worlds WHERE id=$1', [worldId]),
     pool.query(`SELECT a.id AS "agentId",a.name,am.archetype,am.traits,am.current_goal AS "currentGoal",am.actions_taken AS "actionsTaken",
         m.energy,m.food,m.social,m.location,s.goal,s.risk_tolerance AS "riskTolerance",s.happiness,s.knowledge,
@@ -1792,19 +1718,16 @@ async function readEngineSnapshot(pool, worldId) {
           ORDER BY rel.familiarity DESC,rel.trust DESC) FROM world_relationships rel
           JOIN agents other ON other.id=CASE WHEN rel.agent_a_id=m.agent_id THEN rel.agent_b_id ELSE rel.agent_a_id END
           WHERE rel.world_id=m.world_id AND (rel.agent_a_id=m.agent_id OR rel.agent_b_id=m.agent_id)),'[]'::jsonb) AS relationships,
-        coalesce((SELECT balance::text FROM crypto_balances b WHERE b.world_id=m.world_id AND b.agent_id=m.agent_id AND b.asset_symbol='USDC'),'0') AS usdc,
-        coalesce((SELECT balance::text FROM crypto_balances b WHERE b.world_id=m.world_id AND b.agent_id=m.agent_id AND b.asset_symbol='BTC'),'0') AS btc,
-        coalesce((SELECT balance::text FROM crypto_balances b WHERE b.world_id=m.world_id AND b.agent_id=m.agent_id AND b.asset_symbol='ETH'),'0') AS eth
+        coalesce((SELECT balance::text FROM world_economic_accounts account WHERE account.world_id=m.world_id
+          AND account.account_type='resident' AND account.account_key=m.agent_id::text AND account.asset_symbol='USDC'),'0') AS usdc
       FROM world_members m JOIN agents a ON a.id=m.agent_id JOIN world_agent_states s ON s.world_id=m.world_id AND s.agent_id=m.agent_id
       LEFT JOIN agent_minds am ON am.world_id=m.world_id AND am.agent_id=m.agent_id
       LEFT JOIN world_social_profiles p ON p.world_id=m.world_id AND p.agent_id=m.agent_id
       WHERE m.world_id=$1 ORDER BY m.joined_at,a.name`, [worldId]),
-    pool.query(`SELECT id,name,scene_type AS "sceneType",status FROM world_scenes WHERE world_id=$1 ORDER BY created_at,id`, [worldId]),
-    pool.query(`SELECT symbol,price_usd::text AS "priceUsd",quote_version AS "quoteVersion",as_of AS "asOf",source
-      FROM crypto_market_quotes ORDER BY symbol`)
+    pool.query(`SELECT id,name,scene_type AS "sceneType",status FROM world_scenes WHERE world_id=$1 ORDER BY created_at,id`, [worldId])
   ]);
-  const runtime = (await pool.query('SELECT tick_count,world_minutes,last_tick_at,market_snapshot,typesafe_next_at FROM world_runtime_state WHERE world_id=$1', [worldId])).rows[0];
-  return { name: world.rows[0]?.name || 'Synterra', members: members.rows, scenes: scenes.rows, quotes: quotes.rows, runtime };
+  const runtime = (await pool.query('SELECT tick_count,world_minutes,last_tick_at,typesafe_next_at FROM world_runtime_state WHERE world_id=$1', [worldId])).rows[0];
+  return { name: world.rows[0]?.name || 'Synterra', members: members.rows, scenes: scenes.rows, runtime };
 }
 
 async function runStrategicTypeSafe(pool, worldId, chooseWithTypeSafe, runtimeState) {
@@ -1813,8 +1736,7 @@ async function runStrategicTypeSafe(pool, worldId, chooseWithTypeSafe, runtimeSt
   const index = stableInt(`${worldId}:${snapshot.runtime.tick_count}:typesafe`) % snapshot.members.length;
   const resident = snapshot.members[index];
   const goalCandidates = [
-    { id: 'BUILD_WEALTH', legacyGoal: 'wealth', action: 'work', goal: 'Build simulated savings through paid work and bounded Exchange activity.', description: 'Build simulated savings through paid work; only trade at Exchange with existing risk limits.' },
-    { id: 'MASTER_TRADING', legacyGoal: 'wealth', action: 'trade', goal: 'Develop simulated trading expertise while respecting existing Exchange limits.', description: 'Practice at Exchange only when the existing risk gate permits it.' },
+    { id: 'BUILD_WEALTH', legacyGoal: 'wealth', action: 'work', goal: 'Build simulated savings through useful work and business activity.', description: 'Build savings through existing work and business opportunities.' },
     { id: 'MASTER_RESEARCH', legacyGoal: 'learn', action: 'learn', goal: 'Grow research skill through study and observation.', description: 'Study in the library or observatory.' },
     { id: 'MASTER_ENGINEERING', legacyGoal: 'learn', action: 'work', goal: 'Grow engineering skill through data-center and workshop shifts.', description: 'Work at an existing workshop or data center.' },
     { id: 'BUILD_RELATIONSHIPS', legacyGoal: 'community', action: 'socialize', goal: 'Build meaningful familiarity with co-located residents.', description: 'Meet available residents at a cafe or garden.' },
@@ -1822,16 +1744,11 @@ async function runStrategicTypeSafe(pool, worldId, chooseWithTypeSafe, runtimeSt
   ];
   const skills = safeJson(resident.skills);
   const bestSkill = Object.entries(skills).sort((a, b) => Number(b[1]) - Number(a[1]))[0]?.[0] || 'research';
-  goalCandidates.push({ id: `DEVELOP_${bestSkill.toUpperCase()}`, legacyGoal: bestSkill === 'trading' ? 'wealth'
-    : bestSkill === 'social' ? 'community' : 'learn', action: bestSkill === 'trading' ? 'trade'
-      : bestSkill === 'social' ? 'socialize' : bestSkill === 'engineering' ? 'work' : 'learn',
+  goalCandidates.push({ id: `DEVELOP_${bestSkill.toUpperCase()}`, legacyGoal: bestSkill === 'social' ? 'community'
+    : bestSkill === 'trading' ? 'wealth' : 'learn', action: bestSkill === 'social' ? 'socialize'
+      : bestSkill === 'engineering' ? 'work' : 'learn',
   goal: `Develop ${bestSkill} through useful practice informed by personal experience.`,
   description: `Continue building ${bestSkill} while protecting immediate needs.` });
-  if (resident.memories.filter((memory) => Number(memory.metadata?.realizedPnlUsd) < 0).length >= 2) goalCandidates.push({
-    id: 'RECOVER_FINANCIAL_STABILITY', legacyGoal: 'wealth', action: 'work',
-    goal: 'Rebuild simulated financial stability after recent realized losses.',
-    description: 'Prefer stable work and learning while allowing existing risk gates to govern any Exchange activity.'
-  });
   const trusted = resident.relationships.find((relation) => Number(relation.familiarity) >= 40 && Number(relation.trust) >= 8);
   if (trusted) goalCandidates.push({ id: 'COOPERATE_WITH_RESIDENT', legacyGoal: 'community', action: 'cooperate',
     goal: `Find a useful shared project with ${trusted.name}.`, description: `Explore a real cooperative opportunity with ${trusted.name}.` });
@@ -1849,9 +1766,7 @@ async function runStrategicTypeSafe(pool, worldId, chooseWithTypeSafe, runtimeSt
         ambition: resident.ambition, skills: resident.skills, modifiers: resident.personalityModifiers,
         riskModifier: resident.riskModifier
       } },
-    market: { quotes: snapshot.quotes },
-    trading: { balances: { USDC: resident.usdc, BTC: resident.btc, ETH: resident.eth }, positions: [],
-      netAssetValueUsd: resident.usdc, risk: { simulatedOnly: true } }
+    economic: { internalUsdcBalance: resident.usdc }
   };
   const selection = await chooseWithTypeSafe(observation, goalCandidates, runtimeState, []);
   const selectedGoal = selection.decision?.id;
@@ -2081,7 +1996,7 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
       try {
         await client.query('BEGIN');
         await client.query(`SET LOCAL statement_timeout = '${WORLD_DB_STATEMENT_TIMEOUT_MS}ms'`);
-        const clockResult = await client.query(`SELECT tick_count,world_minutes,last_tick_at,typesafe_next_at,market_snapshot,environment
+        const clockResult = await client.query(`SELECT tick_count,world_minutes,last_tick_at,typesafe_next_at,environment
           FROM world_runtime_state WHERE world_id=$1 FOR UPDATE`, [worldId]);
         if (!clockResult.rowCount) throw new Error('WORLD_RUNTIME_STATE_MISSING');
         const clock = clockResult.rows[0];
@@ -2142,11 +2057,6 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
         await settleWorldPlaceMaintenance(client, { worldId, worldTime: newWorldDay * 1_440 });
       }
       phaseSucceeded('DAILY_ECONOMY');
-        const quoteResult = await client.query(`SELECT symbol,price_usd::text AS "priceUsd",quote_version AS "quoteVersion",as_of AS "asOf",source
-          FROM crypto_market_quotes ORDER BY symbol`);
-        const quotes = quoteResult.rows.map((quote) => ({ ...quote, quoteVersion: Number(quote.quoteVersion) }));
-        const priorSnapshot = safeJson(clock.market_snapshot);
-        const nextSnapshot = marketSnapshot(quotes);
         const typeSafeDueAt = new Date(clock.typesafe_next_at).getTime();
         shouldAskTypeSafe = Boolean(chooseWithTypeSafe && !typeSafeInProgress && nowMs >= typeSafeDueAt && nowMs >= nextTypeSafeAt);
         if (shouldAskTypeSafe) {
@@ -2155,7 +2065,6 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
           await client.query(`UPDATE world_runtime_state SET typesafe_next_at=$2 WHERE world_id=$1`,
             [worldId, new Date(nextTypeSafeAt)]);
         }
-        await client.query(`UPDATE world_runtime_state SET market_snapshot=$2::jsonb WHERE world_id=$1`, [worldId, JSON.stringify(nextSnapshot)]);
         setPhase('RESIDENT_UPDATE');
         if (decayHours > 0) {
           // Residents without an engine state row keep the original flat decay.
@@ -2184,7 +2093,7 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
             am.archetype,am.traits,am.memories,am.current_goal,am.actions_taken,
             s.goal,s.risk_tolerance AS risk_tolerance,s.happiness,s.knowledge,s.hygiene,s.fun,s.activity_variant,
             s.status,s.planned_action,s.target_location,
-            s.planned_partner_id AS planned_partner_id,s.planned_side,s.planned_asset,s.planned_quote_units::text AS planned_quote_units,s.planned_paid_meal,
+            s.planned_partner_id AS planned_partner_id,s.planned_paid_meal,
             s.planned_context,s.next_strategic_decision_world_minutes AS next_strategic_decision_world_minutes,
             s.next_institutional_review_world_minutes AS next_institutional_review_world_minutes,
             s.next_civilization_review_world_minutes AS next_civilization_review_world_minutes,
@@ -2193,7 +2102,7 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
             s.strategic_goal_progress_world_minutes AS strategic_goal_progress_world_minutes,
             s.strategic_goal_stagnation_cycles AS strategic_goal_stagnation_cycles,
             s.fruitfly_observation,s.fruitfly_candidates,s.fruitfly_selected,
-            s.movement_started_at,s.movement_ends_at,s.action_started_at,s.action_ends_at,s.next_decision_at,s.last_trade_at,
+            s.movement_started_at,s.movement_ends_at,s.action_started_at,s.action_ends_at,s.next_decision_at,
             p.sociability::text AS sociability,p.curiosity::text AS curiosity,p.discipline::text AS discipline,
             p.ambition::text AS ambition,p.primary_goal AS primary_goal,p.goal_progress::text AS goal_progress,
             p.goal_milestones AS goal_milestones,p.dominant_role AS dominant_role,
@@ -2235,9 +2144,8 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
                 FROM world_relationships r JOIN agents other ON other.id=CASE WHEN r.agent_a_id=m.agent_id THEN r.agent_b_id ELSE r.agent_a_id END
                 WHERE r.world_id=m.world_id AND (r.agent_a_id=m.agent_id OR r.agent_b_id=m.agent_id)
                 ORDER BY r.familiarity DESC,r.interaction_count DESC LIMIT 12) recent),'[]'::jsonb) AS relationships,
-            coalesce((SELECT balance::text FROM crypto_balances b WHERE b.world_id=m.world_id AND b.agent_id=m.agent_id AND b.asset_symbol='USDC'),'0') AS usdc,
-            coalesce((SELECT balance::text FROM crypto_balances b WHERE b.world_id=m.world_id AND b.agent_id=m.agent_id AND b.asset_symbol='BTC'),'0') AS btc,
-            coalesce((SELECT balance::text FROM crypto_balances b WHERE b.world_id=m.world_id AND b.agent_id=m.agent_id AND b.asset_symbol='ETH'),'0') AS eth,
+            coalesce((SELECT balance::text FROM world_economic_accounts account WHERE account.world_id=m.world_id
+              AND account.account_type='resident' AND account.account_key=m.agent_id::text AND account.asset_symbol='USDC'),'0') AS usdc,
             coalesce((SELECT sum(amount)::text FROM token_ledger l WHERE l.world_id=m.world_id AND l.agent_id=m.agent_id),'0') AS internal_units
           FROM world_members m JOIN agents a ON a.id=m.agent_id
           JOIN world_agent_states s ON s.world_id=m.world_id AND s.agent_id=m.agent_id
@@ -2307,7 +2215,7 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
         for (const row of membersResult.rows) {
           const agent = { ...row, agentId: row.agent_id,
             currentGoal: row.current_goal || row.goal || 'balanced',
-            lastTradeAt: row.last_trade_at, planned_paid_meal: row.planned_paid_meal,
+            planned_paid_meal: row.planned_paid_meal,
             nextInstitutionalReviewWorldMinutes: row.next_institutional_review_world_minutes === null
               ? null : Number(row.next_institutional_review_world_minutes),
             nextCivilizationReviewWorldMinutes: row.next_civilization_review_world_minutes === null
@@ -2420,13 +2328,13 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
           } else if (agent.status === 'performing' && new Date(agent.action_ends_at).getTime() <= now.getTime()) {
             const completedAction = String(agent.planned_action || '');
             const completionPhase = completedAction === 'capability_use' ? 'CAPABILITY_EXPERIMENTS'
-              : completedAction.startsWith('business') || completedAction === 'trade' ? 'ECONOMY'
+              : completedAction.startsWith('business') ? 'ECONOMY'
                 : completedAction.startsWith('agreement') || completedAction === 'commitment_resolve'
                   ? 'AGREEMENTS' : 'ACTION_COMPLETION';
             setPhase(completionPhase);
             const placeResult = scenes.find((scene) => scene.name === agent.location);
             const learning = await completeActivity(client, worldId, { ...agent, scene_type: placeResult?.sceneType || null },
-              { tick_count: tickCount, world_minutes: worldMinutes }, quotes, now, placeResult, onAutonomousBusinessAction,
+              { tick_count: tickCount, world_minutes: worldMinutes }, now, placeResult, onAutonomousBusinessAction,
               environment);
             phaseSucceeded(completionPhase);
             if (learning) fruitflyOutcomes.push(learning);
@@ -2440,8 +2348,8 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
                     primaryGoal: other.primary_goal, skills: safeJson(other.skills), relationship,
                     lastInteractionWorldMinutes: relationship?.lastInteractionWorldMinutes };
                 })]));
-          const nativeUtilityCandidates = buildActivityCandidates(agent, scenes, { tick: tickCount, worldMinutes, nowMs, quotes,
-            previousQuotes: priorSnapshot, residentsAt: placeCounts, residentsAtLocation, environment, occupancy });
+          const nativeUtilityCandidates = buildActivityCandidates(agent, scenes, { tick: tickCount, worldMinutes, nowMs,
+            residentsAt: placeCounts, residentsAtLocation, environment, occupancy });
           const capabilityCandidates = await buildCapabilityUseCandidates(agent, capabilityOptions, {
             worldMinutes, residentsAtLocation, placeIdsByName,
             maxAlternativeScore: Math.max(0, ...nativeUtilityCandidates.map((candidate) => Number(candidate.score) || 0)) });
@@ -2768,8 +2676,6 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
               calendar: environment.calendar, weather: environment.weather }) : null;
             const duration = activityDurationSeconds(activity.action, ACTION_SECONDS[activity.action] || 10,
               { variant: localVariant, agentId: agent.agentId, calendar: environment.calendar });
-            const tradeFields = activity.action === 'trade'
-              ? [activity.side, activity.asset, activity.quoteUnits] : [null, null, null];
             const plannedContext = Object.fromEntries(['opportunityId','opportunityProposal','projectId','decision','projectProposal','goalReviewProposal',
               'capabilityId','capabilityExperimentId','capabilityContext',
               'organizationId','organizationProposal','inviteeAgentId','shareId','informationProposal','contributionType',
@@ -2790,12 +2696,12 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
                 { weather: environment.weather, seed: `${agent.agentId}:${tickCount}` });
               const movementEnd = new Date(now.getTime() + walkSeconds * 1_000);
               await client.query(`UPDATE world_agent_states SET status='walking',planned_action=$3,target_location=$4,activity_variant=NULL,
-                  planned_side=$5,planned_asset=$6,planned_quote_units=$7,planned_paid_meal=$8,planned_partner_id=$9,
-                  fruitfly_observation=$12::jsonb,fruitfly_candidates=$13::jsonb,fruitfly_selected=$14::jsonb,
-                  planned_context=$15::jsonb,
-                  movement_started_at=$10,movement_ends_at=$11,action_started_at=NULL,action_ends_at=NULL,
-                  updated_at=$10 WHERE world_id=$1 AND agent_id=$2`,
-              [worldId, agent.agentId, activity.action, activity.targetLocation, ...tradeFields, Boolean(activity.plannedPaidMeal),
+                  planned_side=NULL,planned_asset=NULL,planned_quote_units=NULL,planned_paid_meal=$5,planned_partner_id=$6,
+                  fruitfly_observation=$9::jsonb,fruitfly_candidates=$10::jsonb,fruitfly_selected=$11::jsonb,
+                  planned_context=$12::jsonb,
+                  movement_started_at=$7,movement_ends_at=$8,action_started_at=NULL,action_ends_at=NULL,
+                  updated_at=$7 WHERE world_id=$1 AND agent_id=$2`,
+              [worldId, agent.agentId, activity.action, activity.targetLocation, Boolean(activity.plannedPaidMeal),
                 activity.socialPartnerId, now, movementEnd, JSON.stringify(flyObservation || {}), JSON.stringify(flyCandidates),
                 JSON.stringify(flySelected || {}), JSON.stringify(plannedContext)]);
               await setMindGoal(client, worldId, agent.agentId, activity.goal, activity.action,
@@ -2806,13 +2712,13 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
               row.status = 'walking';
               row.planned_action = activity.action;
             } else {
-              await client.query(`UPDATE world_agent_states SET status='performing',planned_action=$3,target_location=NULL,activity_variant=$15,
-                  planned_side=$4,planned_asset=$5,planned_quote_units=$6,planned_paid_meal=$7,planned_partner_id=$8,
-                  fruitfly_observation=$11::jsonb,fruitfly_candidates=$12::jsonb,fruitfly_selected=$13::jsonb,
-                  planned_context=$14::jsonb,
-                  movement_started_at=NULL,movement_ends_at=NULL,action_started_at=$9,action_ends_at=$10,updated_at=$9
+              await client.query(`UPDATE world_agent_states SET status='performing',planned_action=$3,target_location=NULL,activity_variant=$12,
+                  planned_side=NULL,planned_asset=NULL,planned_quote_units=NULL,planned_paid_meal=$4,planned_partner_id=$5,
+                  fruitfly_observation=$8::jsonb,fruitfly_candidates=$9::jsonb,fruitfly_selected=$10::jsonb,
+                  planned_context=$11::jsonb,
+                  movement_started_at=NULL,movement_ends_at=NULL,action_started_at=$6,action_ends_at=$7,updated_at=$6
                 WHERE world_id=$1 AND agent_id=$2`,
-              [worldId, agent.agentId, activity.action, ...tradeFields, Boolean(activity.plannedPaidMeal), activity.socialPartnerId, now,
+              [worldId, agent.agentId, activity.action, Boolean(activity.plannedPaidMeal), activity.socialPartnerId, now,
                 new Date(now.getTime() + duration * 1_000), JSON.stringify(flyObservation || {}),
                 JSON.stringify(flyCandidates), JSON.stringify(flySelected || {}), JSON.stringify(plannedContext), localVariant]);
               row.activity_variant = localVariant;

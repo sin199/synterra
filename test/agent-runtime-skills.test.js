@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { candidateActions, decideNextAction } from '../src/agent-runtime/mind.js';
 import { skillProfile, skillsForAction, WORLD_SKILLS } from '../src/agent-runtime/skills.js';
+import { fruitflyFamily } from '../src/social-world.js';
 
 const observation = (overrides = {}) => ({
   self: { agentId: 'agent-1', food: 100, energy: 100, social: 100, location: 'town-square' },
@@ -23,14 +24,15 @@ test('each persona receives a normalized six-skill profile', () => {
 });
 
 test('native skills map only to supported world actions', () => {
-  const supported = new Set(['eat', 'buy_meal', 'rest', 'travel', 'socialize', 'build_scene', 'work', 'trade_crypto', 'trade_meme', 'trade_hold']);
+  const supported = new Set(['eat', 'buy_meal', 'rest', 'travel', 'socialize', 'build_scene', 'work',
+    'business_market_observe', 'business_skill_practice']);
   for (const skill of Object.values(WORLD_SKILLS)) {
     for (const action of skill.actions) assert.ok(supported.has(action));
   }
   assert.deepEqual(skillsForAction('eat'), ['care']);
   assert.deepEqual(skillsForAction('build_scene'), ['building']);
-  assert.deepEqual(skillsForAction('trade_crypto'), ['markets']);
-  assert.deepEqual(skillsForAction('trade_meme'), ['markets']);
+  assert.deepEqual(skillsForAction('business_market_observe'), ['markets']);
+  assert.deepEqual(skillsForAction('business_skill_practice'), ['markets']);
 });
 
 test('work is omitted unless the configured active mine and needs are available', () => {
@@ -69,7 +71,7 @@ test('residents can choose a paid meal only when their internal balance covers i
   assert.ok(candidateActions(poor).some((candidate) => candidate.action === 'eat'));
 });
 
-test('simulated spot trade candidates require market and account state', () => {
+test('legacy simulated market data never creates resident trading candidates', () => {
   const obs = observation({
     market: { simulated: true, quotes: [
       { symbol: 'BTC', priceUsd: '65000.00000000', quoteVersion: 1 },
@@ -81,11 +83,12 @@ test('simulated spot trade candidates require market and account state', () => {
       ] }
   });
   const candidates = candidateActions(obs, 'mine-1');
-  assert.ok(candidates.some((candidate) => candidate.action === 'trade_hold'));
-  assert.ok(candidates.some((candidate) => candidate.id === 'buy_btc_250'));
-  assert.ok(candidates.some((candidate) => candidate.id === 'buy_eth_250'));
-  assert.ok(!candidates.some((candidate) => candidate.action === 'trade_crypto' && candidate.side === 'sell'));
+  assert.ok(!candidates.some((candidate) => ['trade_crypto', 'trade_meme', 'trade_hold'].includes(candidate.action)));
+  assert.ok(!candidates.some((candidate) => candidate.asset === 'BTC' || candidate.asset === 'ETH'));
+  assert.ok(candidates.some((candidate) => candidate.action === 'work'), 'ordinary economic work remains available');
 
   const noMarket = candidateActions(observation(), 'mine-1');
-  assert.ok(!noMarket.some((candidate) => candidate.action.startsWith('trade_')));
+  assert.ok(!noMarket.some((candidate) => ['trade_crypto', 'trade_meme', 'trade_hold'].includes(candidate.action)));
+  assert.equal(fruitflyFamily({ action: 'business_service', serviceType: 'trading_service' }), 'business',
+    'market-research services remain available without routing to a trading action family');
 });

@@ -21,6 +21,7 @@ import { confirmWorldTokenIssuance } from '../src/world-token-issuance.js';
 import { reserveArcMainnetPilotCost, releaseArcMainnetPilotCost,
   setArcMainnetPilotCostStatus } from '../src/arc/pilot-budget.js';
 import { DeterministicFakeArcSigner, createIsolatedArcMainnetConfig } from './helpers/arc-mainnet-fakes.js';
+import { fundTestResidents } from './helpers/economic-fixtures.js';
 import { ARC_SETTLEMENT_INTERFACE, toArcBytes16Uuid } from '../src/arc/settlement.js';
 
 const databaseUrl = process.env.SYNTERRA_TEST_DATABASE_URL;
@@ -251,6 +252,7 @@ test('Arc Mainnet Agent action reaches persistent outbox, policy evaluation, and
       },
       onAutonomousBusinessAction: enqueueArcAgentEconomicAction, emergencySink: { write() {} } });
     assert.equal(engine.running, true);
+    await inTransaction(pool, (client) => fundTestResidents(client, { worldId, agentIds: [payerId, recipientId] }));
     await pool.query(`UPDATE world_agent_states SET next_decision_at=$3 WHERE world_id=$1 AND agent_id=ANY($2::uuid[])`,
       [worldId, [payerId, recipientId], new Date(nowMs + 86_400_000)]);
 
@@ -397,7 +399,9 @@ test('Arc Mainnet Agent action reaches persistent outbox, policy evaluation, and
     const outboxBeforePolicy = await pool.query(`SELECT world_action_id,world_event_id,chain_id,status,
         from_agent_id,to_agent_id,action_family,simulated_amount_usdc,created_world_minute,metadata
       FROM arc_settlement_outbox WHERE world_id=$1`, [worldId]);
-    assert.equal(outboxBeforePolicy.rowCount, 1, 'the autonomous action wrote a persistent outbox row');
+    assert.equal(outboxBeforePolicy.rowCount, 1,
+      `the autonomous action wrote a persistent outbox row; event=${JSON.stringify(actionResult.rows[0]?.data)} ` +
+      `outbox=${JSON.stringify(outboxBeforePolicy.rows)}`);
     assert.equal(Number(outboxBeforePolicy.rows[0].chain_id), ARC_MAINNET_CHAIN_ID);
     assert.equal(outboxBeforePolicy.rows[0].status, 'policy_pending');
     assert.equal(outboxBeforePolicy.rows[0].from_agent_id, payerId);

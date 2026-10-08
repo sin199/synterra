@@ -84,7 +84,7 @@ export function seededGoalSet(agentId, slot = 0) {
 export function goalDescription(goal) {
   const descriptions = {
     BUILD_WEALTH: 'Build durable simulated savings through work, learning and considered opportunities.',
-    MASTER_TRADING: 'Develop market judgment while respecting the existing Exchange and risk rules.',
+    MASTER_TRADING: 'Develop independent market research judgment and useful economic insight.',
     MASTER_RESEARCH: 'Build research capability by studying, observing and applying what is learned.',
     MASTER_ENGINEERING: 'Become more capable at engineering through useful work and practice.',
     BUILD_RELATIONSHIPS: 'Build reciprocal, durable connections through real encounters and cooperation.',
@@ -228,8 +228,6 @@ export function reflectionDue({ worldMinutes, lastReflectionWorldMinutes, import
 export function reflectionProposal({ profile = {}, memories = [], skills = {}, relationships = [], balances = {}, needs = {},
   currentGoal = null, worldMinutes = 0 }) {
   const recent = (Array.isArray(memories) ? memories : []).slice(0, 20);
-  const losses = recent.filter((memory) => Number(memory.metadata?.realizedPnlUsd) < 0).length;
-  const wins = recent.filter((memory) => Number(memory.metadata?.realizedPnlUsd) > 0).length;
   const workSuccesses = recent.filter((memory) => memory.memoryType === 'work' && Number(memory.metadata?.incomeUsd) > 0).length;
   const socialSuccesses = recent.filter((memory) => memory.memoryType === 'social').length;
   const modifiers = Object.fromEntries(PERSONALITY_FIELDS.map((field) => [field,
@@ -242,18 +240,14 @@ export function reflectionProposal({ profile = {}, memories = [], skills = {}, r
   };
   if (socialSuccesses >= 2) nudge('sociability', 1);
   if (workSuccesses >= 2) nudge('discipline', 1);
-  if (losses >= 2) nudge('discipline', 1);
-  if (wins >= 2 && losses === 0) nudge('ambition', 1);
-  const nextRiskModifier = clampFinite(riskModifier + (losses >= 2 ? -ADAPTIVE_PERSONALITY_STEP : wins >= 3 ? ADAPTIVE_PERSONALITY_STEP : 0),
-    -ADAPTIVE_PERSONALITY_LIMIT, ADAPTIVE_PERSONALITY_LIMIT, 0);
+  const nextRiskModifier = riskModifier;
   const rankedSkill = Object.entries(skills).sort((a, b) => Number(b[1]) - Number(a[1]));
   const bestSkill = rankedSkill[0]?.[0] || 'research';
   const weakNeed = ['energy', 'food', 'social'].sort((a, b) => Number(needs[a] ?? 50) - Number(needs[b] ?? 50))[0];
   const wealth = Number(balances.netWorthUsd) || 0;
   const bestRelation = [...relationships].sort((a, b) => Number(b.familiarity) - Number(a.familiarity))[0];
   let nextGoal = null;
-  if (losses >= 3) nextGoal = { category: 'RECOVER_FINANCIAL_STABILITY', description: 'Rebuild stable simulated resources after a run of realized losses.', source: 'experience', metadata: { losses } };
-  else if (weakNeed === 'energy' || weakNeed === 'food') nextGoal = { category: 'RESTORE_WELLBEING', description: 'Restore daily wellbeing, then return to longer-term pursuits.', source: 'experience', metadata: { need: weakNeed } };
+  if (weakNeed === 'energy' || weakNeed === 'food') nextGoal = { category: 'RESTORE_WELLBEING', description: 'Restore daily wellbeing, then return to longer-term pursuits.', source: 'experience', metadata: { need: weakNeed } };
   else if (bestRelation && Number(bestRelation.familiarity) >= 40 && Number(bestRelation.trust) >= 8) {
     nextGoal = { category: 'COOPERATE_WITH_RESIDENT', description: `Find a useful opportunity to work or learn with ${bestRelation.name || 'a trusted resident'}.`,
       source: 'relationship', parentGoalId: currentGoal?.id || null, metadata: { agentId: bestRelation.otherAgentId } };
@@ -262,7 +256,7 @@ export function reflectionProposal({ profile = {}, memories = [], skills = {}, r
     source: 'experience', metadata: { skill: bestSkill, weakNeed } };
   return { worldMinutes: Math.max(0, Math.trunc(Number(worldMinutes) || 0)), modifiers,
     riskModifier: nextRiskModifier, nextGoal, dominantRole: deriveDominantRole(skills, currentGoal?.category),
-    rationale: { recentMemories: recent.length, losses, wins, workSuccesses, socialSuccesses, bestSkill, weakNeed, wealth } };
+    rationale: { recentMemories: recent.length, workSuccesses, socialSuccesses, bestSkill, weakNeed, wealth } };
 }
 
 export function initialSkillValues(agentId, slot = 0) {
@@ -275,7 +269,6 @@ export function initialSkillValues(agentId, slot = 0) {
 }
 
 export function skillGainForAction(action, place, hadPartner = false) {
-  if (action === 'trade') return { trading: 0.45 };
   if (action === 'learn') return { research: 0.5 };
   if (action === 'work' || action === 'cooperate') return place === 'Data Center'
     ? { engineering: 0.35, research: 0.2 } : { engineering: 0.45 };
@@ -294,17 +287,6 @@ export function memoryForCompletedAction({ action, result = {}, place, worldMinu
     memoryType: 'learning', summary: `Studied at ${place} and gained ${result.learning.knowledge} knowledge.`, importance: 0.28,
     metadata: { action, knowledge: result.learning.knowledge, outcome: 0.2 }
   };
-  if (action === 'trade' && result.trade && !result.abandoned) {
-    const loss = Number(result.trade.realizedPnlUsd) < 0;
-    return { memoryType: loss ? 'failure' : 'trade',
-      summary: `${result.trade.side === 'buy' ? 'Bought' : 'Sold'} ${result.trade.asset} for ${result.trade.notionalUsd} simulated USDC at Exchange.`,
-      importance: loss ? 0.76 : 0.48,
-      metadata: { action, asset: result.trade.asset, side: result.trade.side, notionalUsd: result.trade.notionalUsd,
-        priceUsd: result.trade.priceUsd, feeUsdc: result.trade.feeUsdc,
-        ...(Number.isFinite(result.trade.realizedPnlUsd) ? { realizedPnlUsd: result.trade.realizedPnlUsd,
-          outcome: clampFinite(result.trade.realizedPnlUsd / 100, -1, 1, 0) } : {}) }
-    };
-  }
   if (action === 'socialize' && result.socialInteraction) return {
     memoryType: 'social', summary: `Met ${result.socialInteraction.partnerName} at ${place}.`, importance: 0.48,
     relatedAgentId: result.socialInteraction.partnerId,
@@ -361,8 +343,10 @@ export function canCooperatePair({ actor, partner, scene, worldMinutes }) {
 
 function goalActionAffinity(category, action, candidate = {}, metadata = {}) {
   const key = String(category || '').toUpperCase();
-  if (['BUILD_WEALTH', 'RECOVER_FINANCIAL_STABILITY'].includes(key)) return action === 'work' ? 1 : action === 'trade' ? 0.28 : 0;
-  if (['MASTER_TRADING', 'DEVELOP_TRADING'].includes(key) || key.includes('TRADING')) return action === 'trade' ? 1 : action === 'learn' ? 0.18 : 0;
+  if (['BUILD_WEALTH', 'RECOVER_FINANCIAL_STABILITY'].includes(key)) return action === 'work' ? 1 : 0;
+  if (['MASTER_TRADING', 'DEVELOP_TRADING'].includes(key) || key.includes('TRADING')) {
+    return ['learn', 'business_market_observe', 'business_skill_practice'].includes(action) ? 1 : 0;
+  }
   if (['MASTER_RESEARCH', 'DEVELOP_RESEARCH', 'LEAD_LOCAL_RESEARCH'].includes(key) || key.includes('RESEARCH')) return action === 'learn' ? 1 : action === 'work' && candidate.targetLocation === 'Data Center' ? 0.35 : 0;
   if (['MASTER_ENGINEERING', 'DEVELOP_ENGINEERING'].includes(key) || key.includes('ENGINEERING')) return action === 'work' || action === 'cooperate' ? 1 : 0;
   if (['BUILD_RELATIONSHIPS', 'BUILD_SOCIAL_SKILL', 'GROW_SKILLS', 'COOPERATE_AND_BUILD'].includes(key) || key.includes('SOCIAL')) return action === 'socialize' || action === 'cooperate' ? 1 : 0;
@@ -377,7 +361,7 @@ function goalActionAffinity(category, action, candidate = {}, metadata = {}) {
   if (wantedSkill === 'engineering') return action === 'work' || action === 'cooperate' ? 0.8 : 0;
   if (wantedSkill === 'research') return action === 'learn' ? 0.8 : 0;
   if (wantedSkill === 'social') return action === 'socialize' || action === 'cooperate' ? 0.8 : 0;
-  if (wantedSkill === 'trading') return action === 'trade' ? 0.8 : 0;
+  if (wantedSkill === 'trading') return ['learn', 'business_market_observe', 'business_skill_practice'].includes(action) ? 0.8 : 0;
   return 0;
 }
 
@@ -430,13 +414,7 @@ export function recentMemoryUtility(agent, action, worldMinutes) {
     if (!Number.isFinite(age) || age < 0 || age > 720) continue;
     const decay = Math.max(0, 1 - age / 720);
     const metadata = memory.metadata && typeof memory.metadata === 'object' ? memory.metadata : {};
-    if (action === 'trade' && ['trade', 'failure'].includes(memory.memoryType) && metadata.asset
-        && Number(metadata.realizedPnlUsd) < 0) {
-      adjustment -= Math.min(16, 4 + Math.abs(Number(metadata.realizedPnlUsd)) * 0.15) * decay;
-    } else if (action === 'trade' && ['trade', 'failure'].includes(memory.memoryType) && metadata.asset
-        && Number(metadata.realizedPnlUsd) > 0) {
-      adjustment += Math.min(5, Number(metadata.realizedPnlUsd) * 0.05) * decay;
-    } else if (action === 'work' && memory.memoryType === 'work' && Number(metadata.incomeUsd) > 0) {
+    if (action === 'work' && memory.memoryType === 'work' && Number(metadata.incomeUsd) > 0) {
       adjustment += Math.min(4, Number(metadata.incomeUsd) * 0.025) * decay;
     } else if (action === 'learn' && memory.memoryType === 'learning') {
       adjustment += 2 * decay;
@@ -490,33 +468,9 @@ export function goalProgress(goal, state = {}, previousMilestones = 0) {
   return { progress: Math.round(progress * 100) / 100, milestones, metric };
 }
 
-export function lastRealizedSalePnl(trades) {
-  let quantity = 0;
-  let costBasis = 0;
-  let lastRealized = null;
-  for (const trade of Array.isArray(trades) ? trades : []) {
-    const tradeQuantity = Number(trade.quantity);
-    const notional = Number(trade.notionalUsd);
-    const fee = Number(trade.feeUsdc);
-    if (!(tradeQuantity > 0) || !Number.isFinite(notional) || !Number.isFinite(fee)) continue;
-    if (trade.side === 'buy') {
-      quantity += tradeQuantity;
-      costBasis += notional + fee;
-    } else if (trade.side === 'sell') {
-      const sold = Math.min(quantity, tradeQuantity);
-      const averageCost = quantity > 0 ? costBasis / quantity : 0;
-      lastRealized = notional - fee - averageCost * sold;
-      quantity = Math.max(0, quantity - sold);
-      costBasis = Math.max(0, costBasis - averageCost * sold);
-    }
-  }
-  return Number.isFinite(lastRealized) ? Math.round(lastRealized * 1e8) / 1e8 : null;
-}
-
 export function fruitflyFamily(candidateOrAction) {
   const candidate = candidateOrAction && typeof candidateOrAction === 'object' ? candidateOrAction : {};
   const action = String(candidate.action || candidateOrAction || '');
-  if (action === 'trade' || action === 'trade_meme') return 'trade_crypto';
   if (action === 'learn') return 'travel';
   if (action === 'capability_use') return 'business_learn';
   if (['business_skill_practice', 'business_market_observe'].includes(action)) return 'business_learn';
@@ -528,7 +482,7 @@ export function fruitflyFamily(candidateOrAction) {
     const serviceType = candidate.serviceType || candidate.service_type;
     if (serviceType === 'food_service') return 'eat';
     if (serviceType === 'social_service') return 'socialize';
-    if (serviceType === 'trading_service') return 'trade_crypto';
+    if (serviceType === 'trading_service') return 'business';
     if (serviceType === 'engineering_service') return 'work';
     if (serviceType === 'research_service') return 'travel';
     return 'business';

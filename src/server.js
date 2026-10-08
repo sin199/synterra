@@ -9,11 +9,7 @@ import path from 'node:path';
 import { chargeMeal, MEAL_COST_UNITS } from './economy.js';
 import { payAdultServiceProvider, parseAdultServicePrice, refundAdultServiceFunds, reserveAdultServiceFunds } from './adult-services.js';
 import { MESSAGE_TEMPLATES, messageText } from './message-templates.js';
-import { formatUnits, parsePositiveUnits, simulatedQuotes } from './crypto-market.js';
-import { readWorldMarket } from './market-candles.js';
-import { accountSnapshot, ensureCryptoAccount, executeCryptoTrade, MAX_ASSET_NAV_BPS, MAX_ORDER_NAV_BPS, SPREAD_BPS, STARTING_USDC, TRADE_FEE_BPS } from './crypto-trading.js';
-import { formatRawTokenAmount, readRobinhoodMarket, scanRobinhoodMarket } from './robinhood-market.js';
-import { executeRobinhoodPaperTrade, readRobinhoodPaperAccount } from './robinhood-paper-trading.js';
+import { parsePositiveUnits } from './units.js';
 import { loadState, STATE_DIR } from './agent-runtime/client.js';
 import { createFruitflyRuntime } from './agent-runtime/fruitfly.js';
 import { chooseCivilizationOption, chooseWithTypeSafe, chooseWorldV7Reflection } from './agent-runtime/typesafe.js';
@@ -52,7 +48,7 @@ import { closeWorldBusiness, distributeWorldBusinessProfit, distributeWorldProje
   purchaseWorldBusinessService, reviewWorldBusinessPrice, completeWorldBusinessShift, applyToWorldBusinessJob,
   decideWorldBusinessApplication, leaveWorldBusinessJob, practiceWorldBusinessCapability,
   withdrawWorldBusinessApplication } from './world-businesses.js';
-import { ensureEconomicAccount, getEconomicAccount } from './economic-ledger.js';
+import { ensureEconomicAccount, ensureResidentEconomicAccounts, getEconomicAccount } from './economic-ledger.js';
 import { alignWorldValue, createCoordinationMechanism, createEmergentEntity, createGoalPrimitiveProposal, createObservationMethod,
   createPolicyExperiment, createWorldResourceType, decideObservationMethod, decideWorldResourceType, evaluateCoordinationExperiment,
   exposeWorldValue,
@@ -86,8 +82,6 @@ const ARC_RPC_CLIENT = new ArcRpcClient({ config: ARC_CONFIG });
 const CHAIN_ID = ARC_CONFIG.chainId;
 const MINING_REWARD = Number(process.env.MINING_REWARD_UNITS || 5);
 const RUN_COST = Number(process.env.WORLD_RUN_COST_PER_UNIT || 1);
-const ROBINHOOD_SCAN_INTERVAL_MS = Math.max(15_000, Math.min(300_000, Number(process.env.ROBINHOOD_SCAN_INTERVAL_MS) || 30_000));
-let cachedCryptoQuoteMinute = -1;
 
 app.decorateRequest('rawBody', null);
 app.decorateRequest('agentId', null);
@@ -215,31 +209,11 @@ async function updateAgentMind(client, worldId, agentId, currentGoal, kind, summ
   [worldId, agentId, archetype, JSON.stringify(traits), currentGoal, JSON.stringify(memories)]);
 }
 
-async function refreshCryptoQuotes(client = pool) {
-  const nowMinute = Math.floor(Date.now() / 60_000);
-  if (cachedCryptoQuoteMinute === nowMinute) return;
-  for (const quote of simulatedQuotes()) {
-    await client.query(`INSERT INTO crypto_market_quotes(symbol,price_usd,quote_version,as_of,source)
-      VALUES($1,$2,$3,$4,$5) ON CONFLICT(symbol) DO UPDATE SET price_usd=EXCLUDED.price_usd,
-        quote_version=EXCLUDED.quote_version,as_of=EXCLUDED.as_of,source=EXCLUDED.source`,
-    [quote.symbol, quote.priceUsd, quote.quoteVersion, quote.asOf, quote.source]);
-  }
-  cachedCryptoQuoteMinute = nowMinute;
-}
-
-async function readCryptoQuotes(client = pool) {
-  await refreshCryptoQuotes(client);
-  const result = await client.query(`SELECT symbol,asset.name,price_usd::text AS "priceUsd",quote_version AS "quoteVersion",
-      as_of AS "asOf",source FROM crypto_market_quotes quote JOIN crypto_assets asset USING(symbol)
-      ORDER BY CASE symbol WHEN 'BTC' THEN 1 WHEN 'ETH' THEN 2 ELSE 3 END`);
-  return result.rows.map((row) => ({ ...row, quoteVersion: Number(row.quoteVersion) }));
-}
-
 app.addHook('preHandler', async (request, reply) => {
   const pathOnly = request.raw.url?.split('?')[0] || '';
   const localResidentDetail = /^\/local\/map-data\/residents\/[^/]+$/.test(pathOnly)
     && ['127.0.0.1', '::1', 'localhost'].includes(HOST);
-  if (pathOnly === '/' || pathOnly === '/styles.css' || pathOnly === '/app.js' || pathOnly === '/world3d.js' || pathOnly === '/crypto-plaza.js' ||
+  if (pathOnly === '/' || pathOnly === '/styles.css' || pathOnly === '/app.js' || pathOnly === '/world3d.js' ||
       pathOnly === '/vendor/three.module.min.js' || pathOnly === '/v6-observer-status.js' || pathOnly === '/og.jpg' || pathOnly.startsWith('/fonts/') || pathOnly === '/public/stats' ||
       pathOnly === '/local/map-data' || localResidentDetail || pathOnly === '/health' || pathOnly === '/v1/agents/challenges' || pathOnly === '/v1/agents') return;
 
@@ -276,7 +250,6 @@ app.get('/', (request, reply) => sendSiteFile(request, reply, SITE_ROOT, 'index.
 app.get('/styles.css', (request, reply) => sendSiteFile(request, reply, SITE_ROOT, 'styles.css', { type: 'text/css; charset=utf-8' }));
 app.get('/app.js', (request, reply) => sendSiteFile(request, reply, SITE_ROOT, 'app.js', { type: JS_TYPE }));
 app.get('/world3d.js', (request, reply) => sendSiteFile(request, reply, SITE_ROOT, 'world3d.js', { type: JS_TYPE }));
-app.get('/crypto-plaza.js', (request, reply) => sendSiteFile(request, reply, SITE_ROOT, 'crypto-plaza.js', { type: JS_TYPE }));
 app.get('/v6-observer-status.js', (request, reply) => sendSiteFile(request, reply, SITE_ROOT, 'v6-observer-status.js', { type: JS_TYPE }));
 app.get('/vendor/three.module.min.js', (request, reply) => sendSiteFile(request, reply, SITE_ROOT, path.join('vendor', 'three.module.min.js'),
   { type: JS_TYPE, cacheControl: 'public, max-age=86400' }));
@@ -369,9 +342,7 @@ app.get('/local/map-data', async (_request, reply) => {
     FROM worlds WHERE open=true ORDER BY created_at DESC LIMIT 1`);
   if (!world.rowCount) return { world: null, scenes: [], residents: [], events: [], dataCenterLogs: [], generatedAt: new Date().toISOString() };
   const worldId = world.rows[0].id;
-  const cryptoQuotes = await readCryptoQuotes();
-  const robinhoodMarket = await readRobinhoodMarket(pool);
-  const [scenes, residents, events, dataCenterLogs, cryptoPortfolios, cryptoTrades, memePortfolios, memeTrades, clock] = await Promise.all([
+  const [scenes, residents, events, dataCenterLogs, clock] = await Promise.all([
     pool.query(`SELECT s.id,s.name,s.scene_type AS "sceneType",s.status,s.description,s.purpose,s.capacity,s.features,s.position,
       s.created_world_minutes AS "createdWorldTime",s.created_by_project_id AS "createdByProjectId",
       s.created_by_organization_id AS "createdByOrganizationId",s.created_at AS "createdAt",
@@ -380,7 +351,9 @@ app.get('/local/map-data', async (_request, reply) => {
     pool.query(`SELECT a.id,a.name,a.gender,m.energy,m.food,m.social,m.location,
         coalesce(ws.happiness,60) AS happiness,coalesce(ws.knowledge,20) AS knowledge,
         coalesce(ws.goal,'balanced') AS goal,ws.risk_tolerance::text AS "riskTolerance",
-        coalesce(ws.status,'idle') AS "currentStatus",ws.planned_action AS "currentAction",
+        coalesce(ws.status,'idle') AS "currentStatus",
+        CASE WHEN ws.planned_action IN ('trade','trade_crypto','trade_meme','trade_hold') THEN NULL
+          ELSE ws.planned_action END AS "currentAction",
         coalesce(ws.hygiene,80) AS hygiene,coalesce(ws.fun,70) AS fun,ws.activity_variant AS "activityVariant",
         ws.target_location AS "targetLocation",ws.movement_started_at AS "movementStartedAt",
         ws.movement_ends_at AS "movementEndsAt",ws.action_started_at AS "actionStartedAt",ws.action_ends_at AS "actionEndsAt",
@@ -404,9 +377,6 @@ app.get('/local/map-data', async (_request, reply) => {
             FROM world_relationships rel JOIN agents other ON other.id=CASE WHEN rel.agent_a_id=m.agent_id THEN rel.agent_b_id ELSE rel.agent_a_id END
             WHERE rel.world_id=m.world_id AND (rel.agent_a_id=m.agent_id OR rel.agent_b_id=m.agent_id)
             ORDER BY rel.familiarity DESC,rel.interaction_count DESC LIMIT 10) recent),'[]'::jsonb) AS "relationshipSummary",
-        coalesce((SELECT balance::text FROM crypto_balances b WHERE b.world_id=m.world_id AND b.agent_id=m.agent_id AND b.asset_symbol='USDC'),'0') AS "usdcBalance",
-        coalesce((SELECT balance::text FROM crypto_balances b WHERE b.world_id=m.world_id AND b.agent_id=m.agent_id AND b.asset_symbol='BTC'),'0') AS "btcBalance",
-        coalesce((SELECT balance::text FROM crypto_balances b WHERE b.world_id=m.world_id AND b.agent_id=m.agent_id AND b.asset_symbol='ETH'),'0') AS "ethBalance",
         recent.event_type AS "lastEventType",recent.action AS "lastEventAction",recent.created_at AS "lastEventAt",recent.place AS "lastEventPlace"
       FROM world_members m JOIN agents a ON a.id=m.agent_id
       LEFT JOIN world_agent_states ws ON ws.world_id=m.world_id AND ws.agent_id=m.agent_id
@@ -415,66 +385,32 @@ app.get('/local/map-data', async (_request, reply) => {
       LEFT JOIN LATERAL (
         SELECT e.event_type,e.created_at,coalesce(e.data->>'place',e.data->>'to') AS place,e.data->>'action' AS action
         FROM world_events e WHERE e.world_id=m.world_id AND e.actor_id=m.agent_id
-          AND (e.event_type LIKE 'action.%' OR e.event_type LIKE 'world.%' OR e.event_type LIKE 'crypto.%')
+          AND (e.event_type LIKE 'action.%' OR e.event_type LIKE 'world.%')
+          AND COALESCE(e.data->>'action','') NOT IN ('trade','trade_crypto','trade_meme','trade_hold')
         ORDER BY e.id DESC LIMIT 1
       ) recent ON true
       WHERE m.world_id=$1 ORDER BY m.joined_at,a.name`, [worldId]),
     pool.query(`SELECT a.name AS "agentName",e.event_type AS "eventType",coalesce(e.data->>'place',e.data->>'to') AS place,
-        e.data->>'action' AS action,e.data->>'side' AS side,e.data->>'asset' AS asset,e.created_at AS "createdAt",
+        e.data->>'action' AS action,e.created_at AS "createdAt",
         e.data->>'variant' AS variant,e.data->>'weather' AS weather
       FROM world_events e JOIN agents a ON a.id=e.actor_id
-      WHERE e.world_id=$1 AND (e.event_type LIKE 'action.%' OR e.event_type='scene.created' OR e.event_type LIKE 'crypto.%' OR e.event_type LIKE 'world.%')
+      WHERE e.world_id=$1 AND (e.event_type LIKE 'action.%' OR e.event_type='scene.created' OR e.event_type LIKE 'world.%')
+        AND e.event_type NOT LIKE 'crypto.%'
+        AND COALESCE(e.data->>'action','') NOT IN ('trade','trade_crypto','trade_meme','trade_hold')
       ORDER BY e.id DESC LIMIT 24`, [worldId]),
     pool.query(`SELECT a.name AS "agentName",e.event_type AS "eventType",coalesce(e.data->>'place',e.data->>'to') AS place,
-        e.data->>'action' AS action,e.data->>'side' AS side,e.data->>'asset' AS asset,e.created_at AS "createdAt",
+        e.data->>'action' AS action,e.created_at AS "createdAt",
         e.data->>'variant' AS variant,e.data->>'weather' AS weather
       FROM world_events e JOIN agents a ON a.id=e.actor_id
-      WHERE e.world_id=$1 AND (e.event_type LIKE 'action.%' OR e.event_type='scene.created' OR e.event_type LIKE 'crypto.%' OR e.event_type LIKE 'world.%')
+      WHERE e.world_id=$1 AND (e.event_type LIKE 'action.%' OR e.event_type='scene.created' OR e.event_type LIKE 'world.%')
+        AND e.event_type NOT LIKE 'crypto.%'
+        AND COALESCE(e.data->>'action','') NOT IN ('trade','trade_crypto','trade_meme','trade_hold')
       ORDER BY e.id DESC LIMIT 100`, [worldId]),
-    pool.query(`SELECT a.id AS "agentId",a.name,
-        COALESCE(sum(b.balance * q.price_usd),0)::text AS "netAssetValueUsd",
-        COALESCE(sum(b.balance) FILTER (WHERE b.asset_symbol='USDC'),0)::text AS "usdcBalance",
-        COALESCE(sum(b.balance) FILTER (WHERE b.asset_symbol='BTC'),0)::text AS "btcBalance",
-        COALESCE(sum(b.balance) FILTER (WHERE b.asset_symbol='ETH'),0)::text AS "ethBalance"
-      FROM world_members m JOIN agents a ON a.id=m.agent_id
-      LEFT JOIN crypto_balances b ON b.world_id=m.world_id AND b.agent_id=m.agent_id
-      LEFT JOIN crypto_market_quotes q ON q.symbol=b.asset_symbol
-      WHERE m.world_id=$1 GROUP BY a.id,a.name ORDER BY min(m.joined_at),a.name`, [worldId]),
-    pool.query(`SELECT a.name AS "agentName",a.id AS "agentId",t.side,t.asset_symbol AS asset,t.quantity::text AS quantity,
-        t.price_usd::text AS "priceUsd",t.notional_usd::text AS "notionalUsd",t.fee_usdc::text AS "feeUsdc",
-        t.created_at AS "createdAt"
-      FROM crypto_trades t JOIN agents a ON a.id=t.agent_id WHERE t.world_id=$1
-      ORDER BY t.created_at DESC LIMIT 50`, [worldId]),
-    pool.query(`SELECT p.agent_id AS "agentId",round(sum(p.quantity_raw*q.price_usd/power(10::numeric,t.decimals)),8)::text AS "memeValueUsd"
-      FROM robinhood_paper_positions p JOIN robinhood_tokens t USING(token_address)
-      JOIN robinhood_market_quotes q USING(token_address) WHERE p.world_id=$1 GROUP BY p.agent_id`, [worldId]),
-    pool.query(`SELECT a.name AS "agentName",a.id AS "agentId",o.side,o.token_address AS "tokenAddress",o.token_amount_raw::text AS "quantityRaw",
-        t.decimals,o.data->>'priceUsd' AS "priceUsd",o.notional_usd::text AS "notionalUsd",
-        o.fee_usdc::text AS "feeUsdc",o.created_at AS "createdAt"
-      FROM robinhood_paper_orders o JOIN agents a ON a.id=o.agent_id JOIN robinhood_tokens t USING(token_address)
-      WHERE o.world_id=$1 ORDER BY o.created_at DESC LIMIT 50`, [worldId]),
     worldClock(pool, worldId, worldEngine.running)
   ]);
-  const portfolioByAgent = new Map(cryptoPortfolios.rows.map((portfolio) => [portfolio.agentId, portfolio]));
-  for (const resident of residents.rows) {
-    const portfolio = portfolioByAgent.get(resident.id);
-    resident.assets = { USDC: portfolio?.usdcBalance || resident.usdcBalance,
-      BTC: portfolio?.btcBalance || resident.btcBalance, ETH: portfolio?.ethBalance || resident.ethBalance };
-  }
-  const memeValueByAgent = new Map(memePortfolios.rows.map((row) => [row.agentId, Number(row.memeValueUsd || 0)]));
-  for (const portfolio of cryptoPortfolios.rows) {
-    portfolio.netAssetValueUsd = (Number(portfolio.netAssetValueUsd || 0) + (memeValueByAgent.get(portfolio.agentId) || 0)).toFixed(8);
-  }
-  const recentMemeTrades = memeTrades.rows.map((trade) => ({
-    ...trade, asset: `0x${trade.tokenAddress.slice(2, 10)}`, quantity: formatRawTokenAmount(trade.quantityRaw, trade.decimals),
-    simulatedMeme: true
-  }));
-  const recentTrades = [...cryptoTrades.rows, ...recentMemeTrades]
-    .sort((left, right) => new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime()).slice(0, 50);
   const worldMinutes = Number(clock?.worldMinutes) || 0;
   const environment = enrichMapEnvironment({ worldSeed: worldId, worldMinutes, scenes: scenes.rows,
     residents: residents.rows, events: [...events.rows, ...dataCenterLogs.rows] });
-  const market = await readWorldMarket(pool, { worldId, recentTrades: cryptoTrades.rows });
   const emergence = await readEmergenceReport(pool, { worldId, worldMinutes });
   const recoveryMetrics = await readEconomicRecoveryMetrics(pool, { worldId, worldMinutes });
   const [economyDashboard, businesses, economicDemand, economyHistory] = await Promise.all([
@@ -537,8 +473,7 @@ app.get('/local/map-data', async (_request, reply) => {
   agentTokenIssuance.pilotGeneration = AGENT_TOKEN_PILOT_GENERATION;
   const worldEvolution = { dashboard: { ...counts.rows[0], worldMinutes, worldAgeHours: Math.round(worldMinutes / 60),
       worldAgeDays: Math.floor(worldMinutes / 1_440) + 1,
-      totalSimulatedWealthUsd: (Number(economyDashboard.rows[0]?.total_resident_net_worth_usd || 0)
-        + [...memeValueByAgent.values()].reduce((sum, value) => sum + value, 0)).toFixed(2),
+      totalSimulatedWealthUsd: Number(economyDashboard.rows[0]?.total_resident_net_worth_usd || 0).toFixed(2),
         totalInternalUnits: internalUnits.rows[0].units }, opportunities: opportunities.rows, projects,
     organizations, institutions, capabilities, v6Lifecycle, v6LifecycleObserver: v6LifecycleObserverStatus,
     arcMainnet: publicArcObserverStatus.arcMainnet,
@@ -558,9 +493,9 @@ app.get('/local/map-data', async (_request, reply) => {
     demand: economicDemand.rows, history: economyHistory.rows, recovery: recoveryMetrics,
     settlement: 'simulated_internal_ledger', chainSettlementEnabled: false };
   worldEvolution.emergence = emergence;
-  return { world: { ...world.rows[0], engine: clock || { running: false }, environment, market }, scenes: scenes.rows, residents: residents.rows, events: events.rows,
-    dataCenterLogs: dataCenterLogs.rows, trading: { simulated: true, quotes: cryptoQuotes, robinhood: robinhoodMarket,
-      portfolios: cryptoPortfolios.rows, recentTrades }, worldEvolution, generatedAt: new Date().toISOString() };
+  return { world: { ...world.rows[0], engine: clock || { running: false }, environment }, scenes: scenes.rows,
+    residents: residents.rows, events: events.rows, dataCenterLogs: dataCenterLogs.rows,
+    worldEvolution, generatedAt: new Date().toISOString() };
 });
 
 app.get('/local/map-data/residents/:agentId', async (request, reply) => {
@@ -584,7 +519,9 @@ app.get('/local/map-data/residents/:agentId', async (request, reply) => {
         p.ambition::text AS ambition,p.personality_modifiers AS "personalityModifiers",
         p.risk_modifier::text AS "riskModifier",p.price_sensitivity::text AS "priceSensitivity",
         s.risk_tolerance::text AS "riskTolerance",
-        m.location,COALESCE(s.status,'idle') AS "currentStatus",s.planned_action AS "currentAction",
+        m.location,COALESCE(s.status,'idle') AS "currentStatus",
+        CASE WHEN s.planned_action IN ('trade','trade_crypto','trade_meme','trade_hold') THEN NULL
+          ELSE s.planned_action END AS "currentAction",
         am.current_goal AS "currentIntent",p.last_reflection_world_minutes AS "lastReflectionWorldMinutes"
       FROM world_members m JOIN agents a ON a.id=m.agent_id
       LEFT JOIN world_social_profiles p ON p.world_id=m.world_id AND p.agent_id=m.agent_id
@@ -605,6 +542,8 @@ app.get('/local/map-data/residents/:agentId', async (request, reply) => {
         related.name AS "relatedAgentName",memory.metadata,memory.created_at AS "createdAt",memory.long_term AS "longTerm"
       FROM agent_memories memory LEFT JOIN agents related ON related.id=memory.related_agent_id
       WHERE memory.world_id=$1 AND memory.agent_id=$2
+        AND COALESCE(memory.metadata->>'action','') NOT IN ('trade','trade_crypto','trade_meme','trade_hold')
+        AND memory.memory_type NOT IN ('trade','trading')
         AND (memory.consolidation_key LIKE 'world_epoch:%' OR memory.id IN (
           SELECT recent.id FROM agent_memories recent WHERE recent.world_id=$1 AND recent.agent_id=$2
           ORDER BY recent.world_minutes DESC,recent.id DESC LIMIT 12))
@@ -621,7 +560,9 @@ app.get('/local/map-data/residents/:agentId', async (request, reply) => {
     pool.query(`SELECT tick_count AS "tickCount",world_minutes AS "worldMinutes",chosen_candidate_id AS "candidateId",
         chosen_action AS action,behavior_probability::text AS probability,distribution,utility_scores AS "utilityScores",
         goal_snapshot AS goals,rationale,created_at AS "createdAt"
-      FROM world_decision_traces WHERE world_id=$1 AND agent_id=$2 ORDER BY tick_count DESC,id DESC LIMIT 8`, [worldId, agentId]),
+      FROM world_decision_traces WHERE world_id=$1 AND agent_id=$2
+        AND chosen_action NOT IN ('trade','trade_crypto','trade_meme','trade_hold')
+      ORDER BY tick_count DESC,id DESC LIMIT 8`, [worldId, agentId]),
     pool.query(`SELECT world_minutes AS "worldMinutes",trigger,rationale,created_at AS "createdAt"
       FROM world_agent_reflections WHERE world_id=$1 AND agent_id=$2 ORDER BY world_minutes DESC,id DESC LIMIT 5`, [worldId, agentId])
     ,pool.query(`SELECT asset_symbol AS asset,balance::text AS balance FROM world_economic_accounts
@@ -702,13 +643,13 @@ app.get('/local/map-data/residents/:agentId', async (request, reply) => {
           AND NOT (child.asset_type||':'||child.asset_id::text)=ANY(holdings.path)
       ), assets AS (
         SELECT account.account_type AS asset_type,account.owner_id AS asset_id,
-          sum(account.balance*COALESCE(quote.price_usd,0)) AS value_usd
-        FROM world_economic_accounts account LEFT JOIN crypto_market_quotes quote ON quote.symbol=account.asset_symbol
+          sum(account.balance) AS value_usd
+        FROM world_economic_accounts account
         WHERE account.world_id=$1 AND account.account_type IN ('business','organization','project')
         GROUP BY account.account_type,account.owner_id
       )
-      SELECT (SELECT COALESCE(sum(account.balance*COALESCE(quote.price_usd,0)),0)
-          FROM world_economic_accounts account LEFT JOIN crypto_market_quotes quote ON quote.symbol=account.asset_symbol
+      SELECT (SELECT COALESCE(sum(account.balance),0)
+          FROM world_economic_accounts account
           WHERE account.world_id=$1 AND account.account_type='resident' AND account.owner_id=$2)
         +(SELECT COALESCE(sum(holdings.share*assets.value_usd),0) FROM holdings JOIN assets USING(asset_type,asset_id)) AS "netWorthUsd"`,
     [worldId, agentId])
@@ -854,9 +795,6 @@ app.post('/v1/worlds', async (request, reply) => {
     if (duplicate.rowCount) return duplicate.rows[0].data;
     const world = (await client.query('INSERT INTO worlds(owner_agent_id,name,chain_id) VALUES($1,$2,$3) RETURNING *', [request.agentId, name.trim(), CHAIN_ID])).rows[0];
     await client.query("INSERT INTO world_members(world_id,agent_id,role) VALUES($1,$2,'owner')", [world.id, request.agentId]);
-    await client.query('INSERT INTO crypto_risk_limits(world_id,starting_usdc,max_order_nav_bps,max_asset_nav_bps,fee_bps,spread_bps) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING',
-      [world.id, STARTING_USDC, MAX_ORDER_NAV_BPS, MAX_ASSET_NAV_BPS, TRADE_FEE_BPS, SPREAD_BPS]);
-    await ensureCryptoAccount(client, { worldId: world.id, agentId: request.agentId });
     const response = { worldId: world.id, name: world.name, chainId: world.chain_id, tokenStatus: world.token_status };
     await client.query("INSERT INTO world_events(world_id,actor_id,event_type,data,action_id) VALUES($1,$2,'world.created',$3,$4)", [world.id, request.agentId, response, idempotencyKey]);
     return response;
@@ -889,7 +827,6 @@ app.post('/v1/worlds/:worldId/join', async (request, reply) => {
     if (!world.rowCount) throw Object.assign(new Error('WORLD_NOT_FOUND'), { statusCode: 404 });
     if (!world.rows[0].open) throw Object.assign(new Error('WORLD_CLOSED'), { statusCode: 403 });
     await client.query("INSERT INTO world_members(world_id,agent_id,role) VALUES($1,$2,'resident') ON CONFLICT DO NOTHING", [worldId, request.agentId]);
-    await ensureCryptoAccount(client, { worldId, agentId: request.agentId });
     const response = { worldId, joined: true };
     await client.query("INSERT INTO world_events(world_id,actor_id,event_type,data,action_id) VALUES($1,$2,'agent.joined',$3,$4)", [worldId, request.agentId, response, actionId]);
     return response;
@@ -1085,11 +1022,12 @@ app.get('/v1/worlds/:worldId/observe', async (request, reply) => {
   const me = await pool.query(`SELECT m.*,w.name AS world_name,w.owner_agent_id,w.chain_id,w.token_address,w.token_name,w.token_symbol,w.token_status
     FROM world_members m JOIN worlds w ON w.id=m.world_id WHERE m.world_id=$1 AND m.agent_id=$2`, [worldId, request.agentId]);
   if (!me.rowCount) return fail(reply, 403, 'AGENT_NOT_IN_WORLD');
-  const [cryptoQuotes, robinhoodMarket] = await Promise.all([readCryptoQuotes(), readRobinhoodMarket(pool)]);
   const [members, events, consents, balance, mines, scenes, mind, adultServices, adultServiceBookings] = await Promise.all([
     pool.query(`SELECT a.id,a.name,a.gender,m.role,m.energy,m.food,m.social,m.location
       FROM world_members m JOIN agents a ON a.id=m.agent_id WHERE m.world_id=$1 ORDER BY m.joined_at`, [worldId]),
     pool.query(`SELECT id,actor_id,event_type,data,created_at FROM world_events WHERE world_id=$1
+      AND event_type NOT LIKE 'crypto.%'
+      AND COALESCE(data->>'action','') NOT IN ('trade','trade_crypto','trade_meme','trade_hold')
       AND ((event_type NOT LIKE 'adult_service.%' AND event_type <> 'interaction.intimacy') OR actor_id=$2)
       ORDER BY id DESC LIMIT 30`, [worldId, request.agentId]),
     pool.query(`SELECT id,requester_id,target_id,scope,status,created_at,expires_at FROM consents
@@ -1112,16 +1050,6 @@ app.get('/v1/worlds/:worldId/observe', async (request, reply) => {
   const self = me.rows[0];
   const tokenIssuanceIntents = arcTokenSchemaReady
     ? await listWorldTokenIssuance(pool, { worldId, limit: 30 }) : [];
-  const [trading, risk, recentCryptoOrders, robinhoodPaper] = await Promise.all([
-    accountSnapshot(pool, worldId, request.agentId, cryptoQuotes),
-    pool.query(`SELECT starting_usdc::text AS "startingUsdc",max_order_nav_bps AS "maxOrderNavBps",
-        max_asset_nav_bps AS "maxAssetNavBps",fee_bps AS "feeBps",spread_bps AS "spreadBps"
-      FROM crypto_risk_limits WHERE world_id=$1`, [worldId]),
-    pool.query(`SELECT id,side,asset_symbol AS asset,quantity::text AS quantity,price_usd::text AS "priceUsd",
-        notional_usd::text AS "notionalUsd",fee_usdc::text AS "feeUsdc",status,created_at AS "createdAt"
-      FROM crypto_orders WHERE world_id=$1 AND agent_id=$2 ORDER BY created_at DESC LIMIT 10`, [worldId, request.agentId]),
-    readRobinhoodPaperAccount(pool, worldId, request.agentId)
-  ]);
   return {
     world: { id: worldId, name: self.world_name, ownerAgentId: self.owner_agent_id, chainId: self.chain_id,
       token: self.token_address ? { address: self.token_address, name: self.token_name, symbol: self.token_symbol, status: self.token_status } : null,
@@ -1133,144 +1061,8 @@ app.get('/v1/worlds/:worldId/observe', async (request, reply) => {
       decimalsRange: [0, 18], writesEnabled: ARC_CONFIG.writesEnabled,
       intents: tokenIssuanceIntents },
     adultServices: adultServices.rows,
-    adultServiceBookings: adultServiceBookings.rows,
-    market: { quotes: cryptoQuotes, simulated: true, robinhood: robinhoodMarket },
-    trading: { ...trading, netAssetValueUsd: robinhoodPaper.netAssetValueUsd,
-      risk: risk.rows[0] || null, recentOrders: recentCryptoOrders.rows,
-      robinhoodPaper, onChain: false }
+    adultServiceBookings: adultServiceBookings.rows
   };
-});
-
-app.get('/v1/worlds/:worldId/market', async (request, reply) => {
-  const { worldId } = request.params;
-  if (!validUuid(worldId)) return fail(reply, 400, 'WORLD_ID_INVALID');
-  await assertMember(pool, worldId, request.agentId);
-  const quotes = await readCryptoQuotes();
-  const robinhood = await readRobinhoodMarket(pool);
-  return { simulated: true, quoteAsset: 'USDC', quotes, robinhood, updatedAt: quotes[0]?.asOf || null };
-});
-
-app.get('/v1/worlds/:worldId/trading/account', async (request, reply) => {
-  const { worldId } = request.params;
-  if (!validUuid(worldId)) return fail(reply, 400, 'WORLD_ID_INVALID');
-  await assertMember(pool, worldId, request.agentId);
-  const [quotes, risk, orders, robinhoodPaper] = await Promise.all([
-    readCryptoQuotes(),
-    pool.query(`SELECT starting_usdc::text AS "startingUsdc",max_order_nav_bps AS "maxOrderNavBps",
-        max_asset_nav_bps AS "maxAssetNavBps",fee_bps AS "feeBps",spread_bps AS "spreadBps"
-      FROM crypto_risk_limits WHERE world_id=$1`, [worldId]),
-    pool.query(`SELECT id,side,asset_symbol AS asset,quantity::text AS quantity,price_usd::text AS "priceUsd",
-        notional_usd::text AS "notionalUsd",fee_usdc::text AS "feeUsdc",status,created_at AS "createdAt"
-      FROM crypto_orders WHERE world_id=$1 AND agent_id=$2 ORDER BY created_at DESC LIMIT 50`, [worldId, request.agentId]),
-    readRobinhoodPaperAccount(pool, worldId, request.agentId)
-  ]);
-  const account = await accountSnapshot(pool, worldId, request.agentId, quotes);
-  return { ...account, netAssetValueUsd: robinhoodPaper.netAssetValueUsd,
-    risk: risk.rows[0] || null, recentOrders: orders.rows, robinhoodPaper, onChain: false };
-});
-
-app.get('/v1/worlds/:worldId/trading/orders', async (request, reply) => {
-  const { worldId } = request.params;
-  const limit = Math.max(1, Math.min(Number(request.query.limit) || 50, 100));
-  if (!validUuid(worldId)) return fail(reply, 400, 'WORLD_ID_INVALID');
-  await assertMember(pool, worldId, request.agentId);
-  const orders = await pool.query(`SELECT id,side,asset_symbol AS asset,quote_version AS "quoteVersion",
-      quantity::text AS quantity,price_usd::text AS "priceUsd",notional_usd::text AS "notionalUsd",
-      fee_usdc::text AS "feeUsdc",status,created_at AS "createdAt"
-    FROM crypto_orders WHERE world_id=$1 AND agent_id=$2 ORDER BY created_at DESC LIMIT $3`, [worldId, request.agentId, limit]);
-  return { orders: orders.rows };
-});
-
-app.post('/v1/worlds/:worldId/trading/orders', async (request, reply) => {
-  const { worldId } = request.params;
-  const { actionId, side, asset, quoteUnits, quoteVersion, mindUpdate } = request.body || {};
-  if (!validUuid(worldId) || !['buy', 'sell'].includes(side) || !['BTC', 'ETH'].includes(asset) ||
-      typeof quoteVersion !== 'number' || !Number.isSafeInteger(quoteVersion) || !validMindUpdate(mindUpdate)) return fail(reply, 400, 'CRYPTO_ORDER_INVALID');
-  let parsedQuote;
-  try { parsedQuote = formatUnits(parsePositiveUnits(quoteUnits)); }
-  catch { return fail(reply, 400, 'CRYPTO_ORDER_SIZE_INVALID'); }
-  const id = requireActionId({ actionId });
-  const result = await transaction(async (client) => {
-    await assertMember(client, worldId, request.agentId, true);
-    await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', [`crypto:${worldId}:${request.agentId}:${id}`]);
-    const prior = await client.query('SELECT data FROM crypto_orders WHERE world_id=$1 AND agent_id=$2 AND action_id=$3',
-      [worldId, request.agentId, id]);
-    if (prior.rowCount) return prior.rows[0].data;
-    const [quotes, limits] = await Promise.all([
-      readCryptoQuotes(client),
-      client.query(`SELECT max_order_nav_bps AS "maxOrderNavBps",max_asset_nav_bps AS "maxAssetNavBps",
-          fee_bps AS "feeBps",spread_bps AS "spreadBps" FROM crypto_risk_limits WHERE world_id=$1`, [worldId])
-    ]);
-    const quote = quotes.find((item) => item.symbol === asset);
-    if (!quote || quote.quoteVersion !== quoteVersion) throw Object.assign(new Error('CRYPTO_QUOTE_STALE'), { statusCode: 409 });
-    const quoteBundle = { ...quote, all: quotes };
-    const trade = await executeCryptoTrade(client, { worldId, agentId: request.agentId, actionId: id, side, asset,
-      quoteUnits: parsedQuote, quote: quoteBundle, feeBps: limits.rows[0]?.feeBps ?? TRADE_FEE_BPS,
-      spreadBps: limits.rows[0]?.spreadBps ?? SPREAD_BPS,
-      maxOrderNavBps: limits.rows[0]?.maxOrderNavBps ?? MAX_ORDER_NAV_BPS,
-      maxAssetNavBps: limits.rows[0]?.maxAssetNavBps ?? MAX_ASSET_NAV_BPS });
-    await client.query(`INSERT INTO world_events(world_id,actor_id,event_type,data,action_id)
-      VALUES($1,$2,'crypto.trade_filled',$3,$4)`, [worldId, request.agentId, trade, id]);
-    if (mindUpdate) await updateAgentMind(client, worldId, request.agentId, mindUpdate.currentGoal.trim(), 'trade_meme',
-      `${side === 'buy' ? 'Bought' : 'Sold'} ${trade.quantity} ${asset} in the simulated spot market.`);
-    return trade;
-  });
-  return reply.code(201).send(result);
-});
-
-app.post('/v1/worlds/:worldId/trading/robinhood-orders', async (request, reply) => {
-  const { worldId } = request.params;
-  const { actionId, side, tokenAddress, quoteUnits, tokenAmountRaw, quoteVersion, mindUpdate } = request.body || {};
-  if (!validUuid(worldId) || !['buy', 'sell'].includes(side) || typeof tokenAddress !== 'string' ||
-      !/^0x[0-9a-f]{40}$/i.test(tokenAddress) || typeof quoteVersion !== 'number' ||
-      !Number.isSafeInteger(quoteVersion) || quoteVersion < 0 || !validMindUpdate(mindUpdate)) {
-    return fail(reply, 400, 'ROBINHOOD_ORDER_INVALID');
-  }
-  if (side === 'buy') {
-    try { parsePositiveUnits(quoteUnits); }
-    catch { return fail(reply, 400, 'ROBINHOOD_ORDER_SIZE_INVALID'); }
-  } else if (typeof tokenAmountRaw !== 'string' || !/^[1-9]\d{0,77}$/.test(tokenAmountRaw)) {
-    return fail(reply, 400, 'ROBINHOOD_TOKEN_AMOUNT_INVALID');
-  }
-  const id = requireActionId({ actionId });
-  const result = await transaction(async (client) => {
-    await assertMember(client, worldId, request.agentId, true);
-    const prior = await client.query(`SELECT data FROM world_events
-      WHERE world_id=$1 AND actor_id=$2 AND action_id=$3`, [worldId, request.agentId, id]);
-    if (prior.rowCount) return prior.rows[0].data;
-    const trade = await executeRobinhoodPaperTrade(client, {
-      worldId, agentId: request.agentId, actionId: id, side, tokenAddress, quoteVersion,
-      quoteUnits: side === 'buy' ? formatUnits(parsePositiveUnits(quoteUnits)) : undefined,
-      tokenAmountRaw: side === 'sell' ? tokenAmountRaw : undefined
-    });
-    await client.query(`INSERT INTO world_events(world_id,actor_id,event_type,data,action_id)
-      VALUES($1,$2,'crypto.robinhood_paper_filled',$3,$4)`, [worldId, request.agentId, trade, id]);
-    if (mindUpdate) await updateAgentMind(client, worldId, request.agentId, mindUpdate.currentGoal.trim(), 'trade_crypto',
-      `${side === 'buy' ? 'Bought' : 'Sold'} a Robinhood Pons V2 token in the simulated market.`);
-    return trade;
-  });
-  return reply.code(201).send(result);
-});
-
-app.post('/v1/worlds/:worldId/trading/hold', async (request, reply) => {
-  const { worldId } = request.params;
-  const { actionId, quoteVersion, mindUpdate } = request.body || {};
-  if (!validUuid(worldId) || typeof quoteVersion !== 'number' || !Number.isSafeInteger(quoteVersion) || !validMindUpdate(mindUpdate)) return fail(reply, 400, 'CRYPTO_HOLD_INVALID');
-  const id = requireActionId({ actionId });
-  const result = await transaction(async (client) => {
-    await assertMember(client, worldId, request.agentId, true);
-    const prior = await client.query('SELECT data FROM world_events WHERE world_id=$1 AND actor_id=$2 AND action_id=$3', [worldId, request.agentId, id]);
-    if (prior.rowCount) return prior.rows[0].data;
-    const quotes = await readCryptoQuotes(client);
-    if (!quotes.some((quote) => quote.quoteVersion === quoteVersion)) throw Object.assign(new Error('CRYPTO_QUOTE_STALE'), { statusCode: 409 });
-    const response = { action: 'hold', status: 'no_order', quoteVersion, simulated: true };
-    await client.query(`INSERT INTO world_events(world_id,actor_id,event_type,data,action_id)
-      VALUES($1,$2,'crypto.trade_held',$3,$4)`, [worldId, request.agentId, response, id]);
-    if (mindUpdate) await updateAgentMind(client, worldId, request.agentId, mindUpdate.currentGoal.trim(), 'trade_hold',
-      'Reviewed the simulated market and kept the portfolio unchanged.');
-    return response;
-  });
-  return reply.send(result);
 });
 
 app.get('/v1/worlds/:worldId/adult-services', async (request, reply) => {
@@ -1704,7 +1496,6 @@ app.post('/v1/offspring/:offspringId/activate', async (request, reply) => {
     if (!verifySignature(publicKey, claimMessage, childSignature)) throw Object.assign(new Error('CHILD_KEY_PROOF_INVALID'), { statusCode: 401 });
     const agent = (await client.query('INSERT INTO agents(name,public_key) VALUES($1,$2) RETURNING id,name', [name.trim(), publicKey])).rows[0];
     await client.query("INSERT INTO world_members(world_id,agent_id,role) VALUES($1,$2,'resident')", [row.world_id, agent.id]);
-    await ensureCryptoAccount(client, { worldId: row.world_id, agentId: agent.id });
     await client.query('UPDATE offspring SET claimed_agent_id=$2,activation_hash=$3 WHERE id=$1', [offspringId, agent.id, 'used']);
     const response = { agent, worldId: row.world_id };
     await client.query("INSERT INTO world_events(world_id,actor_id,event_type,data,action_id) VALUES($1,$2,'offspring.activated',$3,$4) ON CONFLICT DO NOTHING", [row.world_id, request.agentId, response, id]);
@@ -1732,9 +1523,8 @@ app.get('/v1/worlds/:worldId/initiative-state', async (request, reply) => {
         (SELECT count(*)::int FROM world_projects WHERE world_id=$1 AND status='completed') AS completed_projects,
         (SELECT count(*)::int FROM world_opportunities WHERE world_id=$1 AND status IN ('open','active')
           AND (expires_world_time IS NULL OR expires_world_time>$2)) AS active_opportunities`, [worldId, worldMinutes]),
-    pool.query(`SELECT COALESCE(sum(balance * CASE WHEN account.asset_symbol='USDC' THEN 1 ELSE quote.price_usd END),0)::text AS usd
-      FROM crypto_balances account LEFT JOIN crypto_market_quotes quote ON quote.symbol=account.asset_symbol
-      WHERE account.world_id=$1 AND account.asset_symbol IN ('USDC','BTC','ETH')`, [worldId]),
+    pool.query(`SELECT COALESCE(sum(balance),0)::text AS usd FROM world_economic_accounts
+      WHERE world_id=$1 AND account_type='resident' AND asset_symbol='USDC'`, [worldId]),
     worldClock(pool, worldId, worldEngine.running)
   ]);
   return { worldId, worldMinutes, clock,
@@ -2602,7 +2392,6 @@ if (arcSchemaReady) {
   }
 }
 await expireAdultServiceBookings();
-await refreshCryptoQuotes();
 await app.listen({ host: HOST, port: PORT });
 let typeSafeRuntimeState = null;
 if (process.env.TYPESAFE_API_KEY) {
@@ -2662,19 +2451,8 @@ const adultServiceExpiryTimer = setInterval(() => {
   expireAdultServiceBookings().catch((error) => app.log.error({ err: error }, 'adult service booking expiry failed'));
 }, 60_000);
 adultServiceExpiryTimer.unref();
-const cryptoMarketTimer = setInterval(() => {
-  refreshCryptoQuotes().catch((error) => app.log.error({ err: error }, 'simulated crypto quote refresh failed'));
-}, 60_000);
-cryptoMarketTimer.unref();
-const robinhoodMarketTimer = setInterval(() => {
-  scanRobinhoodMarket(pool).catch((error) => app.log.error({ err: error }, 'Robinhood Pons V2 read-only market scan failed'));
-}, ROBINHOOD_SCAN_INTERVAL_MS);
-robinhoodMarketTimer.unref();
-setImmediate(() => scanRobinhoodMarket(pool).catch((error) => app.log.error({ err: error }, 'Robinhood Pons V2 initial scan failed')));
 async function shutdown() {
   clearInterval(adultServiceExpiryTimer);
-  clearInterval(cryptoMarketTimer);
-  clearInterval(robinhoodMarketTimer);
   await arcSettlementWorker?.stop();
   await arcAgentTokenIssuanceWorker?.stop();
   await arcObserver?.stop();

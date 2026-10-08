@@ -16,10 +16,6 @@ const mapStatusDot = document.querySelector('#map-status-dot');
 const mapUpdated = document.querySelector('#map-updated');
 const mapError = document.querySelector('#map-error');
 const sceneMap = document.querySelector('#scene-map');
-const marketQuotes = document.querySelector('#market-quotes');
-const marketUpdated = document.querySelector('#market-updated');
-const portfolioSummary = document.querySelector('#portfolio-summary');
-const recentTrades = document.querySelector('#recent-trades');
 const evolutionStats = document.querySelector('#world-evolution-stats');
 const opportunityList = document.querySelector('#world-opportunity-list');
 const projectList = document.querySelector('#world-project-list');
@@ -74,15 +70,13 @@ const MAP_POINTS = [
 ];
 const SCENE_ICONS = { garden: '❋', studio: '◈', library: '▤', cafe: '◒', workshop: '⌘', observatory: '⊙', commons: '✳', data_center: '▥' };
 const ARCHETYPES = { naturalist: 'Naturalist', maker: 'Maker', scholar: 'Scholar', host: 'Organizer', observer: 'Observer' };
-const ROLE_LABELS = { researcher: 'Researcher', engineer: 'Engineer', trader: 'Trader', worker: 'Builder', socialite: 'Socialite', generalist: 'Generalist' };
-const GOAL_LABELS = { BUILD_WEALTH: 'Build wealth', MASTER_TRADING: 'Master trading', MASTER_RESEARCH: 'Master research',
+const ROLE_LABELS = { researcher: 'Researcher', engineer: 'Engineer', trader: 'Market researcher', worker: 'Builder', socialite: 'Socialite', generalist: 'Generalist' };
+const GOAL_LABELS = { BUILD_WEALTH: 'Build wealth', MASTER_TRADING: 'Market research', MASTER_RESEARCH: 'Master research',
   MASTER_ENGINEERING: 'Master engineering', BUILD_RELATIONSHIPS: 'Build relationships', BALANCED_LIFE: 'Balanced life' };
-const SKILL_LABELS = { trading: 'Trading', research: 'Research', engineering: 'Engineering', social: 'Social' };
+const SKILL_LABELS = { trading: 'Market research', research: 'Research', engineering: 'Engineering', social: 'Social' };
 const EVENT_LABELS = {
   'action.socialize': 'Socialize', 'action.travel': 'Travel to place', 'action.work': 'Work',
   'action.rest': 'Rest', 'action.eat': 'Eat', 'action.build_scene': 'Build place', 'scene.created': 'Place built',
-  'crypto.trade_filled': 'Simulated crypto fill', 'crypto.trade_held': 'Chose to hold',
-  'crypto.robinhood_paper_filled': 'Simulated Robinhood meme-coin fill',
   'world.movement_started': 'Departed', 'world.agent_arrived': 'Arrived', 'world.action_started': 'Started action',
   'world.action_completed': 'Completed action', 'world.goal_updated': 'Revised long-term goal',
   'world.project_proposed': 'Proposed project', 'world.project_contribution': 'Project contribution',
@@ -92,7 +86,7 @@ const EVENT_LABELS = {
   'world.information_accepted': 'Accepted information', 'world.information_doubted': 'Doubted information',
   'world.information_ignored': 'Ignored information'
 };
-const ACTION_LABELS = { work: 'Work', cooperate: 'Cooperative work', learn: 'Learn', rest: 'Rest', eat: 'Eat', socialize: 'Socialize', trade: 'Simulated trade',
+const ACTION_LABELS = { work: 'Work', cooperate: 'Cooperative work', learn: 'Learn', rest: 'Rest', eat: 'Eat', socialize: 'Socialize',
   opportunity: 'Join opportunity', opportunity_reject: 'Decline opportunity', opportunity_propose: 'Propose opportunity', project_propose: 'Propose project', project_join: 'Join project',
   project_reject: 'Decline project', project_contribute: 'Contribute to project', project_leave: 'Leave project', organization_found: 'Found organization',
   organization_join: 'Join organization', organization_reject: 'Decline org invite', organization_leave: 'Leave organization',
@@ -268,10 +262,10 @@ function renderMap() {
   exchangeNode.style.left = '50%';
   exchangeNode.style.top = '50%';
   exchangeNode.setAttribute('role', 'group');
-  exchangeNode.setAttribute('aria-label', 'Exchange simulated trading floor');
+  exchangeNode.setAttribute('aria-label', 'Exchange for local market research');
   const exchangeLabel = document.createElement('div');
   exchangeLabel.className = 'map-place-label';
-  exchangeLabel.textContent = 'Exchange';
+  exchangeLabel.textContent = 'Research Exchange';
   exchangeNode.append(exchangeLabel);
   const exchangeMarkers = document.createElement('div');
   exchangeMarkers.className = 'map-markers';
@@ -364,8 +358,6 @@ function renderAgentPanel(agent, detail = selectedResidentDetail) {
     ['Current action', activeAction],
     ['Destination', targetLabel || '—'],
     ...environmentFacts,
-    ['Cash', `${moneyFormat.format(Number(agent.assets?.USDC || 0))} USDC`],
-    ['BTC / ETH', `${Number(agent.assets?.BTC || 0).toFixed(6)} / ${Number(agent.assets?.ETH || 0).toFixed(5)}`],
     ['Mood / knowledge', `${displayCount(agent.happiness)} / ${displayCount(agent.knowledge)}`],
     ['Actions taken', displayCount(agent.actionsTaken)],
     ['Last action', agent.lastEventType ? `${eventLabel(agent.lastEventType, agent.lastEventAction)} · ${formatTime(agent.lastEventAt)}` : 'No actions yet']
@@ -747,9 +739,7 @@ function renderActivity() {
     const title = document.createElement('strong');
     title.textContent = event.agentName || 'Resident';
     const detail = document.createElement('span');
-    const trade = event.eventType === 'crypto.trade_filled' && event.side && event.asset
-      ? ` · ${event.side === 'buy' ? 'Buy' : 'Sell'} ${event.asset}` : '';
-    detail.textContent = `${eventLabel(event.eventType, event.action)}${trade}${event.place ? ` · ${event.place}` : ''}`;
+    detail.textContent = `${eventLabel(event.eventType, event.action)}${event.place ? ` · ${event.place}` : ''}`;
     copy.append(title, detail);
     const time = document.createElement('time');
     time.dateTime = event.createdAt || '';
@@ -875,7 +865,7 @@ function renderWorldEvolution() {
     'No institutional interactions yet.', (item) => item.detail);
   if (worldArcSummary) {
     const sampleTime = arcObserver.lastSampleAt ? new Date(arcObserver.lastSampleAt).toLocaleString() : 'No samples yet';
-    worldArcSummary.textContent = `${arcObserver.network?.name || 'Arc'} · chain ID ${displayCount(arc.chainId)} · read-only sample ${sampleTime}; simulated balances are not counted as on-chain assets.`;
+    worldArcSummary.textContent = `${arcObserver.network?.name || 'Arc'} · chain ID ${displayCount(arc.chainId)} · read-only sample ${sampleTime}; the internal world ledger is separate from on-chain assets.`;
   }
   if (worldArcObserverStatus) {
     worldArcObserverStatus.textContent = arcObserver.running && arcObserver.mode === 'read_only'
@@ -927,7 +917,7 @@ function renderWorldEvolution() {
       detail: readinessLabels[arcObserver.reason] || arcObserver.reason || 'Arc Observer not started.' }] : []),
     ...(arcDatabase.readinessBlockers || []).map((code) => ({
       title: readinessLabels[code] || code,
-      detail: 'Readiness only; the Observer never trades for residents or auto-corrects records.'
+      detail: 'Readiness only; the Observer never submits transactions or auto-corrects records.'
     })),
     ...(arcObserver.findings || []).map((finding) => ({
       title: finding.code,
@@ -1208,100 +1198,6 @@ function renderSummary() {
   }
 }
 
-function renderTrading() {
-  if (!latestMapData?.trading) return;
-  const trading = latestMapData.trading;
-  marketQuotes?.replaceChildren();
-  for (const quote of trading.quotes || []) {
-    const row = document.createElement('div');
-    row.className = 'market-quote-row';
-    const asset = document.createElement('div');
-    asset.className = 'market-asset';
-    const symbol = document.createElement('strong');
-    symbol.textContent = quote.symbol;
-    const name = document.createElement('span');
-    name.textContent = quote.name;
-    asset.append(symbol, name);
-    const price = document.createElement('strong');
-    price.className = 'market-price';
-    price.textContent = `$${Number(quote.priceUsd).toLocaleString('en-US', { minimumFractionDigits: quote.symbol === 'USDC' ? 4 : 2, maximumFractionDigits: quote.symbol === 'USDC' ? 4 : 2 })}`;
-    row.append(asset, price);
-    marketQuotes?.append(row);
-  }
-  const robinhood = trading.robinhood || {};
-  const scanner = robinhood.scanner || {};
-  const chainHeading = document.createElement('p');
-  chainHeading.className = 'market-updated';
-  chainHeading.textContent = `Robinhood mainnet · Pons V2 · scanner ${scanner.healthy ? (scanner.fresh ? 'healthy' : 'stale') : 'unavailable'} · block ${scanner.scannedToBlock ?? '—'}`;
-  marketQuotes?.append(chainHeading);
-  for (const token of (robinhood.tokens || []).slice(0, 8)) {
-    const row = document.createElement('div');
-    row.className = 'market-quote-row';
-    const asset = document.createElement('div');
-    asset.className = 'market-asset';
-    const symbol = document.createElement('strong');
-    symbol.textContent = `0x${String(token.tokenAddress || '').slice(2, 10)}`;
-    const status = document.createElement('span');
-    status.textContent = token.tradable ? 'Curve open for simulated trading' : token.graduated ? 'Graduated; curve trading paused' : 'Record only';
-    asset.append(symbol, status);
-    const price = document.createElement('strong');
-    price.className = 'market-price';
-    const numericPrice = Number(token.priceUsd);
-    price.textContent = Number.isFinite(numericPrice) && numericPrice > 0
-      ? `$${numericPrice.toLocaleString('en-US', { maximumFractionDigits: 8 })}` : '—';
-    row.append(asset, price);
-    marketQuotes?.append(row);
-  }
-  setText(marketUpdated, `Internal simulated quotes ${formatTime(trading.quotes?.[0]?.asOf, true)} · BTC / ETH / USDC`);
-
-  portfolioSummary?.replaceChildren();
-  const portfolios = [...(trading.portfolios || [])].sort((a, b) => Number(b.netAssetValueUsd) - Number(a.netAssetValueUsd));
-  if (!portfolios.length) {
-    const empty = document.createElement('p');
-    empty.className = 'market-empty';
-    empty.textContent = 'No agent accounts initialized yet.';
-    portfolioSummary?.append(empty);
-  }
-  for (const portfolio of portfolios) {
-    const row = document.createElement('div');
-    row.className = 'portfolio-row';
-    const agent = document.createElement('span');
-    agent.textContent = portfolio.name;
-    const value = document.createElement('strong');
-    value.textContent = `$${Number(portfolio.netAssetValueUsd).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
-    row.append(agent, value);
-    portfolioSummary?.append(row);
-  }
-
-  recentTrades?.replaceChildren();
-  const trades = (trading.recentTrades || []).slice(0, 12);
-  if (!trades.length) {
-    const empty = document.createElement('li');
-    empty.className = 'market-empty';
-    empty.textContent = 'No simulated agent trades yet.';
-    recentTrades?.append(empty);
-  }
-  for (const trade of trades) {
-    const row = document.createElement('li');
-    row.dataset.side = trade.side === 'buy' ? 'buy' : 'sell';
-    const details = document.createElement('div');
-    details.className = 'trade-details';
-    const headline = document.createElement('strong');
-    headline.textContent = `${trade.agentName} · ${trade.side === 'buy' ? 'Buy' : 'Sell'} ${trade.asset}${trade.simulatedMeme ? ' (simulated)' : ''}`;
-    const meta = document.createElement('span');
-    const price = Number(trade.priceUsd);
-    meta.textContent = trade.simulatedMeme
-      ? `${trade.quantity} token · notional $${Number(trade.notionalUsd).toFixed(4)} · fee ${Number(trade.feeUsdc).toFixed(4)} USDC · Pons V2`
-      : `${Number(trade.quantity).toFixed(8)} ${trade.asset} · $${price.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} · fee ${Number(trade.feeUsdc).toFixed(4)} USDC`;
-    details.append(headline, meta);
-    const time = document.createElement('time');
-    time.dateTime = trade.createdAt || '';
-    time.textContent = formatTime(trade.createdAt, true);
-    row.append(details, time);
-    recentTrades?.append(row);
-  }
-}
-
 function renderMapData(data) {
   latestMapData = data;
   const residents = data.residents || [];
@@ -1312,7 +1208,6 @@ function renderMapData(data) {
   renderAgentPanel(residents.find((resident) => resident.id === selectedAgentId));
   renderActivity();
   renderWorldEvolution();
-  renderTrading();
 }
 
 let mapRequestInFlight = false;

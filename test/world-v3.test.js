@@ -61,14 +61,14 @@ test('utility qualification fills its minimum from the ranked candidates', () =>
   assert.deepEqual(qualifyUtilityCandidates(candidates).map((item) => item.score), [100, 20, 10]);
 });
 
-test('Fruitfly exposes twelve output families and learns from V3 and V4 action families', async () => {
+test('Fruitfly exposes the remaining output families and learns from V3 and V4 actions', async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'synterra-fruitfly-v3-'));
   try {
     const fruitfly = await createFruitflyRuntime(directory);
     const observation = { self: { agentId: 'resident-v3', energy: 80, food: 70, social: 60 },
       mind: { archetype: 'scholar', traits: { curiosity: 0.8, craft: 0.6 }, memories: [], goals: [],
         relationships: [], personality: {} } };
-    const actions = ['eat', 'rest', 'socialize', 'work', 'cooperate', 'opportunity', 'trade', 'trade_hold',
+    const actions = ['eat', 'rest', 'socialize', 'work', 'cooperate', 'opportunity',
       'business_found', 'project_invest', 'business_apply', 'business_skill_practice',
       'opportunity_propose', 'opportunity_reject', 'project_propose',
       'project_join', 'project_reject', 'project_contribute', 'project_leave', 'organization_found',
@@ -83,7 +83,10 @@ test('Fruitfly exposes twelve output families and learns from V3 and V4 action f
       await fruitfly.learn('resident-v3', observation, [candidate], decision.candidate,
         { energy: 80, food: 70, social: 60 });
     }
-    assert.equal(families.size, 12);
+    assert.equal(families.size, 10);
+    assert.equal(fruitflyFamily({ action: 'business_market_observe' }), 'business_learn');
+    assert.equal(fruitflyFamily({ action: 'business_service', serviceType: 'trading_service' }), 'business',
+      'independent paid market-research services retain their business mapping');
     assert.ok(fruitflyFamily('business_found') === 'business');
     assert.ok(fruitflyFamily('business_invest') === 'invest');
     assert.ok(fruitflyFamily('business_apply') === 'job');

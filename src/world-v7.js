@@ -10,7 +10,7 @@ const clamp = (value, low, high) => Math.max(low, Math.min(high, Number(value) |
 const object = (value, fallback = {}) => value && typeof value === 'object' && !Array.isArray(value) ? value : fallback;
 const jsonBytes = (value) => Buffer.byteLength(JSON.stringify(value));
 const stablePart = (value) => createHash('sha256').update(String(value)).digest('hex').slice(0, 12);
-const PLANNING_HORIZON_AFFINITY = Object.freeze({ trade: -0.8, work: -0.2, learn: 0.55, rest: 0.1,
+const PLANNING_HORIZON_AFFINITY = Object.freeze({ work: -0.2, learn: 0.55, rest: 0.1,
   eat: -0.25, socialize: 0.2, cooperate: 0.7, capability_use: 0.45, business_market_observe: 0.4,
   project_contribute: 0.75, information_share: 0.45, travel: 0.5 });
 const cleanKey = (value, field = 'key') => {
@@ -53,7 +53,7 @@ export function applyAgentDecisionPolicy(candidate, policy = DEFAULT_AGENT_POLIC
   if (['socialize', 'cooperate', 'information_share', 'project_contribute'].includes(action)) {
     delta += (active.socialInfluencePreference - 0.5) * 6;
   }
-  if (['trade', 'business_invest', 'project_invest'].includes(action)) delta += active.riskToleranceBias * 12;
+  if (['business_invest', 'project_invest'].includes(action)) delta += active.riskToleranceBias * 12;
   const horizonAffinity = PLANNING_HORIZON_AFFINITY[action] || 0;
   delta += ((active.planningHorizonMinutes / DEFAULT_AGENT_POLICY.planningHorizonMinutes) - 1) * horizonAffinity * 4;
   result.score = Number(result.score || 0) + clamp(delta, -8, 8);
