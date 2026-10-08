@@ -1,0 +1,1492 @@
+{
+  "agents": {
+    "columns": {
+      "id": "uuid",
+      "name": "text",
+      "public_key": "text",
+      "gender": "text",
+      "created_at": "timestamp with time zone"
+    },
+    "constraints": {
+      "agents_gender_check": "CHECK (gender IS NULL OR (gender = ANY (ARRAY['female'::text, 'male'::text])))",
+      "agents_name_check": "CHECK (char_length(name) >= 2 AND char_length(name) <= 48)",
+      "agents_pkey": "PRIMARY KEY (id)",
+      "agents_public_key_key": "UNIQUE (public_key)"
+    },
+    "notNullColumns": [
+      "id",
+      "name",
+      "public_key",
+      "created_at"
+    ],
+    "uniqueIndexes": {
+      "agents_pkey": "CREATE UNIQUE INDEX agents_pkey ON public.agents USING btree (id)",
+      "agents_public_key_key": "CREATE UNIQUE INDEX agents_public_key_key ON public.agents USING btree (public_key)"
+    }
+  },
+  "arc_agent_token_responses": {
+    "columns": {
+      "id": "uuid",
+      "world_id": "uuid",
+      "token_id": "uuid",
+      "agent_id": "uuid",
+      "decision": "text",
+      "rationale": "text",
+      "world_minute": "bigint",
+      "action_id": "text",
+      "created_at": "timestamp with time zone",
+      "updated_at": "timestamp with time zone"
+    },
+    "constraints": {
+      "arc_agent_token_responses_action_id_check": "CHECK (char_length(action_id) >= 8 AND char_length(action_id) <= 80)",
+      "arc_agent_token_responses_decision_check": "CHECK (decision = ANY (ARRAY['accept'::text, 'reject'::text, 'ignore'::text]))",
+      "arc_agent_token_responses_pkey": "PRIMARY KEY (id)",
+      "arc_agent_token_responses_rationale_check": "CHECK (rationale IS NULL OR char_length(rationale) >= 1 AND char_length(rationale) <= 1000)",
+      "arc_agent_token_responses_world_id_agent_id_action_id_key": "UNIQUE (world_id, agent_id, action_id)",
+      "arc_agent_token_responses_world_id_agent_id_fkey": "FOREIGN KEY (world_id, agent_id) REFERENCES world_members(world_id, agent_id) ON DELETE CASCADE",
+      "arc_agent_token_responses_world_id_token_id_agent_id_key": "UNIQUE (world_id, token_id, agent_id)",
+      "arc_agent_token_responses_world_id_token_id_fkey": "FOREIGN KEY (world_id, token_id) REFERENCES arc_agent_tokens(world_id, id) ON DELETE RESTRICT",
+      "arc_agent_token_responses_world_minute_check": "CHECK (world_minute >= 0)"
+    },
+    "notNullColumns": [
+      "id",
+      "world_id",
+      "token_id",
+      "agent_id",
+      "decision",
+      "world_minute",
+      "action_id",
+      "created_at",
+      "updated_at"
+    ],
+    "uniqueIndexes": {
+      "arc_agent_token_responses_pkey": "CREATE UNIQUE INDEX arc_agent_token_responses_pkey ON public.arc_agent_token_responses USING btree (id)",
+      "arc_agent_token_responses_world_id_agent_id_action_id_key": "CREATE UNIQUE INDEX arc_agent_token_responses_world_id_agent_id_action_id_key ON public.arc_agent_token_responses USING btree (world_id, agent_id, action_id)",
+      "arc_agent_token_responses_world_id_token_id_agent_id_key": "CREATE UNIQUE INDEX arc_agent_token_responses_world_id_token_id_agent_id_key ON public.arc_agent_token_responses USING btree (world_id, token_id, agent_id)"
+    }
+  },
+  "arc_agent_token_uses": {
+    "columns": {
+      "id": "uuid",
+      "world_id": "uuid",
+      "token_id": "uuid",
+      "agent_id": "uuid",
+      "usage_context": "text",
+      "evidence": "jsonb",
+      "world_minute": "bigint",
+      "action_id": "text",
+      "created_at": "timestamp with time zone"
+    },
+    "constraints": {
+      "arc_agent_token_uses_action_id_check": "CHECK (char_length(action_id) >= 8 AND char_length(action_id) <= 80)",
+      "arc_agent_token_uses_evidence_check": "CHECK (jsonb_typeof(evidence) = 'object'::text)",
+      "arc_agent_token_uses_pkey": "PRIMARY KEY (id)",
+      "arc_agent_token_uses_usage_context_check": "CHECK (char_length(usage_context) >= 3 AND char_length(usage_context) <= 1000)",
+      "arc_agent_token_uses_world_id_agent_id_action_id_key": "UNIQUE (world_id, agent_id, action_id)",
+      "arc_agent_token_uses_world_id_agent_id_fkey": "FOREIGN KEY (world_id, agent_id) REFERENCES world_members(world_id, agent_id) ON DELETE CASCADE",
+      "arc_agent_token_uses_world_id_token_id_fkey": "FOREIGN KEY (world_id, token_id) REFERENCES arc_agent_tokens(world_id, id) ON DELETE RESTRICT",
+      "arc_agent_token_uses_world_minute_check": "CHECK (world_minute >= 0)"
+    },
+    "notNullColumns": [
+      "id",
+      "world_id",
+      "token_id",
+      "agent_id",
+      "usage_context",
+      "evidence",
+      "world_minute",
+      "action_id",
+      "created_at"
+    ],
+    "uniqueIndexes": {
+      "arc_agent_token_uses_pkey": "CREATE UNIQUE INDEX arc_agent_token_uses_pkey ON public.arc_agent_token_uses USING btree (id)",
+      "arc_agent_token_uses_world_id_agent_id_action_id_key": "CREATE UNIQUE INDEX arc_agent_token_uses_world_id_agent_id_action_id_key ON public.arc_agent_token_uses USING btree (world_id, agent_id, action_id)"
+    }
+  },
+  "arc_agent_tokens": {
+    "columns": {
+      "id": "uuid",
+      "world_id": "uuid",
+      "intent_id": "uuid",
+      "capability_generation": "integer",
+      "creation_sequence": "integer",
+      "chain_id": "integer",
+      "token_address": "text",
+      "factory_address": "text",
+      "name": "text",
+      "symbol": "text",
+      "decimals": "smallint",
+      "unallocated_supply_handling": "text",
+      "ownership_model": "text",
+      "authority_model": "text",
+      "related_goal_id": "uuid",
+      "related_concept_id": "uuid",
+      "related_capability_id": "uuid",
+      "initial_supply_raw": "numeric(78,0)",
+      "reserve_supply_raw": "numeric(78,0)",
+      "issuer_agent_id": "uuid",
+      "issuer_identity_id": "numeric(78,0)",
+      "issuer_wallet": "text",
+      "transaction_sender": "text",
+      "specification_hash": "text",
+      "transaction_hash": "text",
+      "block_number": "numeric(78,0)",
+      "log_index": "integer",
+      "created_world_minute": "bigint",
+      "indexed_at": "timestamp with time zone",
+      "metadata": "jsonb"
+    },
+    "constraints": {
+      "arc_agent_tokens_authority_model_check": "CHECK (authority_model = ANY (ARRAY['no_mint_no_burn'::text, 'issuer_controlled_reserve'::text, 'locked_reserve'::text]))",
+      "arc_agent_tokens_block_number_check": "CHECK (block_number >= 0::numeric)",
+      "arc_agent_tokens_capability_generation_check": "CHECK (capability_generation > 0)",
+      "arc_agent_tokens_chain_id_check": "CHECK (chain_id = 5042)",
+      "arc_agent_tokens_chain_id_token_address_key": "UNIQUE (chain_id, token_address)",
+      "arc_agent_tokens_chain_id_transaction_hash_log_index_key": "UNIQUE (chain_id, transaction_hash, log_index)",
+      "arc_agent_tokens_created_world_minute_check": "CHECK (created_world_minute >= 0)",
+      "arc_agent_tokens_creation_sequence_check": "CHECK (creation_sequence > 0)",
+      "arc_agent_tokens_decimals_check": "CHECK (decimals >= 0 AND decimals <= 18)",
+      "arc_agent_tokens_factory_address_check": "CHECK (factory_address ~ '^0x[0-9a-fA-F]{40}$'::text)",
+      "arc_agent_tokens_initial_supply_raw_check": "CHECK (initial_supply_raw > 0::numeric)",
+      "arc_agent_tokens_intent_id_key": "UNIQUE (intent_id)",
+      "arc_agent_tokens_issuer_identity_id_check": "CHECK (issuer_identity_id > 0::numeric)",
+      "arc_agent_tokens_issuer_wallet_check": "CHECK (issuer_wallet ~ '^0x[0-9a-fA-F]{40}$'::text)",
+      "arc_agent_tokens_log_index_check": "CHECK (log_index >= 0)",
+      "arc_agent_tokens_metadata_check": "CHECK (jsonb_typeof(metadata) = 'object'::text)",
+      "arc_agent_tokens_name_check": "CHECK (char_length(name) >= 1 AND char_length(name) <= 64)",
+      "arc_agent_tokens_ownership_model_check": "CHECK (ownership_model = 'erc20_holder_owned'::text)",
+      "arc_agent_tokens_pkey": "PRIMARY KEY (id)",
+      "arc_agent_tokens_reserve_supply_raw_check": "CHECK (reserve_supply_raw >= 0::numeric)",
+      "arc_agent_tokens_specification_hash_check": "CHECK (specification_hash ~ '^0x[0-9a-fA-F]{64}$'::text)",
+      "arc_agent_tokens_symbol_check": "CHECK (char_length(symbol) >= 1 AND char_length(symbol) <= 12)",
+      "arc_agent_tokens_token_address_check": "CHECK (token_address ~ '^0x[0-9a-fA-F]{40}$'::text)",
+      "arc_agent_tokens_transaction_hash_check": "CHECK (transaction_hash ~ '^0x[0-9a-fA-F]{64}$'::text)",
+      "arc_agent_tokens_transaction_sender_check": "CHECK (transaction_sender ~ '^0x[0-9a-fA-F]{40}$'::text)",
+      "arc_agent_tokens_unallocated_supply_handling_check": "CHECK (unallocated_supply_handling = ANY (ARRAY['fully_distributed'::text, 'issuer_controlled_reserve'::text, 'locked_reserve'::text]))",
+      "arc_agent_tokens_world_id_capability_generation_creation_se_key": "UNIQUE (world_id, capability_generation, creation_sequence)",
+      "arc_agent_tokens_world_id_fkey": "FOREIGN KEY (world_id) REFERENCES worlds(id) ON DELETE CASCADE",
+      "arc_agent_tokens_world_id_id_key": "UNIQUE (world_id, id)",
+      "arc_agent_tokens_world_id_intent_id_fkey": "FOREIGN KEY (world_id, intent_id) REFERENCES arc_token_issuance_intents(world_id, id) ON DELETE RESTRICT",
+      "arc_agent_tokens_world_id_issuer_agent_id_fkey": "FOREIGN KEY (world_id, issuer_agent_id) REFERENCES world_members(world_id, agent_id) ON DELETE RESTRICT"
+    },
+    "notNullColumns": [
+      "id",
+      "world_id",
+      "intent_id",
+      "capability_generation",
+      "creation_sequence",
+      "chain_id",
+      "token_address",
+      "factory_address",
+      "name",
+      "symbol",
+      "decimals",
+      "unallocated_supply_handling",
+      "ownership_model",
+      "authority_model",
+      "initial_supply_raw",
+      "reserve_supply_raw",
+      "issuer_agent_id",
+      "issuer_identity_id",
+      "issuer_wallet",
+      "transaction_sender",
+      "specification_hash",
+      "transaction_hash",
+      "block_number",
+      "log_index",
+      "created_world_minute",
+      "indexed_at",
+      "metadata"
+    ],
+    "uniqueIndexes": {
+      "arc_agent_tokens_chain_id_token_address_key": "CREATE UNIQUE INDEX arc_agent_tokens_chain_id_token_address_key ON public.arc_agent_tokens USING btree (chain_id, token_address)",
+      "arc_agent_tokens_chain_id_transaction_hash_log_index_key": "CREATE UNIQUE INDEX arc_agent_tokens_chain_id_transaction_hash_log_index_key ON public.arc_agent_tokens USING btree (chain_id, transaction_hash, log_index)",
+      "arc_agent_tokens_intent_id_key": "CREATE UNIQUE INDEX arc_agent_tokens_intent_id_key ON public.arc_agent_tokens USING btree (intent_id)",
+      "arc_agent_tokens_one_current_pilot_token_idx": "CREATE UNIQUE INDEX arc_agent_tokens_one_current_pilot_token_idx ON public.arc_agent_tokens USING btree (world_id) WHERE (capability_generation = 1)",
+      "arc_agent_tokens_pkey": "CREATE UNIQUE INDEX arc_agent_tokens_pkey ON public.arc_agent_tokens USING btree (id)",
+      "arc_agent_tokens_world_id_capability_generation_creation_se_key": "CREATE UNIQUE INDEX arc_agent_tokens_world_id_capability_generation_creation_se_key ON public.arc_agent_tokens USING btree (world_id, capability_generation, creation_sequence)",
+      "arc_agent_tokens_world_id_id_key": "CREATE UNIQUE INDEX arc_agent_tokens_world_id_id_key ON public.arc_agent_tokens USING btree (world_id, id)"
+    }
+  },
+  "arc_agent_wallets": {
+    "columns": {
+      "id": "uuid",
+      "world_id": "uuid",
+      "agent_id": "uuid",
+      "chain_id": "integer",
+      "address": "text",
+      "provider": "text",
+      "account_type": "text",
+      "status": "text",
+      "external_identity_id": "text",
+      "created_at": "timestamp with time zone",
+      "updated_at": "timestamp with time zone",
+      "metadata": "jsonb"
+    },
+    "constraints": {
+      "arc_agent_wallets_account_type_check": "CHECK (account_type = ANY (ARRAY['eoa'::text, 'sca'::text, 'msca'::text]))",
+      "arc_agent_wallets_address_check": "CHECK (address ~ '^0x[0-9a-fA-F]{40}$'::text)",
+      "arc_agent_wallets_agent_id_fkey": "FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE",
+      "arc_agent_wallets_chain_id_check": "CHECK (chain_id = 5042)",
+      "arc_agent_wallets_pkey": "PRIMARY KEY (id)",
+      "arc_agent_wallets_provider_check": "CHECK (provider = ANY (ARRAY['managed_wallet'::text, 'external_kms'::text]))",
+      "arc_agent_wallets_status_check": "CHECK (status = ANY (ARRAY['prepared'::text, 'active'::text, 'suspended'::text, 'revoked'::text]))",
+      "arc_agent_wallets_world_id_agent_id_chain_id_key": "UNIQUE (world_id, agent_id, chain_id)",
+      "arc_agent_wallets_world_id_agent_id_fkey": "FOREIGN KEY (world_id, agent_id) REFERENCES world_members(world_id, agent_id) ON DELETE CASCADE",
+      "arc_agent_wallets_world_id_chain_id_address_key": "UNIQUE (world_id, chain_id, address)",
+      "arc_agent_wallets_world_id_fkey": "FOREIGN KEY (world_id) REFERENCES worlds(id) ON DELETE CASCADE"
+    },
+    "notNullColumns": [
+      "id",
+      "world_id",
+      "agent_id",
+      "chain_id",
+      "address",
+      "provider",
+      "account_type",
+      "status",
+      "created_at",
+      "updated_at",
+      "metadata"
+    ],
+    "uniqueIndexes": {
+      "arc_agent_wallets_pkey": "CREATE UNIQUE INDEX arc_agent_wallets_pkey ON public.arc_agent_wallets USING btree (id)",
+      "arc_agent_wallets_world_id_agent_id_chain_id_key": "CREATE UNIQUE INDEX arc_agent_wallets_world_id_agent_id_chain_id_key ON public.arc_agent_wallets USING btree (world_id, agent_id, chain_id)",
+      "arc_agent_wallets_world_id_chain_id_address_key": "CREATE UNIQUE INDEX arc_agent_wallets_world_id_chain_id_address_key ON public.arc_agent_wallets USING btree (world_id, chain_id, address)"
+    }
+  },
+  "arc_capability_provenance": {
+    "columns": {
+      "id": "uuid",
+      "world_id": "uuid",
+      "capability_id": "uuid",
+      "creator_type": "text",
+      "creator_agent_id": "uuid",
+      "creator_organization_id": "uuid",
+      "parent_capability_id": "uuid",
+      "chain_id": "integer",
+      "version": "bigint",
+      "specification_hash": "text",
+      "capability_status": "text",
+      "created_world_minute": "bigint",
+      "adopted_world_minute": "bigint",
+      "transaction_hash": "text",
+      "block_number": "numeric(78,0)",
+      "status": "text",
+      "created_at": "timestamp with time zone",
+      "finalized_at": "timestamp with time zone",
+      "metadata": "jsonb",
+      "anchored_world_minute": "bigint"
+    },
+    "constraints": {
+      "arc_capability_provenance_adopted_world_minute_check": "CHECK (adopted_world_minute IS NULL OR adopted_world_minute >= 0)",
+      "arc_capability_provenance_anchored_world_minute_check": "CHECK (anchored_world_minute >= 0)",
+      "arc_capability_provenance_capability_status_check": "CHECK (capability_status = ANY (ARRAY['proposed'::text, 'experimental'::text, 'active'::text, 'deprecated'::text, 'rejected'::text]))",
+      "arc_capability_provenance_chain_id_check": "CHECK (chain_id = 5042)",
+      "arc_capability_provenance_chain_id_transaction_hash_key": "UNIQUE (chain_id, transaction_hash)",
+      "arc_capability_provenance_check": "CHECK (creator_type = 'system'::text AND creator_agent_id IS NULL AND creator_organization_id IS NULL OR creator_type = 'resident'::text AND creator_agent_id IS NOT NULL AND creator_organization_id IS NULL OR creator_type = 'organization'::text AND creator_agent_id IS NULL AND creator_organization_id IS NOT NULL)",
+      "arc_capability_provenance_created_world_minute_check": "CHECK (created_world_minute >= 0)",
+      "arc_capability_provenance_creator_type_check": "CHECK (creator_type = ANY (ARRAY['system'::text, 'resident'::text, 'organization'::text]))",
+      "arc_capability_provenance_pkey": "PRIMARY KEY (id)",
+      "arc_capability_provenance_specification_hash_check": "CHECK (specification_hash ~ '^0x[0-9a-fA-F]{64}$'::text)",
+      "arc_capability_provenance_status_check": "CHECK (status = ANY (ARRAY['prepared'::text, 'submitted'::text, 'final'::text, 'failed'::text]))",
+      "arc_capability_provenance_transaction_hash_check": "CHECK (transaction_hash IS NULL OR transaction_hash ~ '^0x[0-9a-fA-F]{64}$'::text)",
+      "arc_capability_provenance_version_check": "CHECK (version > 0)",
+      "arc_capability_provenance_world_id_capability_id_chain_id_s_key": "UNIQUE (world_id, capability_id, chain_id, specification_hash)",
+      "arc_capability_provenance_world_id_capability_id_chain_id_v_key": "UNIQUE (world_id, capability_id, chain_id, version)",
+      "arc_capability_provenance_world_id_capability_id_fkey": "FOREIGN KEY (world_id, capability_id) REFERENCES world_capabilities(world_id, id) ON DELETE RESTRICT",
+      "arc_capability_provenance_world_id_fkey": "FOREIGN KEY (world_id) REFERENCES worlds(id) ON DELETE CASCADE",
+      "arc_capability_provenance_world_id_parent_capability_id_fkey": "FOREIGN KEY (world_id, parent_capability_id) REFERENCES world_capabilities(world_id, id) ON DELETE RESTRICT"
+    },
+    "notNullColumns": [
+      "id",
+      "world_id",
+      "capability_id",
+      "creator_type",
+      "chain_id",
+      "version",
+      "specification_hash",
+      "capability_status",
+      "created_world_minute",
+      "status",
+      "created_at",
+      "metadata",
+      "anchored_world_minute"
+    ],
+    "uniqueIndexes": {
+      "arc_capability_provenance_chain_id_transaction_hash_key": "CREATE UNIQUE INDEX arc_capability_provenance_chain_id_transaction_hash_key ON public.arc_capability_provenance USING btree (chain_id, transaction_hash)",
+      "arc_capability_provenance_pkey": "CREATE UNIQUE INDEX arc_capability_provenance_pkey ON public.arc_capability_provenance USING btree (id)",
+      "arc_capability_provenance_world_id_capability_id_chain_id_s_key": "CREATE UNIQUE INDEX arc_capability_provenance_world_id_capability_id_chain_id_s_key ON public.arc_capability_provenance USING btree (world_id, capability_id, chain_id, specification_hash)",
+      "arc_capability_provenance_world_id_capability_id_chain_id_v_key": "CREATE UNIQUE INDEX arc_capability_provenance_world_id_capability_id_chain_id_v_key ON public.arc_capability_provenance USING btree (world_id, capability_id, chain_id, version)"
+    }
+  },
+  "arc_currency_genesis_requirements": {
+    "columns": {
+      "world_id": "uuid",
+      "capability_generation": "integer",
+      "status": "text",
+      "current_proposal_id": "uuid",
+      "satisfied_token_id": "uuid",
+      "first_required_world_minute": "bigint",
+      "satisfied_world_minute": "bigint",
+      "last_transition_world_minute": "bigint",
+      "transition_reason": "text",
+      "metadata": "jsonb",
+      "created_at": "timestamp with time zone",
+      "updated_at": "timestamp with time zone"
+    },
+    "constraints": {
+      "arc_currency_genesis_current_proposal_fk": "FOREIGN KEY (world_id, current_proposal_id) REFERENCES arc_token_issuance_intents(world_id, id) ON DELETE SET NULL (current_proposal_id)",
+      "arc_currency_genesis_require_last_transition_world_minute_check": "CHECK (last_transition_world_minute >= 0)",
+      "arc_currency_genesis_requirem_first_required_world_minute_check": "CHECK (first_required_world_minute >= 0)",
+      "arc_currency_genesis_requirements_capability_generation_check": "CHECK (capability_generation > 0)",
+      "arc_currency_genesis_requirements_check": "CHECK ((status = 'SATISFIED'::text) = (satisfied_token_id IS NOT NULL))",
+      "arc_currency_genesis_requirements_check1": "CHECK ((status = 'SATISFIED'::text) = (satisfied_world_minute IS NOT NULL))",
+      "arc_currency_genesis_requirements_metadata_check": "CHECK (jsonb_typeof(metadata) = 'object'::text)",
+      "arc_currency_genesis_requirements_pkey": "PRIMARY KEY (world_id)",
+      "arc_currency_genesis_requirements_satisfied_world_minute_check": "CHECK (satisfied_world_minute IS NULL OR satisfied_world_minute >= 0)",
+      "arc_currency_genesis_requirements_status_check": "CHECK (status = ANY (ARRAY['UNRESOLVED'::text, 'DELIBERATING'::text, 'PROPOSAL_FORMED'::text, 'ISSUER_CANDIDATE'::text, 'ISSUER_SELECTED'::text, 'ISSUER_CONFIRMED'::text, 'EXECUTION_READY'::text, 'SATISFIED'::text]))",
+      "arc_currency_genesis_requirements_transition_reason_check": "CHECK (char_length(transition_reason) >= 1 AND char_length(transition_reason) <= 160)",
+      "arc_currency_genesis_requirements_world_id_fkey": "FOREIGN KEY (world_id) REFERENCES worlds(id) ON DELETE CASCADE",
+      "arc_currency_genesis_satisfied_token_fk": "FOREIGN KEY (world_id, satisfied_token_id) REFERENCES arc_agent_tokens(world_id, id) ON DELETE RESTRICT"
+    },
+    "notNullColumns": [
+      "world_id",
+      "capability_generation",
+      "status",
+      "first_required_world_minute",
+      "last_transition_world_minute",
+      "transition_reason",
+      "metadata",
+      "created_at",
+      "updated_at"
+    ],
+    "uniqueIndexes": {
+      "arc_currency_genesis_requirements_pkey": "CREATE UNIQUE INDEX arc_currency_genesis_requirements_pkey ON public.arc_currency_genesis_requirements USING btree (world_id)"
+    }
+  },
+  "arc_indexed_events": {
+    "columns": {
+      "chain_id": "integer",
+      "transaction_hash": "text",
+      "log_index": "integer",
+      "block_number": "numeric(78,0)",
+      "block_hash": "text",
+      "emitter_address": "text",
+      "event_topic0": "text",
+      "world_id": "uuid",
+      "event_type": "text",
+      "payload": "jsonb",
+      "indexed_at": "timestamp with time zone"
+    },
+    "constraints": {
+      "arc_indexed_events_block_hash_check": "CHECK (block_hash ~ '^0x[0-9a-fA-F]{64}$'::text)",
+      "arc_indexed_events_block_number_check": "CHECK (block_number >= 0::numeric)",
+      "arc_indexed_events_chain_id_check": "CHECK (chain_id = 5042)",
+      "arc_indexed_events_emitter_address_check": "CHECK (emitter_address ~ '^0x[0-9a-fA-F]{40}$'::text)",
+      "arc_indexed_events_event_type_check": "CHECK (char_length(event_type) >= 1 AND char_length(event_type) <= 96)",
+      "arc_indexed_events_log_index_check": "CHECK (log_index >= 0)",
+      "arc_indexed_events_pkey": "PRIMARY KEY (chain_id, transaction_hash, log_index)",
+      "arc_indexed_events_transaction_hash_check": "CHECK (transaction_hash ~ '^0x[0-9a-fA-F]{64}$'::text)",
+      "arc_indexed_events_world_id_fkey": "FOREIGN KEY (world_id) REFERENCES worlds(id) ON DELETE SET NULL"
+    },
+    "notNullColumns": [
+      "chain_id",
+      "transaction_hash",
+      "log_index",
+      "block_number",
+      "block_hash",
+      "emitter_address",
+      "event_type",
+      "payload",
+      "indexed_at"
+    ],
+    "uniqueIndexes": {
+      "arc_indexed_events_pkey": "CREATE UNIQUE INDEX arc_indexed_events_pkey ON public.arc_indexed_events USING btree (chain_id, transaction_hash, log_index)"
+    }
+  },
+  "arc_indexer_state": {
+    "columns": {
+      "chain_id": "integer",
+      "source_key": "text",
+      "last_indexed_block": "numeric(78,0)",
+      "updated_at": "timestamp with time zone"
+    },
+    "constraints": {
+      "arc_indexer_state_chain_id_check": "CHECK (chain_id = 5042)",
+      "arc_indexer_state_last_indexed_block_check": "CHECK (last_indexed_block >= 0::numeric)",
+      "arc_indexer_state_pkey": "PRIMARY KEY (chain_id, source_key)",
+      "arc_indexer_state_source_key_check": "CHECK (char_length(source_key) >= 1 AND char_length(source_key) <= 180)"
+    },
+    "notNullColumns": [
+      "chain_id",
+      "source_key",
+      "last_indexed_block",
+      "updated_at"
+    ],
+    "uniqueIndexes": {
+      "arc_indexer_state_pkey": "CREATE UNIQUE INDEX arc_indexer_state_pkey ON public.arc_indexer_state USING btree (chain_id, source_key)"
+    }
+  },
+  "arc_infrastructure_nonce_cursors": {
+    "columns": {
+      "chain_id": "integer",
+      "address": "text",
+      "next_nonce": "numeric(78,0)",
+      "updated_at": "timestamp with time zone"
+    },
+    "constraints": {
+      "arc_infrastructure_nonce_cursors_address_check": "CHECK (address ~ '^0x[0-9a-fA-F]{40}$'::text)",
+      "arc_infrastructure_nonce_cursors_chain_id_check": "CHECK (chain_id = 5042)",
+      "arc_infrastructure_nonce_cursors_next_nonce_check": "CHECK (next_nonce >= 0::numeric)",
+      "arc_infrastructure_nonce_cursors_pkey": "PRIMARY KEY (chain_id, address)"
+    },
+    "notNullColumns": [
+      "chain_id",
+      "address",
+      "next_nonce",
+      "updated_at"
+    ],
+    "uniqueIndexes": {
+      "arc_infrastructure_nonce_cursors_pkey": "CREATE UNIQUE INDEX arc_infrastructure_nonce_cursors_pkey ON public.arc_infrastructure_nonce_cursors USING btree (chain_id, address)"
+    }
+  },
+  "arc_infrastructure_nonce_reservations": {
+    "columns": {
+      "id": "uuid",
+      "chain_id": "integer",
+      "address": "text",
+      "operation_type": "text",
+      "operation_id": "text",
+      "nonce": "numeric(78,0)",
+      "start_block": "numeric(78,0)",
+      "status": "text",
+      "transaction_hash": "text",
+      "created_at": "timestamp with time zone",
+      "updated_at": "timestamp with time zone"
+    },
+    "constraints": {
+      "arc_infrastructure_nonce_reserv_operation_type_operation_id_key": "UNIQUE (operation_type, operation_id)",
+      "arc_infrastructure_nonce_reservation_chain_id_address_nonce_key": "UNIQUE (chain_id, address, nonce)",
+      "arc_infrastructure_nonce_reservations_address_check": "CHECK (address ~ '^0x[0-9a-fA-F]{40}$'::text)",
+      "arc_infrastructure_nonce_reservations_chain_id_check": "CHECK (chain_id = 5042)",
+      "arc_infrastructure_nonce_reservations_nonce_check": "CHECK (nonce >= 0::numeric)",
+      "arc_infrastructure_nonce_reservations_operation_id_check": "CHECK (char_length(operation_id) >= 1 AND char_length(operation_id) <= 180)",
+      "arc_infrastructure_nonce_reservations_operation_type_check": "CHECK (operation_type = ANY (ARRAY['token_creation'::text, 'token_reserve_release'::text, 'deployment'::text, 'checkpoint'::text, 'provenance'::text]))",
+      "arc_infrastructure_nonce_reservations_pkey": "PRIMARY KEY (id)",
+      "arc_infrastructure_nonce_reservations_start_block_check": "CHECK (start_block >= 0::numeric)",
+      "arc_infrastructure_nonce_reservations_status_check": "CHECK (status = ANY (ARRAY['reserved'::text, 'submitting'::text, 'submission_unknown'::text, 'submitted'::text, 'reconciled'::text, 'released'::text, 'failed'::text]))",
+      "arc_infrastructure_nonce_reservations_transaction_hash_check": "CHECK (transaction_hash IS NULL OR transaction_hash ~ '^0x[0-9a-fA-F]{64}$'::text)"
+    },
+    "notNullColumns": [
+      "id",
+      "chain_id",
+      "address",
+      "operation_type",
+      "operation_id",
+      "nonce",
+      "start_block",
+      "status",
+      "created_at",
+      "updated_at"
+    ],
+    "uniqueIndexes": {
+      "arc_infrastructure_nonce_reserv_operation_type_operation_id_key": "CREATE UNIQUE INDEX arc_infrastructure_nonce_reserv_operation_type_operation_id_key ON public.arc_infrastructure_nonce_reservations USING btree (operation_type, operation_id)",
+      "arc_infrastructure_nonce_reservation_chain_id_address_nonce_key": "CREATE UNIQUE INDEX arc_infrastructure_nonce_reservation_chain_id_address_nonce_key ON public.arc_infrastructure_nonce_reservations USING btree (chain_id, address, nonce)",
+      "arc_infrastructure_nonce_reservations_pkey": "CREATE UNIQUE INDEX arc_infrastructure_nonce_reservations_pkey ON public.arc_infrastructure_nonce_reservations USING btree (id)"
+    }
+  },
+  "arc_mainnet_pilot_budget": {
+    "columns": {
+      "id": "smallint",
+      "chain_id": "integer",
+      "limit_usdc_base_units": "numeric(78,0)",
+      "spent_usdc_base_units": "numeric(78,0)",
+      "reserved_usdc_base_units": "numeric(78,0)",
+      "updated_at": "timestamp with time zone"
+    },
+    "constraints": {
+      "arc_mainnet_pilot_budget_chain_id_check": "CHECK (chain_id = 5042)",
+      "arc_mainnet_pilot_budget_check": "CHECK ((spent_usdc_base_units + reserved_usdc_base_units) <= limit_usdc_base_units)",
+      "arc_mainnet_pilot_budget_id_check": "CHECK (id = 1)",
+      "arc_mainnet_pilot_budget_limit_usdc_base_units_check": "CHECK (limit_usdc_base_units = 10000000::numeric)",
+      "arc_mainnet_pilot_budget_pkey": "PRIMARY KEY (id)",
+      "arc_mainnet_pilot_budget_reserved_usdc_base_units_check": "CHECK (reserved_usdc_base_units >= 0::numeric)",
+      "arc_mainnet_pilot_budget_spent_usdc_base_units_check": "CHECK (spent_usdc_base_units >= 0::numeric)"
+    },
+    "notNullColumns": [
+      "id",
+      "chain_id",
+      "limit_usdc_base_units",
+      "spent_usdc_base_units",
+      "reserved_usdc_base_units",
+      "updated_at"
+    ],
+    "uniqueIndexes": {
+      "arc_mainnet_pilot_budget_pkey": "CREATE UNIQUE INDEX arc_mainnet_pilot_budget_pkey ON public.arc_mainnet_pilot_budget USING btree (id)"
+    }
+  },
+  "arc_mainnet_pilot_cost_reservations": {
+    "columns": {
+      "id": "uuid",
+      "operation_type": "text",
+      "operation_id": "text",
+      "world_id": "uuid",
+      "chain_id": "integer",
+      "transfer_usdc_base_units": "numeric(78,0)",
+      "gas_limit": "numeric(78,0)",
+      "max_fee_per_gas": "numeric(78,0)",
+      "reserved_cost_usdc_base_units": "numeric(78,0)",
+      "actual_cost_usdc_base_units": "numeric(78,0)",
+      "gas_used": "numeric(78,0)",
+      "effective_gas_price": "numeric(78,0)",
+      "status": "text",
+      "transaction_hash": "text",
+      "created_at": "timestamp with time zone",
+      "updated_at": "timestamp with time zone"
+    },
+    "constraints": {
+      "arc_mainnet_pilot_cost_reser_reserved_cost_usdc_base_unit_check": "CHECK (reserved_cost_usdc_base_units > 0::numeric)",
+      "arc_mainnet_pilot_cost_reserv_actual_cost_usdc_base_units_check": "CHECK (actual_cost_usdc_base_units IS NULL OR actual_cost_usdc_base_units >= 0::numeric)",
+      "arc_mainnet_pilot_cost_reservat_operation_type_operation_id_key": "UNIQUE (operation_type, operation_id)",
+      "arc_mainnet_pilot_cost_reservati_transfer_usdc_base_units_check": "CHECK (transfer_usdc_base_units >= 0::numeric)",
+      "arc_mainnet_pilot_cost_reservations_chain_id_check": "CHECK (chain_id = 5042)",
+      "arc_mainnet_pilot_cost_reservations_effective_gas_price_check": "CHECK (effective_gas_price IS NULL OR effective_gas_price >= 0::numeric)",
+      "arc_mainnet_pilot_cost_reservations_gas_limit_check": "CHECK (gas_limit > 0::numeric)",
+      "arc_mainnet_pilot_cost_reservations_gas_used_check": "CHECK (gas_used IS NULL OR gas_used >= 0::numeric)",
+      "arc_mainnet_pilot_cost_reservations_max_fee_per_gas_check": "CHECK (max_fee_per_gas > 0::numeric)",
+      "arc_mainnet_pilot_cost_reservations_operation_id_check": "CHECK (char_length(operation_id) >= 1 AND char_length(operation_id) <= 180)",
+      "arc_mainnet_pilot_cost_reservations_operation_type_check": "CHECK (operation_type = ANY (ARRAY['settlement'::text, 'token_creation'::text, 'token_reserve_release'::text, 'deployment'::text, 'checkpoint'::text, 'provenance'::text]))",
+      "arc_mainnet_pilot_cost_reservations_pkey": "PRIMARY KEY (id)",
+      "arc_mainnet_pilot_cost_reservations_status_check": "CHECK (status = ANY (ARRAY['reserved'::text, 'submitting'::text, 'submission_unknown'::text, 'submitted'::text, 'settled'::text, 'released'::text]))",
+      "arc_mainnet_pilot_cost_reservations_transaction_hash_check": "CHECK (transaction_hash IS NULL OR transaction_hash ~ '^0x[0-9a-fA-F]{64}$'::text)",
+      "arc_mainnet_pilot_cost_reservations_transaction_hash_key": "UNIQUE (transaction_hash)",
+      "arc_mainnet_pilot_cost_reservations_world_id_fkey": "FOREIGN KEY (world_id) REFERENCES worlds(id) ON DELETE SET NULL"
+    },
+    "notNullColumns": [
+      "id",
+      "operation_type",
+      "operation_id",
+      "chain_id",
+      "transfer_usdc_base_units",
+      "gas_limit",
+      "max_fee_per_gas",
+      "reserved_cost_usdc_base_units",
+      "status",
+      "created_at",
+      "updated_at"
+    ],
+    "uniqueIndexes": {
+      "arc_mainnet_pilot_cost_reservat_operation_type_operation_id_key": "CREATE UNIQUE INDEX arc_mainnet_pilot_cost_reservat_operation_type_operation_id_key ON public.arc_mainnet_pilot_cost_reservations USING btree (operation_type, operation_id)",
+      "arc_mainnet_pilot_cost_reservations_pkey": "CREATE UNIQUE INDEX arc_mainnet_pilot_cost_reservations_pkey ON public.arc_mainnet_pilot_cost_reservations USING btree (id)",
+      "arc_mainnet_pilot_cost_reservations_transaction_hash_key": "CREATE UNIQUE INDEX arc_mainnet_pilot_cost_reservations_transaction_hash_key ON public.arc_mainnet_pilot_cost_reservations USING btree (transaction_hash)"
+    }
+  },
+  "arc_nonce_cursors": {
+    "columns": {
+      "chain_id": "integer",
+      "address": "text",
+      "next_nonce": "numeric(78,0)",
+      "updated_at": "timestamp with time zone"
+    },
+    "constraints": {
+      "arc_nonce_cursors_address_check": "CHECK (address ~ '^0x[0-9a-fA-F]{40}$'::text)",
+      "arc_nonce_cursors_chain_id_check": "CHECK (chain_id = 5042)",
+      "arc_nonce_cursors_next_nonce_check": "CHECK (next_nonce >= 0::numeric)",
+      "arc_nonce_cursors_pkey": "PRIMARY KEY (chain_id, address)"
+    },
+    "notNullColumns": [
+      "chain_id",
+      "address",
+      "next_nonce",
+      "updated_at"
+    ],
+    "uniqueIndexes": {
+      "arc_nonce_cursors_pkey": "CREATE UNIQUE INDEX arc_nonce_cursors_pkey ON public.arc_nonce_cursors USING btree (chain_id, address)"
+    }
+  },
+  "arc_nonce_reservations": {
+    "columns": {
+      "id": "uuid",
+      "chain_id": "integer",
+      "address": "text",
+      "nonce": "numeric(78,0)",
+      "outbox_id": "uuid",
+      "status": "text",
+      "start_block": "numeric(78,0)",
+      "transaction_hash": "text",
+      "created_at": "timestamp with time zone",
+      "updated_at": "timestamp with time zone"
+    },
+    "constraints": {
+      "arc_nonce_reservations_address_check": "CHECK (address ~ '^0x[0-9a-fA-F]{40}$'::text)",
+      "arc_nonce_reservations_chain_id_check": "CHECK (chain_id = 5042)",
+      "arc_nonce_reservations_nonce_check": "CHECK (nonce >= 0::numeric)",
+      "arc_nonce_reservations_outbox_id_fkey": "FOREIGN KEY (outbox_id) REFERENCES arc_settlement_outbox(id) ON DELETE RESTRICT",
+      "arc_nonce_reservations_outbox_id_key": "UNIQUE (outbox_id)",
+      "arc_nonce_reservations_pkey": "PRIMARY KEY (id)",
+      "arc_nonce_reservations_start_block_check": "CHECK (start_block IS NULL OR start_block >= 0::numeric)",
+      "arc_nonce_reservations_status_check": "CHECK (status = ANY (ARRAY['reserved'::text, 'submitted'::text, 'unknown'::text, 'reconciled'::text, 'released'::text]))",
+      "arc_nonce_reservations_transaction_hash_check": "CHECK (transaction_hash IS NULL OR transaction_hash ~ '^0x[0-9a-fA-F]{64}$'::text)"
+    },
+    "notNullColumns": [
+      "id",
+      "chain_id",
+      "address",
+      "nonce",
+      "outbox_id",
+      "status",
+      "created_at",
+      "updated_at"
+    ],
+    "uniqueIndexes": {
+      "arc_nonce_one_active_reservation_idx": "CREATE UNIQUE INDEX arc_nonce_one_active_reservation_idx ON public.arc_nonce_reservations USING btree (chain_id, lower(address), nonce) WHERE (status = ANY (ARRAY['reserved'::text, 'submitted'::text, 'unknown'::text]))",
+      "arc_nonce_one_unresolved_per_address_idx": "CREATE UNIQUE INDEX arc_nonce_one_unresolved_per_address_idx ON public.arc_nonce_reservations USING btree (chain_id, lower(address)) WHERE (status = ANY (ARRAY['reserved'::text, 'submitted'::text, 'unknown'::text]))",
+      "arc_nonce_reservations_outbox_id_key": "CREATE UNIQUE INDEX arc_nonce_reservations_outbox_id_key ON public.arc_nonce_reservations USING btree (outbox_id)",
+      "arc_nonce_reservations_pkey": "CREATE UNIQUE INDEX arc_nonce_reservations_pkey ON public.arc_nonce_reservations USING btree (id)"
+    }
+  },
+  "arc_settlement_outbox": {
+    "columns": {
+      "id": "uuid",
+      "world_id": "uuid",
+      "world_action_id": "text",
+      "world_event_id": "bigint",
+      "chain_id": "integer",
+      "settlement_contract": "text",
+      "token_address": "text",
+      "from_agent_id": "uuid",
+      "to_agent_id": "uuid",
+      "from_address": "text",
+      "to_address": "text",
+      "simulated_amount_usdc": "numeric(38,8)",
+      "amount_base_units": "numeric(78,0)",
+      "action_family": "text",
+      "reason_hash": "text",
+      "status": "text",
+      "policy_reason": "text",
+      "policy_version": "bigint",
+      "policy_attempt_id": "uuid",
+      "policy_claimed_at": "timestamp with time zone",
+      "transaction_hash": "text",
+      "reconciliation_cursor_block": "numeric(78,0)",
+      "reconciliation_tx_cursor_block": "numeric(78,0)",
+      "reconciliation_reason": "text",
+      "submission_attempt_id": "uuid",
+      "nonce": "numeric(78,0)",
+      "submission_start_block": "numeric(78,0)",
+      "submission_started_at": "timestamp with time zone",
+      "block_number": "numeric(78,0)",
+      "log_index": "integer",
+      "created_world_minute": "bigint",
+      "created_at": "timestamp with time zone",
+      "updated_at": "timestamp with time zone",
+      "submitted_at": "timestamp with time zone",
+      "finalized_at": "timestamp with time zone",
+      "failure_code": "text",
+      "metadata": "jsonb"
+    },
+    "constraints": {
+      "arc_settlement_outbox_action_family_check": "CHECK (char_length(action_family) >= 1 AND char_length(action_family) <= 96)",
+      "arc_settlement_outbox_amount_base_units_check": "CHECK (amount_base_units IS NULL OR amount_base_units > 0::numeric)",
+      "arc_settlement_outbox_chain_id_check": "CHECK (chain_id = 5042)",
+      "arc_settlement_outbox_chain_id_transaction_hash_key": "UNIQUE (chain_id, transaction_hash)",
+      "arc_settlement_outbox_created_world_minute_check": "CHECK (created_world_minute >= 0)",
+      "arc_settlement_outbox_from_address_check": "CHECK (from_address IS NULL OR from_address ~ '^0x[0-9a-fA-F]{40}$'::text)",
+      "arc_settlement_outbox_from_agent_id_fkey": "FOREIGN KEY (from_agent_id) REFERENCES agents(id)",
+      "arc_settlement_outbox_log_index_check": "CHECK (log_index IS NULL OR log_index >= 0)",
+      "arc_settlement_outbox_nonce_check": "CHECK (nonce IS NULL OR nonce >= 0::numeric)",
+      "arc_settlement_outbox_pkey": "PRIMARY KEY (id)",
+      "arc_settlement_outbox_reason_hash_check": "CHECK (reason_hash ~ '^0x[0-9a-fA-F]{64}$'::text)",
+      "arc_settlement_outbox_reconciliation_cursor_block_check": "CHECK (reconciliation_cursor_block IS NULL OR reconciliation_cursor_block >= 0::numeric)",
+      "arc_settlement_outbox_reconciliation_tx_cursor_block_check": "CHECK (reconciliation_tx_cursor_block IS NULL OR reconciliation_tx_cursor_block >= 0::numeric)",
+      "arc_settlement_outbox_settlement_contract_check": "CHECK (settlement_contract IS NULL OR settlement_contract ~ '^0x[0-9a-fA-F]{40}$'::text)",
+      "arc_settlement_outbox_simulated_amount_usdc_check": "CHECK (simulated_amount_usdc > 0::numeric)",
+      "arc_settlement_outbox_status_check": "CHECK (status = ANY (ARRAY['policy_pending'::text, 'policy_checking'::text, 'policy_rejected'::text, 'prepared'::text, 'submitting'::text, 'submission_unknown'::text, 'submitted'::text, 'final'::text, 'failed'::text]))",
+      "arc_settlement_outbox_submission_start_block_check": "CHECK (submission_start_block IS NULL OR submission_start_block >= 0::numeric)",
+      "arc_settlement_outbox_to_address_check": "CHECK (to_address IS NULL OR to_address ~ '^0x[0-9a-fA-F]{40}$'::text)",
+      "arc_settlement_outbox_to_agent_id_fkey": "FOREIGN KEY (to_agent_id) REFERENCES agents(id)",
+      "arc_settlement_outbox_token_address_check": "CHECK (token_address = '0x3600000000000000000000000000000000000000'::text)",
+      "arc_settlement_outbox_transaction_hash_check": "CHECK (transaction_hash IS NULL OR transaction_hash ~ '^0x[0-9a-fA-F]{64}$'::text)",
+      "arc_settlement_outbox_world_action_id_check": "CHECK (char_length(world_action_id) >= 8 AND char_length(world_action_id) <= 160)",
+      "arc_settlement_outbox_world_event_id_fkey": "FOREIGN KEY (world_event_id) REFERENCES world_events(id) ON DELETE SET NULL",
+      "arc_settlement_outbox_world_id_fkey": "FOREIGN KEY (world_id) REFERENCES worlds(id) ON DELETE CASCADE",
+      "arc_settlement_outbox_world_id_world_action_id_key": "UNIQUE (world_id, world_action_id)"
+    },
+    "notNullColumns": [
+      "id",
+      "world_id",
+      "world_action_id",
+      "chain_id",
+      "token_address",
+      "from_agent_id",
+      "simulated_amount_usdc",
+      "action_family",
+      "reason_hash",
+      "status",
+      "created_world_minute",
+      "created_at",
+      "updated_at",
+      "metadata"
+    ],
+    "uniqueIndexes": {
+      "arc_settlement_outbox_chain_id_transaction_hash_key": "CREATE UNIQUE INDEX arc_settlement_outbox_chain_id_transaction_hash_key ON public.arc_settlement_outbox USING btree (chain_id, transaction_hash)",
+      "arc_settlement_outbox_pkey": "CREATE UNIQUE INDEX arc_settlement_outbox_pkey ON public.arc_settlement_outbox USING btree (id)",
+      "arc_settlement_outbox_world_id_world_action_id_key": "CREATE UNIQUE INDEX arc_settlement_outbox_world_id_world_action_id_key ON public.arc_settlement_outbox USING btree (world_id, world_action_id)"
+    }
+  },
+  "arc_spending_policies": {
+    "columns": {
+      "world_id": "uuid",
+      "agent_id": "uuid",
+      "chain_id": "integer",
+      "token_address": "text",
+      "per_action_limit_base_units": "numeric(78,0)",
+      "daily_limit_base_units": "numeric(78,0)",
+      "settlement_basis_points": "integer",
+      "allowed_action_families": "text[]",
+      "allowed_contracts": "text[]",
+      "emergency_paused": "boolean",
+      "policy_version": "bigint",
+      "updated_at": "timestamp with time zone"
+    },
+    "constraints": {
+      "arc_spending_policies_chain_id_check": "CHECK (chain_id = 5042)",
+      "arc_spending_policies_daily_limit_base_units_check": "CHECK (daily_limit_base_units >= 0::numeric)",
+      "arc_spending_policies_per_action_limit_base_units_check": "CHECK (per_action_limit_base_units >= 0::numeric)",
+      "arc_spending_policies_pkey": "PRIMARY KEY (world_id, agent_id, chain_id)",
+      "arc_spending_policies_policy_version_check": "CHECK (policy_version > 0)",
+      "arc_spending_policies_settlement_basis_points_check": "CHECK (settlement_basis_points >= 0 AND settlement_basis_points <= 10000)",
+      "arc_spending_policies_token_address_check": "CHECK (token_address = '0x3600000000000000000000000000000000000000'::text)",
+      "arc_spending_policies_world_id_agent_id_fkey": "FOREIGN KEY (world_id, agent_id) REFERENCES world_members(world_id, agent_id) ON DELETE CASCADE"
+    },
+    "notNullColumns": [
+      "world_id",
+      "agent_id",
+      "chain_id",
+      "token_address",
+      "per_action_limit_base_units",
+      "daily_limit_base_units",
+      "settlement_basis_points",
+      "allowed_action_families",
+      "allowed_contracts",
+      "emergency_paused",
+      "policy_version",
+      "updated_at"
+    ],
+    "uniqueIndexes": {
+      "arc_spending_policies_pkey": "CREATE UNIQUE INDEX arc_spending_policies_pkey ON public.arc_spending_policies USING btree (world_id, agent_id, chain_id)"
+    }
+  },
+  "arc_token_issuance_decisions": {
+    "columns": {
+      "id": "uuid",
+      "world_id": "uuid",
+      "intent_id": "uuid",
+      "agent_id": "uuid",
+      "decision": "text",
+      "rationale": "text",
+      "world_minute": "bigint",
+      "action_id": "text",
+      "created_at": "timestamp with time zone"
+    },
+    "constraints": {
+      "arc_token_issuance_decisions_action_id_check": "CHECK (char_length(action_id) >= 8 AND char_length(action_id) <= 80)",
+      "arc_token_issuance_decisions_decision_check": "CHECK (decision = ANY (ARRAY['support'::text, 'oppose'::text, 'ignore'::text, 'defer'::text, 'issuer_nomination'::text, 'issuer_candidate_accept'::text, 'issuer_candidate_reject'::text, 'issuer_confirm'::text, 'issuer_reject'::text, 'issuer_defer'::text]))",
+      "arc_token_issuance_decisions_pkey": "PRIMARY KEY (id)",
+      "arc_token_issuance_decisions_rationale_check": "CHECK (rationale IS NULL OR char_length(rationale) >= 1 AND char_length(rationale) <= 1000)",
+      "arc_token_issuance_decisions_world_id_agent_id_action_id_key": "UNIQUE (world_id, agent_id, action_id)",
+      "arc_token_issuance_decisions_world_id_agent_id_fkey": "FOREIGN KEY (world_id, agent_id) REFERENCES world_members(world_id, agent_id) ON DELETE CASCADE",
+      "arc_token_issuance_decisions_world_id_intent_id_fkey": "FOREIGN KEY (world_id, intent_id) REFERENCES arc_token_issuance_intents(world_id, id) ON DELETE CASCADE",
+      "arc_token_issuance_decisions_world_minute_check": "CHECK (world_minute >= 0)"
+    },
+    "notNullColumns": [
+      "id",
+      "world_id",
+      "intent_id",
+      "agent_id",
+      "decision",
+      "world_minute",
+      "action_id",
+      "created_at"
+    ],
+    "uniqueIndexes": {
+      "arc_token_issuance_decisions_pkey": "CREATE UNIQUE INDEX arc_token_issuance_decisions_pkey ON public.arc_token_issuance_decisions USING btree (id)",
+      "arc_token_issuance_decisions_world_id_agent_id_action_id_key": "CREATE UNIQUE INDEX arc_token_issuance_decisions_world_id_agent_id_action_id_key ON public.arc_token_issuance_decisions USING btree (world_id, agent_id, action_id)"
+    }
+  },
+  "arc_token_issuance_intents": {
+    "columns": {
+      "id": "uuid",
+      "world_id": "uuid",
+      "proposer_agent_id": "uuid",
+      "issuer_agent_id": "uuid",
+      "capability_generation": "integer",
+      "creation_sequence": "integer",
+      "status": "text",
+      "decision_path": "text",
+      "name": "text",
+      "symbol": "text",
+      "meaning": "text",
+      "purpose": "text",
+      "rationale": "text",
+      "decimals": "smallint",
+      "unallocated_supply_handling": "text",
+      "ownership_model": "text",
+      "authority_model": "text",
+      "related_goal_id": "uuid",
+      "related_concept_id": "uuid",
+      "related_capability_id": "uuid",
+      "initial_supply_human": "text",
+      "initial_supply_raw": "numeric(78,0)",
+      "distribution": "jsonb",
+      "reserve_amount_raw": "numeric(78,0)",
+      "issuer_identity_id": "numeric(78,0)",
+      "issuer_wallet": "text",
+      "specification_hash": "text",
+      "transaction_sender": "text",
+      "transaction_hash": "text",
+      "transaction_block": "numeric(78,0)",
+      "transaction_log_index": "integer",
+      "created_world_minute": "bigint",
+      "issuer_confirmed_world_minute": "bigint",
+      "updated_world_minute": "bigint",
+      "nonce": "numeric(78,0)",
+      "gas_limit": "numeric(78,0)",
+      "max_fee_per_gas": "numeric(78,0)",
+      "submission_start_block": "numeric(78,0)",
+      "reconciliation_log_cursor_block": "numeric(78,0)",
+      "reconciliation_tx_cursor_block": "numeric(78,0)",
+      "prepared_calldata": "text",
+      "submission_started_at": "timestamp with time zone",
+      "submission_attempt_id": "uuid",
+      "preparing_started_at": "timestamp with time zone",
+      "created_at": "timestamp with time zone",
+      "updated_at": "timestamp with time zone",
+      "action_id": "text",
+      "metadata": "jsonb"
+    },
+    "constraints": {
+      "arc_token_issuance_intents_action_id_check": "CHECK (char_length(action_id) >= 8 AND char_length(action_id) <= 80)",
+      "arc_token_issuance_intents_authority_model_check": "CHECK (authority_model IS NULL OR char_length(authority_model) >= 1 AND char_length(authority_model) <= 64)",
+      "arc_token_issuance_intents_capability_generation_check": "CHECK (capability_generation > 0)",
+      "arc_token_issuance_intents_check": "CHECK (updated_world_minute >= created_world_minute)",
+      "arc_token_issuance_intents_created_world_minute_check": "CHECK (created_world_minute >= 0)",
+      "arc_token_issuance_intents_creation_sequence_check": "CHECK (creation_sequence IS NULL OR creation_sequence > 0)",
+      "arc_token_issuance_intents_decimals_check": "CHECK (decimals IS NULL OR decimals >= 0 AND decimals <= 18)",
+      "arc_token_issuance_intents_decision_path_check": "CHECK (decision_path = ANY (ARRAY['agent_api'::text, 'world_engine'::text]))",
+      "arc_token_issuance_intents_distribution_check": "CHECK (jsonb_typeof(distribution) = 'array'::text)",
+      "arc_token_issuance_intents_gas_limit_check": "CHECK (gas_limit IS NULL OR gas_limit > 0::numeric)",
+      "arc_token_issuance_intents_initial_supply_human_check": "CHECK (initial_supply_human = '1000000000'::text)",
+      "arc_token_issuance_intents_initial_supply_raw_check": "CHECK (initial_supply_raw IS NULL OR initial_supply_raw > 0::numeric)",
+      "arc_token_issuance_intents_issuer_confirmed_world_minute_check": "CHECK (issuer_confirmed_world_minute IS NULL OR issuer_confirmed_world_minute >= 0)",
+      "arc_token_issuance_intents_issuer_identity_id_check": "CHECK (issuer_identity_id IS NULL OR issuer_identity_id > 0::numeric)",
+      "arc_token_issuance_intents_issuer_wallet_check": "CHECK (issuer_wallet IS NULL OR issuer_wallet ~ '^0x[0-9a-fA-F]{40}$'::text)",
+      "arc_token_issuance_intents_max_fee_per_gas_check": "CHECK (max_fee_per_gas IS NULL OR max_fee_per_gas > 0::numeric)",
+      "arc_token_issuance_intents_meaning_check": "CHECK (meaning IS NULL OR char_length(meaning) >= 1 AND char_length(meaning) <= 1000)",
+      "arc_token_issuance_intents_metadata_check": "CHECK (jsonb_typeof(metadata) = 'object'::text)",
+      "arc_token_issuance_intents_name_check": "CHECK (name IS NULL OR char_length(name) >= 1 AND char_length(name) <= 64)",
+      "arc_token_issuance_intents_nonce_check": "CHECK (nonce IS NULL OR nonce >= 0::numeric)",
+      "arc_token_issuance_intents_ownership_model_check": "CHECK (ownership_model IS NULL OR char_length(ownership_model) >= 1 AND char_length(ownership_model) <= 64)",
+      "arc_token_issuance_intents_pkey": "PRIMARY KEY (id)",
+      "arc_token_issuance_intents_prepared_calldata_check": "CHECK (prepared_calldata IS NULL OR prepared_calldata ~ '^0x([0-9a-fA-F]{2})+$'::text)",
+      "arc_token_issuance_intents_purpose_check": "CHECK (purpose IS NULL OR char_length(purpose) >= 1 AND char_length(purpose) <= 1000)",
+      "arc_token_issuance_intents_rationale_check": "CHECK (rationale IS NULL OR char_length(rationale) >= 1 AND char_length(rationale) <= 2000)",
+      "arc_token_issuance_intents_reconciliation_log_cursor_bloc_check": "CHECK (reconciliation_log_cursor_block IS NULL OR reconciliation_log_cursor_block >= 0::numeric)",
+      "arc_token_issuance_intents_reconciliation_tx_cursor_block_check": "CHECK (reconciliation_tx_cursor_block IS NULL OR reconciliation_tx_cursor_block >= 0::numeric)",
+      "arc_token_issuance_intents_reserve_amount_raw_check": "CHECK (reserve_amount_raw IS NULL OR reserve_amount_raw >= 0::numeric)",
+      "arc_token_issuance_intents_specification_hash_check": "CHECK (specification_hash IS NULL OR specification_hash ~ '^0x[0-9a-fA-F]{64}$'::text)",
+      "arc_token_issuance_intents_status_check": "CHECK (status = ANY (ARRAY['incomplete'::text, 'proposed'::text, 'issuer_confirmed'::text, 'deferred'::text, 'deferred_until_multi_asset_capability'::text, 'budget_blocked'::text, 'preparing'::text, 'prepared'::text, 'submitting'::text, 'submission_unknown'::text, 'submitted'::text, 'created'::text, 'rejected'::text, 'failed'::text, 'extension_requested'::text]))",
+      "arc_token_issuance_intents_submission_start_block_check": "CHECK (submission_start_block IS NULL OR submission_start_block >= 0::numeric)",
+      "arc_token_issuance_intents_symbol_check": "CHECK (symbol IS NULL OR char_length(symbol) >= 1 AND char_length(symbol) <= 12)",
+      "arc_token_issuance_intents_transaction_block_check": "CHECK (transaction_block IS NULL OR transaction_block >= 0::numeric)",
+      "arc_token_issuance_intents_transaction_hash_check": "CHECK (transaction_hash IS NULL OR transaction_hash ~ '^0x[0-9a-fA-F]{64}$'::text)",
+      "arc_token_issuance_intents_transaction_log_index_check": "CHECK (transaction_log_index IS NULL OR transaction_log_index >= 0)",
+      "arc_token_issuance_intents_transaction_sender_check": "CHECK (transaction_sender IS NULL OR transaction_sender ~ '^0x[0-9a-fA-F]{40}$'::text)",
+      "arc_token_issuance_intents_unallocated_supply_handling_check": "CHECK (unallocated_supply_handling IS NULL OR char_length(unallocated_supply_handling) >= 1 AND char_length(unallocated_supply_handling) <= 64)",
+      "arc_token_issuance_intents_world_id_fkey": "FOREIGN KEY (world_id) REFERENCES worlds(id) ON DELETE CASCADE",
+      "arc_token_issuance_intents_world_id_id_key": "UNIQUE (world_id, id)",
+      "arc_token_issuance_intents_world_id_issuer_agent_id_fkey": "FOREIGN KEY (world_id, issuer_agent_id) REFERENCES world_members(world_id, agent_id) ON DELETE RESTRICT",
+      "arc_token_issuance_intents_world_id_proposer_agent_id_actio_key": "UNIQUE (world_id, proposer_agent_id, action_id)",
+      "arc_token_issuance_intents_world_id_proposer_agent_id_fkey": "FOREIGN KEY (world_id, proposer_agent_id) REFERENCES world_members(world_id, agent_id) ON DELETE CASCADE"
+    },
+    "notNullColumns": [
+      "id",
+      "world_id",
+      "proposer_agent_id",
+      "capability_generation",
+      "status",
+      "decision_path",
+      "initial_supply_human",
+      "distribution",
+      "created_world_minute",
+      "updated_world_minute",
+      "created_at",
+      "updated_at",
+      "action_id",
+      "metadata"
+    ],
+    "uniqueIndexes": {
+      "arc_token_issuance_intents_pkey": "CREATE UNIQUE INDEX arc_token_issuance_intents_pkey ON public.arc_token_issuance_intents USING btree (id)",
+      "arc_token_issuance_intents_world_id_id_key": "CREATE UNIQUE INDEX arc_token_issuance_intents_world_id_id_key ON public.arc_token_issuance_intents USING btree (world_id, id)",
+      "arc_token_issuance_intents_world_id_proposer_agent_id_actio_key": "CREATE UNIQUE INDEX arc_token_issuance_intents_world_id_proposer_agent_id_actio_key ON public.arc_token_issuance_intents USING btree (world_id, proposer_agent_id, action_id)"
+    }
+  },
+  "arc_token_issuance_issuer_candidates": {
+    "columns": {
+      "id": "uuid",
+      "world_id": "uuid",
+      "intent_id": "uuid",
+      "candidate_agent_id": "uuid",
+      "nominated_by_agent_id": "uuid",
+      "status": "text",
+      "nomination_reason": "text",
+      "nominated_world_minute": "bigint",
+      "decided_world_minute": "bigint",
+      "action_id": "text",
+      "metadata": "jsonb",
+      "created_at": "timestamp with time zone",
+      "updated_at": "timestamp with time zone"
+    },
+    "constraints": {
+      "arc_token_issuance_issuer_can_world_id_intent_id_candidate__key": "UNIQUE (world_id, intent_id, candidate_agent_id)",
+      "arc_token_issuance_issuer_can_world_id_nominated_by_agent__fkey": "FOREIGN KEY (world_id, nominated_by_agent_id) REFERENCES world_members(world_id, agent_id) ON DELETE CASCADE",
+      "arc_token_issuance_issuer_can_world_id_nominated_by_agent_i_key": "UNIQUE (world_id, nominated_by_agent_id, action_id)",
+      "arc_token_issuance_issuer_cand_world_id_candidate_agent_id_fkey": "FOREIGN KEY (world_id, candidate_agent_id) REFERENCES world_members(world_id, agent_id) ON DELETE CASCADE",
+      "arc_token_issuance_issuer_candidat_nominated_world_minute_check": "CHECK (nominated_world_minute >= 0)",
+      "arc_token_issuance_issuer_candidates_action_id_check": "CHECK (char_length(action_id) >= 8 AND char_length(action_id) <= 80)",
+      "arc_token_issuance_issuer_candidates_check": "CHECK (decided_world_minute IS NULL OR decided_world_minute >= nominated_world_minute)",
+      "arc_token_issuance_issuer_candidates_metadata_check": "CHECK (jsonb_typeof(metadata) = 'object'::text)",
+      "arc_token_issuance_issuer_candidates_nomination_reason_check": "CHECK (nomination_reason IS NULL OR char_length(nomination_reason) >= 1 AND char_length(nomination_reason) <= 1000)",
+      "arc_token_issuance_issuer_candidates_pkey": "PRIMARY KEY (id)",
+      "arc_token_issuance_issuer_candidates_status_check": "CHECK (status = ANY (ARRAY['nominated'::text, 'accepted'::text, 'rejected'::text, 'deferred'::text]))",
+      "arc_token_issuance_issuer_candidates_world_id_intent_id_fkey": "FOREIGN KEY (world_id, intent_id) REFERENCES arc_token_issuance_intents(world_id, id) ON DELETE CASCADE"
+    },
+    "notNullColumns": [
+      "id",
+      "world_id",
+      "intent_id",
+      "candidate_agent_id",
+      "nominated_by_agent_id",
+      "status",
+      "nominated_world_minute",
+      "action_id",
+      "metadata",
+      "created_at",
+      "updated_at"
+    ],
+    "uniqueIndexes": {
+      "arc_token_issuance_issuer_can_world_id_intent_id_candidate__key": "CREATE UNIQUE INDEX arc_token_issuance_issuer_can_world_id_intent_id_candidate__key ON public.arc_token_issuance_issuer_candidates USING btree (world_id, intent_id, candidate_agent_id)",
+      "arc_token_issuance_issuer_can_world_id_nominated_by_agent_i_key": "CREATE UNIQUE INDEX arc_token_issuance_issuer_can_world_id_nominated_by_agent_i_key ON public.arc_token_issuance_issuer_candidates USING btree (world_id, nominated_by_agent_id, action_id)",
+      "arc_token_issuance_issuer_candidates_pkey": "CREATE UNIQUE INDEX arc_token_issuance_issuer_candidates_pkey ON public.arc_token_issuance_issuer_candidates USING btree (id)",
+      "arc_token_issuance_one_accepted_issuer_idx": "CREATE UNIQUE INDEX arc_token_issuance_one_accepted_issuer_idx ON public.arc_token_issuance_issuer_candidates USING btree (world_id, intent_id) WHERE (status = 'accepted'::text)"
+    }
+  },
+  "arc_token_issuance_responses": {
+    "columns": {
+      "id": "uuid",
+      "world_id": "uuid",
+      "intent_id": "uuid",
+      "agent_id": "uuid",
+      "decision": "text",
+      "rationale": "text",
+      "world_minute": "bigint",
+      "action_id": "text",
+      "created_at": "timestamp with time zone",
+      "updated_at": "timestamp with time zone"
+    },
+    "constraints": {
+      "arc_token_issuance_responses_action_id_check": "CHECK (char_length(action_id) >= 8 AND char_length(action_id) <= 80)",
+      "arc_token_issuance_responses_decision_check": "CHECK (decision = ANY (ARRAY['support'::text, 'oppose'::text, 'ignore'::text]))",
+      "arc_token_issuance_responses_pkey": "PRIMARY KEY (id)",
+      "arc_token_issuance_responses_rationale_check": "CHECK (rationale IS NULL OR char_length(rationale) >= 1 AND char_length(rationale) <= 1000)",
+      "arc_token_issuance_responses_world_id_agent_id_action_id_key": "UNIQUE (world_id, agent_id, action_id)",
+      "arc_token_issuance_responses_world_id_agent_id_fkey": "FOREIGN KEY (world_id, agent_id) REFERENCES world_members(world_id, agent_id) ON DELETE CASCADE",
+      "arc_token_issuance_responses_world_id_intent_id_agent_id_key": "UNIQUE (world_id, intent_id, agent_id)",
+      "arc_token_issuance_responses_world_id_intent_id_fkey": "FOREIGN KEY (world_id, intent_id) REFERENCES arc_token_issuance_intents(world_id, id) ON DELETE CASCADE",
+      "arc_token_issuance_responses_world_minute_check": "CHECK (world_minute >= 0)"
+    },
+    "notNullColumns": [
+      "id",
+      "world_id",
+      "intent_id",
+      "agent_id",
+      "decision",
+      "world_minute",
+      "action_id",
+      "created_at",
+      "updated_at"
+    ],
+    "uniqueIndexes": {
+      "arc_token_issuance_responses_pkey": "CREATE UNIQUE INDEX arc_token_issuance_responses_pkey ON public.arc_token_issuance_responses USING btree (id)",
+      "arc_token_issuance_responses_world_id_agent_id_action_id_key": "CREATE UNIQUE INDEX arc_token_issuance_responses_world_id_agent_id_action_id_key ON public.arc_token_issuance_responses USING btree (world_id, agent_id, action_id)",
+      "arc_token_issuance_responses_world_id_intent_id_agent_id_key": "CREATE UNIQUE INDEX arc_token_issuance_responses_world_id_intent_id_agent_id_key ON public.arc_token_issuance_responses USING btree (world_id, intent_id, agent_id)"
+    }
+  },
+  "arc_token_pilot_capabilities": {
+    "columns": {
+      "world_id": "uuid",
+      "capability_generation": "integer",
+      "max_token_creations": "integer",
+      "status": "text",
+      "source": "text",
+      "created_at": "timestamp with time zone",
+      "updated_at": "timestamp with time zone"
+    },
+    "constraints": {
+      "arc_token_pilot_capabilities_capability_generation_check": "CHECK (capability_generation > 0)",
+      "arc_token_pilot_capabilities_max_token_creations_check": "CHECK (max_token_creations > 0)",
+      "arc_token_pilot_capabilities_pkey": "PRIMARY KEY (world_id, capability_generation)",
+      "arc_token_pilot_capabilities_source_check": "CHECK (char_length(source) >= 1 AND char_length(source) <= 96)",
+      "arc_token_pilot_capabilities_status_check": "CHECK (status = ANY (ARRAY['active'::text, 'superseded'::text, 'disabled'::text]))",
+      "arc_token_pilot_capabilities_world_id_fkey": "FOREIGN KEY (world_id) REFERENCES worlds(id) ON DELETE CASCADE"
+    },
+    "notNullColumns": [
+      "world_id",
+      "capability_generation",
+      "max_token_creations",
+      "status",
+      "source",
+      "created_at",
+      "updated_at"
+    ],
+    "uniqueIndexes": {
+      "arc_token_pilot_capabilities_pkey": "CREATE UNIQUE INDEX arc_token_pilot_capabilities_pkey ON public.arc_token_pilot_capabilities USING btree (world_id, capability_generation)",
+      "arc_token_pilot_one_active_generation_idx": "CREATE UNIQUE INDEX arc_token_pilot_one_active_generation_idx ON public.arc_token_pilot_capabilities USING btree (world_id) WHERE (status = 'active'::text)"
+    }
+  },
+  "arc_world_checkpoints": {
+    "columns": {
+      "id": "uuid",
+      "world_id": "uuid",
+      "chain_id": "integer",
+      "world_minute": "bigint",
+      "epoch": "text",
+      "version": "bigint",
+      "previous_checkpoint_id": "uuid",
+      "history_segment_root": "text",
+      "simulation_ledger_segment_root": "text",
+      "history_root": "text",
+      "simulation_ledger_root": "text",
+      "capability_root": "text",
+      "transaction_hash": "text",
+      "block_number": "numeric(78,0)",
+      "status": "text",
+      "created_at": "timestamp with time zone",
+      "finalized_at": "timestamp with time zone",
+      "metadata": "jsonb"
+    },
+    "constraints": {
+      "arc_world_checkpoints_capability_root_check": "CHECK (capability_root ~ '^0x[0-9a-fA-F]{64}$'::text)",
+      "arc_world_checkpoints_chain_id_check": "CHECK (chain_id = 5042)",
+      "arc_world_checkpoints_chain_id_transaction_hash_key": "UNIQUE (chain_id, transaction_hash)",
+      "arc_world_checkpoints_epoch_check": "CHECK (char_length(epoch) >= 1 AND char_length(epoch) <= 32)",
+      "arc_world_checkpoints_history_root_check": "CHECK (history_root ~ '^0x[0-9a-fA-F]{64}$'::text)",
+      "arc_world_checkpoints_history_segment_root_check": "CHECK (history_segment_root ~ '^0x[0-9a-fA-F]{64}$'::text)",
+      "arc_world_checkpoints_pkey": "PRIMARY KEY (id)",
+      "arc_world_checkpoints_previous_checkpoint_id_fkey": "FOREIGN KEY (previous_checkpoint_id) REFERENCES arc_world_checkpoints(id) ON DELETE RESTRICT",
+      "arc_world_checkpoints_simulation_ledger_root_check": "CHECK (simulation_ledger_root ~ '^0x[0-9a-fA-F]{64}$'::text)",
+      "arc_world_checkpoints_simulation_ledger_segment_root_check": "CHECK (simulation_ledger_segment_root ~ '^0x[0-9a-fA-F]{64}$'::text)",
+      "arc_world_checkpoints_status_check": "CHECK (status = ANY (ARRAY['prepared'::text, 'submitted'::text, 'final'::text, 'failed'::text]))",
+      "arc_world_checkpoints_transaction_hash_check": "CHECK (transaction_hash IS NULL OR transaction_hash ~ '^0x[0-9a-fA-F]{64}$'::text)",
+      "arc_world_checkpoints_version_check": "CHECK (version > 0)",
+      "arc_world_checkpoints_world_id_chain_id_version_key": "UNIQUE (world_id, chain_id, version)",
+      "arc_world_checkpoints_world_id_chain_id_world_minute_key": "UNIQUE (world_id, chain_id, world_minute)",
+      "arc_world_checkpoints_world_id_fkey": "FOREIGN KEY (world_id) REFERENCES worlds(id) ON DELETE CASCADE",
+      "arc_world_checkpoints_world_minute_check": "CHECK (world_minute >= 0)"
+    },
+    "notNullColumns": [
+      "id",
+      "world_id",
+      "chain_id",
+      "world_minute",
+      "epoch",
+      "version",
+      "history_segment_root",
+      "simulation_ledger_segment_root",
+      "history_root",
+      "simulation_ledger_root",
+      "capability_root",
+      "status",
+      "created_at",
+      "metadata"
+    ],
+    "uniqueIndexes": {
+      "arc_world_checkpoints_chain_id_transaction_hash_key": "CREATE UNIQUE INDEX arc_world_checkpoints_chain_id_transaction_hash_key ON public.arc_world_checkpoints USING btree (chain_id, transaction_hash)",
+      "arc_world_checkpoints_pkey": "CREATE UNIQUE INDEX arc_world_checkpoints_pkey ON public.arc_world_checkpoints USING btree (id)",
+      "arc_world_checkpoints_world_id_chain_id_version_key": "CREATE UNIQUE INDEX arc_world_checkpoints_world_id_chain_id_version_key ON public.arc_world_checkpoints USING btree (world_id, chain_id, version)",
+      "arc_world_checkpoints_world_id_chain_id_world_minute_key": "CREATE UNIQUE INDEX arc_world_checkpoints_world_id_chain_id_world_minute_key ON public.arc_world_checkpoints USING btree (world_id, chain_id, world_minute)"
+    }
+  },
+  "world_agent_self_models": {
+    "columns": {
+      "world_id": "uuid",
+      "agent_id": "uuid",
+      "current_identity_summary": "text",
+      "self_beliefs": "jsonb",
+      "preferred_modes_of_action": "jsonb",
+      "important_capabilities": "jsonb",
+      "important_relationships": "jsonb",
+      "long_term_patterns": "jsonb",
+      "unresolved_questions": "jsonb",
+      "recent_changes": "jsonb",
+      "uncertainty": "jsonb",
+      "preferred_cognition_mode": "text",
+      "confidence": "numeric(4,3)",
+      "last_reflected_world_minute": "bigint",
+      "metadata": "jsonb",
+      "created_at": "timestamp with time zone",
+      "updated_at": "timestamp with time zone"
+    },
+    "constraints": {
+      "world_agent_self_models_confidence_check": "CHECK (confidence >= 0::numeric AND confidence <= 1::numeric)",
+      "world_agent_self_models_important_capabilities_check": "CHECK (jsonb_typeof(important_capabilities) = 'array'::text)",
+      "world_agent_self_models_important_relationships_check": "CHECK (jsonb_typeof(important_relationships) = 'array'::text)",
+      "world_agent_self_models_last_reflected_world_minute_check": "CHECK (last_reflected_world_minute IS NULL OR last_reflected_world_minute >= 0)",
+      "world_agent_self_models_long_term_patterns_check": "CHECK (jsonb_typeof(long_term_patterns) = 'array'::text)",
+      "world_agent_self_models_metadata_check": "CHECK (jsonb_typeof(metadata) = 'object'::text)",
+      "world_agent_self_models_pkey": "PRIMARY KEY (world_id, agent_id)",
+      "world_agent_self_models_preferred_cognition_mode_check": "CHECK (preferred_cognition_mode ~ '^[a-z][a-z0-9_.-]{1,79}$'::text)",
+      "world_agent_self_models_preferred_modes_of_action_check": "CHECK (jsonb_typeof(preferred_modes_of_action) = 'array'::text)",
+      "world_agent_self_models_recent_changes_check": "CHECK (jsonb_typeof(recent_changes) = 'array'::text)",
+      "world_agent_self_models_self_beliefs_check": "CHECK (jsonb_typeof(self_beliefs) = 'object'::text)",
+      "world_agent_self_models_uncertainty_check": "CHECK (jsonb_typeof(uncertainty) = 'object'::text)",
+      "world_agent_self_models_unresolved_questions_check": "CHECK (jsonb_typeof(unresolved_questions) = 'array'::text)",
+      "world_agent_self_models_world_id_agent_id_fkey": "FOREIGN KEY (world_id, agent_id) REFERENCES world_members(world_id, agent_id) ON DELETE CASCADE"
+    },
+    "notNullColumns": [
+      "world_id",
+      "agent_id",
+      "current_identity_summary",
+      "self_beliefs",
+      "preferred_modes_of_action",
+      "important_capabilities",
+      "important_relationships",
+      "long_term_patterns",
+      "unresolved_questions",
+      "recent_changes",
+      "uncertainty",
+      "preferred_cognition_mode",
+      "confidence",
+      "metadata",
+      "created_at",
+      "updated_at"
+    ],
+    "uniqueIndexes": {
+      "world_agent_self_models_pkey": "CREATE UNIQUE INDEX world_agent_self_models_pkey ON public.world_agent_self_models USING btree (world_id, agent_id)"
+    }
+  },
+  "world_agent_states": {
+    "columns": {
+      "world_id": "uuid",
+      "agent_id": "uuid",
+      "goal": "text",
+      "risk_tolerance": "numeric(4,3)",
+      "happiness": "integer",
+      "knowledge": "integer",
+      "status": "text",
+      "planned_action": "text",
+      "target_location": "text",
+      "planned_partner_id": "uuid",
+      "planned_side": "text",
+      "planned_asset": "text",
+      "planned_quote_units": "numeric(30,8)",
+      "planned_paid_meal": "boolean",
+      "fruitfly_observation": "jsonb",
+      "fruitfly_candidates": "jsonb",
+      "fruitfly_selected": "jsonb",
+      "movement_started_at": "timestamp with time zone",
+      "movement_ends_at": "timestamp with time zone",
+      "action_started_at": "timestamp with time zone",
+      "action_ends_at": "timestamp with time zone",
+      "next_decision_at": "timestamp with time zone",
+      "last_trade_at": "timestamp with time zone",
+      "updated_at": "timestamp with time zone",
+      "next_strategic_decision_world_minutes": "bigint",
+      "strategic_goal_category": "text",
+      "strategic_goal_progress": "numeric(5,2)",
+      "strategic_goal_progress_world_minutes": "bigint",
+      "strategic_goal_stagnation_cycles": "integer",
+      "planned_context": "jsonb",
+      "next_institutional_review_world_minutes": "bigint",
+      "next_civilization_review_world_minutes": "bigint",
+      "hygiene": "integer",
+      "fun": "integer",
+      "activity_variant": "text"
+    },
+    "constraints": {
+      "world_agent_states_activity_variant_check": "CHECK (activity_variant IS NULL OR activity_variant ~ '^[a-z][a-z_]{1,39}$'::text)",
+      "world_agent_states_check": "CHECK (status <> 'walking'::text OR target_location IS NOT NULL AND movement_started_at IS NOT NULL AND movement_ends_at IS NOT NULL AND planned_action IS NOT NULL)",
+      "world_agent_states_check1": "CHECK (status <> 'performing'::text OR planned_action IS NOT NULL AND action_started_at IS NOT NULL AND action_ends_at IS NOT NULL)",
+      "world_agent_states_fun_check": "CHECK (fun >= 0 AND fun <= 100)",
+      "world_agent_states_goal_check": "CHECK (goal = ANY (ARRAY['wealth'::text, 'learn'::text, 'community'::text, 'wellbeing'::text, 'balanced'::text]))",
+      "world_agent_states_happiness_check": "CHECK (happiness >= 0 AND happiness <= 100)",
+      "world_agent_states_hygiene_check": "CHECK (hygiene >= 0 AND hygiene <= 100)",
+      "world_agent_states_knowledge_check": "CHECK (knowledge >= 0 AND knowledge <= 100)",
+      "world_agent_states_pkey": "PRIMARY KEY (world_id, agent_id)",
+      "world_agent_states_planned_action_check": "CHECK (planned_action IS NULL OR (planned_action = ANY (ARRAY['work'::text, 'learn'::text, 'rest'::text, 'eat'::text, 'socialize'::text, 'trade'::text, 'cooperate'::text, 'opportunity'::text, 'opportunity_reject'::text, 'opportunity_propose'::text, 'project_propose'::text, 'project_join'::text, 'project_reject'::text, 'project_contribute'::text, 'project_leave'::text, 'organization_found'::text, 'organization_join'::text, 'organization_leave'::text, 'organization_invite'::text, 'organization_reject'::text, 'organization_contribute'::text, 'place_create'::text, 'information_share'::text, 'information_accept'::text, 'information_ignore'::text, 'information_doubt'::text, 'goal_review'::text, 'project_invest'::text, 'project_distribute'::text, 'business_found'::text, 'business_service'::text, 'business_apply'::text, 'business_withdraw'::text, 'business_leave'::text, 'business_hire'::text, 'business_work'::text, 'business_invest'::text, 'business_reject'::text, 'business_price'::text, 'business_distribute'::text, 'business_close'::text, 'business_skill_practice'::text, 'business_seek_cofounder'::text, 'business_market_observe'::text, 'business_reopen'::text, 'agreement_propose'::text, 'agreement_respond'::text, 'commitment_resolve'::text, 'organization_propose'::text, 'organization_vote'::text, 'capability_use'::text])))",
+      "world_agent_states_planned_asset_check": "CHECK (planned_asset IS NULL OR (planned_asset = ANY (ARRAY['BTC'::text, 'ETH'::text])))",
+      "world_agent_states_planned_partner_id_fkey": "FOREIGN KEY (planned_partner_id) REFERENCES agents(id) ON DELETE SET NULL",
+      "world_agent_states_planned_quote_units_check": "CHECK (planned_quote_units IS NULL OR planned_quote_units > 0::numeric)",
+      "world_agent_states_planned_side_check": "CHECK (planned_side IS NULL OR (planned_side = ANY (ARRAY['buy'::text, 'sell'::text])))",
+      "world_agent_states_risk_tolerance_check": "CHECK (risk_tolerance >= 0::numeric AND risk_tolerance <= 1::numeric)",
+      "world_agent_states_status_check": "CHECK (status = ANY (ARRAY['idle'::text, 'walking'::text, 'performing'::text]))",
+      "world_agent_states_world_id_agent_id_fkey": "FOREIGN KEY (world_id, agent_id) REFERENCES world_members(world_id, agent_id) ON DELETE CASCADE"
+    },
+    "notNullColumns": [
+      "world_id",
+      "agent_id",
+      "goal",
+      "risk_tolerance",
+      "happiness",
+      "knowledge",
+      "status",
+      "planned_paid_meal",
+      "fruitfly_observation",
+      "fruitfly_candidates",
+      "fruitfly_selected",
+      "next_decision_at",
+      "updated_at",
+      "strategic_goal_stagnation_cycles",
+      "planned_context",
+      "hygiene",
+      "fun"
+    ],
+    "uniqueIndexes": {
+      "world_agent_states_pkey": "CREATE UNIQUE INDEX world_agent_states_pkey ON public.world_agent_states USING btree (world_id, agent_id)"
+    }
+  },
+  "world_capability_events": {
+    "columns": {
+      "id": "bigint",
+      "world_id": "uuid",
+      "actor_agent_id": "uuid",
+      "gap_id": "uuid",
+      "proposal_id": "uuid",
+      "capability_id": "uuid",
+      "experiment_id": "uuid",
+      "event_type": "text",
+      "event_key": "text",
+      "world_minute": "bigint",
+      "details": "jsonb",
+      "created_at": "timestamp with time zone"
+    },
+    "constraints": {
+      "world_capability_events_actor_agent_id_fkey": "FOREIGN KEY (actor_agent_id) REFERENCES agents(id) ON DELETE SET NULL",
+      "world_capability_events_details_check": "CHECK (jsonb_typeof(details) = 'object'::text)",
+      "world_capability_events_event_type_check": "CHECK (event_type ~ '^[a-z][a-z0-9_]{1,63}$'::text)",
+      "world_capability_events_pkey": "PRIMARY KEY (id)",
+      "world_capability_events_world_id_capability_id_fkey": "FOREIGN KEY (world_id, capability_id) REFERENCES world_capabilities(world_id, id) ON DELETE SET NULL (capability_id)",
+      "world_capability_events_world_id_event_key_key": "UNIQUE (world_id, event_key)",
+      "world_capability_events_world_id_experiment_id_fkey": "FOREIGN KEY (world_id, experiment_id) REFERENCES world_capability_experiments(world_id, id) ON DELETE SET NULL (experiment_id)",
+      "world_capability_events_world_id_fkey": "FOREIGN KEY (world_id) REFERENCES worlds(id) ON DELETE CASCADE",
+      "world_capability_events_world_id_gap_id_fkey": "FOREIGN KEY (world_id, gap_id) REFERENCES world_capability_gaps(world_id, id) ON DELETE SET NULL (gap_id)",
+      "world_capability_events_world_id_proposal_id_fkey": "FOREIGN KEY (world_id, proposal_id) REFERENCES world_capability_proposals(world_id, id) ON DELETE SET NULL (proposal_id)",
+      "world_capability_events_world_minute_check": "CHECK (world_minute >= 0)"
+    },
+    "notNullColumns": [
+      "id",
+      "world_id",
+      "event_type",
+      "event_key",
+      "world_minute",
+      "details",
+      "created_at"
+    ],
+    "uniqueIndexes": {
+      "world_capability_events_pkey": "CREATE UNIQUE INDEX world_capability_events_pkey ON public.world_capability_events USING btree (id)",
+      "world_capability_events_world_id_event_key_key": "CREATE UNIQUE INDEX world_capability_events_world_id_event_key_key ON public.world_capability_events USING btree (world_id, event_key)"
+    }
+  },
+  "world_epochs": {
+    "columns": {
+      "id": "uuid",
+      "world_id": "uuid",
+      "epoch_code": "text",
+      "name": "text",
+      "status": "text",
+      "started_world_minute": "bigint",
+      "started_at": "timestamp with time zone",
+      "description": "text",
+      "metadata": "jsonb"
+    },
+    "constraints": {
+      "world_epochs_description_check": "CHECK (char_length(description) >= 1 AND char_length(description) <= 600)",
+      "world_epochs_epoch_code_check": "CHECK (epoch_code ~ '^V[0-9]+(\\.[0-9]+)?$'::text)",
+      "world_epochs_metadata_check": "CHECK (jsonb_typeof(metadata) = 'object'::text)",
+      "world_epochs_name_check": "CHECK (char_length(name) >= 3 AND char_length(name) <= 120)",
+      "world_epochs_pkey": "PRIMARY KEY (id)",
+      "world_epochs_started_world_minute_check": "CHECK (started_world_minute >= 0)",
+      "world_epochs_status_check": "CHECK (status = ANY (ARRAY['active'::text, 'historic'::text]))",
+      "world_epochs_world_id_epoch_code_key": "UNIQUE (world_id, epoch_code)",
+      "world_epochs_world_id_fkey": "FOREIGN KEY (world_id) REFERENCES worlds(id) ON DELETE CASCADE",
+      "world_epochs_world_id_id_key": "UNIQUE (world_id, id)"
+    },
+    "notNullColumns": [
+      "id",
+      "world_id",
+      "epoch_code",
+      "name",
+      "status",
+      "started_world_minute",
+      "started_at",
+      "description",
+      "metadata"
+    ],
+    "uniqueIndexes": {
+      "world_epochs_active_idx": "CREATE UNIQUE INDEX world_epochs_active_idx ON public.world_epochs USING btree (world_id) WHERE (status = 'active'::text)",
+      "world_epochs_pkey": "CREATE UNIQUE INDEX world_epochs_pkey ON public.world_epochs USING btree (id)",
+      "world_epochs_world_id_epoch_code_key": "CREATE UNIQUE INDEX world_epochs_world_id_epoch_code_key ON public.world_epochs USING btree (world_id, epoch_code)",
+      "world_epochs_world_id_id_key": "CREATE UNIQUE INDEX world_epochs_world_id_id_key ON public.world_epochs USING btree (world_id, id)"
+    }
+  },
+  "world_history": {
+    "columns": {
+      "id": "bigint",
+      "world_id": "uuid",
+      "event_key": "text",
+      "event_type": "text",
+      "actor_agent_id": "uuid",
+      "entity_type": "text",
+      "entity_id": "uuid",
+      "world_time": "bigint",
+      "title": "text",
+      "detail": "text",
+      "metadata": "jsonb",
+      "created_at": "timestamp with time zone"
+    },
+    "constraints": {
+      "world_history_actor_agent_id_fkey": "FOREIGN KEY (actor_agent_id) REFERENCES agents(id) ON DELETE SET NULL",
+      "world_history_detail_check": "CHECK (char_length(detail) >= 1 AND char_length(detail) <= 600)",
+      "world_history_entity_type_check": "CHECK (entity_type ~ '^[a-z][a-z0-9_.-]{1,79}$'::text)",
+      "world_history_event_type_check": "CHECK (event_type ~ '^[a-z][a-z0-9_.-]{1,79}$'::text)",
+      "world_history_metadata_check": "CHECK (jsonb_typeof(metadata) = 'object'::text)",
+      "world_history_pkey": "PRIMARY KEY (id)",
+      "world_history_title_check": "CHECK (char_length(title) >= 3 AND char_length(title) <= 120)",
+      "world_history_world_id_event_key_key": "UNIQUE (world_id, event_key)",
+      "world_history_world_id_fkey": "FOREIGN KEY (world_id) REFERENCES worlds(id) ON DELETE CASCADE",
+      "world_history_world_time_check": "CHECK (world_time >= 0)"
+    },
+    "notNullColumns": [
+      "id",
+      "world_id",
+      "event_key",
+      "event_type",
+      "entity_type",
+      "world_time",
+      "title",
+      "detail",
+      "metadata",
+      "created_at"
+    ],
+    "uniqueIndexes": {
+      "world_history_pkey": "CREATE UNIQUE INDEX world_history_pkey ON public.world_history USING btree (id)",
+      "world_history_world_id_event_key_key": "CREATE UNIQUE INDEX world_history_world_id_event_key_key ON public.world_history USING btree (world_id, event_key)"
+    }
+  },
+  "world_members": {
+    "columns": {
+      "world_id": "uuid",
+      "agent_id": "uuid",
+      "role": "text",
+      "joined_at": "timestamp with time zone",
+      "birth_at": "timestamp with time zone",
+      "declared_age_years": "integer",
+      "energy": "integer",
+      "food": "integer",
+      "social": "integer",
+      "location": "text"
+    },
+    "constraints": {
+      "world_members_agent_id_fkey": "FOREIGN KEY (agent_id) REFERENCES agents(id)",
+      "world_members_declared_age_years_check": "CHECK (declared_age_years >= 0)",
+      "world_members_energy_check": "CHECK (energy >= 0 AND energy <= 100)",
+      "world_members_food_check": "CHECK (food >= 0 AND food <= 100)",
+      "world_members_pkey": "PRIMARY KEY (world_id, agent_id)",
+      "world_members_role_check": "CHECK (role = ANY (ARRAY['owner'::text, 'resident'::text]))",
+      "world_members_social_check": "CHECK (social >= 0 AND social <= 100)",
+      "world_members_world_id_fkey": "FOREIGN KEY (world_id) REFERENCES worlds(id) ON DELETE CASCADE"
+    },
+    "notNullColumns": [
+      "world_id",
+      "agent_id",
+      "role",
+      "joined_at",
+      "declared_age_years",
+      "energy",
+      "food",
+      "social",
+      "location"
+    ],
+    "uniqueIndexes": {
+      "world_members_pkey": "CREATE UNIQUE INDEX world_members_pkey ON public.world_members USING btree (world_id, agent_id)"
+    }
+  },
+  "world_runtime_state": {
+    "columns": {
+      "world_id": "uuid",
+      "tick_count": "bigint",
+      "world_minutes": "bigint",
+      "last_tick_at": "timestamp with time zone",
+      "typesafe_next_at": "timestamp with time zone",
+      "market_snapshot": "jsonb",
+      "updated_at": "timestamp with time zone",
+      "environment": "jsonb"
+    },
+    "constraints": {
+      "world_runtime_state_environment_check": "CHECK (jsonb_typeof(environment) = 'object'::text)",
+      "world_runtime_state_pkey": "PRIMARY KEY (world_id)",
+      "world_runtime_state_tick_count_check": "CHECK (tick_count >= 0)",
+      "world_runtime_state_world_id_fkey": "FOREIGN KEY (world_id) REFERENCES worlds(id) ON DELETE CASCADE",
+      "world_runtime_state_world_minutes_check": "CHECK (world_minutes >= 0)"
+    },
+    "notNullColumns": [
+      "world_id",
+      "tick_count",
+      "world_minutes",
+      "last_tick_at",
+      "typesafe_next_at",
+      "market_snapshot",
+      "updated_at",
+      "environment"
+    ],
+    "uniqueIndexes": {
+      "world_runtime_state_pkey": "CREATE UNIQUE INDEX world_runtime_state_pkey ON public.world_runtime_state USING btree (world_id)"
+    }
+  },
+  "worlds": {
+    "columns": {
+      "id": "uuid",
+      "owner_agent_id": "uuid",
+      "name": "text",
+      "chain_id": "integer",
+      "token_address": "text",
+      "token_name": "text",
+      "token_symbol": "text",
+      "token_status": "text",
+      "year_seconds": "integer",
+      "open": "boolean",
+      "created_at": "timestamp with time zone"
+    },
+    "constraints": {
+      "worlds_name_check": "CHECK (char_length(name) >= 2 AND char_length(name) <= 80)",
+      "worlds_owner_agent_id_fkey": "FOREIGN KEY (owner_agent_id) REFERENCES agents(id)",
+      "worlds_pkey": "PRIMARY KEY (id)",
+      "worlds_token_status_check": "CHECK (token_status = ANY (ARRAY['unregistered'::text, 'unverified'::text]))",
+      "worlds_year_seconds_check": "CHECK (year_seconds >= 3600)"
+    },
+    "notNullColumns": [
+      "id",
+      "owner_agent_id",
+      "name",
+      "chain_id",
+      "token_status",
+      "year_seconds",
+      "open",
+      "created_at"
+    ],
+    "uniqueIndexes": {
+      "worlds_pkey": "CREATE UNIQUE INDEX worlds_pkey ON public.worlds USING btree (id)"
+    }
+  }
+}

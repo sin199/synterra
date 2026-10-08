@@ -1,5 +1,6 @@
 import Fastify from 'fastify';
 import { Pool } from 'pg';
+import { prepareStartupSchema } from './startup-schema.js';
 import { createHash, createPublicKey, randomBytes, randomUUID, timingSafeEqual, verify } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
@@ -2590,7 +2591,12 @@ app.get('/v1/worlds/:worldId/events', async (request, reply) => {
   return { events: events.rows };
 });
 
-await pool.query(await readFile(path.join(ROOT, 'schema.sql'), 'utf8'));
+try {
+  await prepareStartupSchema(pool, { rootDirectory: ROOT, mode: process.env.SYNTERRA_SCHEMA_MODE ?? 'apply' });
+} catch (error) {
+  await pool.end();
+  throw error;
+}
 const arcSchema = await pool.query(`SELECT to_regclass('public.arc_settlement_outbox') IS NOT NULL AS ready`);
 arcSchemaReady = arcSchema.rows[0]?.ready === true;
 const arcTokenSchema = await pool.query(`SELECT to_regclass('public.arc_token_issuance_intents') IS NOT NULL AS ready`);

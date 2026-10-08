@@ -26,7 +26,11 @@ Use `npm ci --omit=dev` for a production Node install. The server handles SIGTER
 
 ## Schema migration and import
 
-The server applies the baseline `schema.sql` on startup. Numbered additive migrations are applied explicitly after a verified backup:
+Set `SYNTERRA_SCHEMA_MODE=validate` for an already migrated production database. Startup then uses a read-only transaction to verify migration checksums, runtime tables, critical Arc/world columns and constraints, and application grants before any listener or World Engine starts. It never executes `schema.sql` or repairs missing objects. A failed check refuses startup; fix schema only through a separately authorized migration.
+
+`SYNTERRA_SCHEMA_MODE=apply` preserves baseline `schema.sql` bootstrap for new development/test databases; this remains the default for backward compatibility. Neither mode applies numbered migrations. The checked-in `src/runtime-schema-contract.json` records the critical object contract from an isolated database built with the current schema and migrations; update it deliberately when changing that contract, never from a production database to suppress a mismatch.
+
+Numbered additive migrations are applied explicitly after a verified backup:
 
 ```sh
 npm run db:migrate -- --plan
