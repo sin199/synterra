@@ -67,7 +67,88 @@ test('V6 observer snapshots are private, bounded, restart-readable, and unique p
   }
 });
 
-test('V6 observer owns one read-only scheduler and resumes its sample status after restart', async () => {
+test('V6 observer rejects a whole cache whose world minute is ahead of PostgreSQL and rebuilds from the source sample', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'synterra-v6-observer-minute-ahead-'));
+  const sourceOfTruth = { worldMinute: 316_531, cursor: { capabilityEventId: '31097' } };
+  const summary = (minute, gaps) => ({ worldId: 'formal-world', worldMinute: minute,
+    counts: { gaps, matureGaps: 0, proposals: 0, candidateCycles: 0, validNoAction: 0,
+      experiments: 0, adoptedCapabilities: 0, capabilityUses: 0 },
+    genealogy: { maximumDepth: 0, secondOrderCapabilities: 0 }, integrity: { findings: [] } });
+  try {
+    await persistV6LifecycleSnapshot(directory, { worldId: 'formal-world', worldMinute: 316_531,
+      summary: summary(316_531, 7), cursor: sourceOfTruth.cursor, observedAt: '2026-10-08T00:00:00.000Z' },
+    { sourceOfTruth });
+    await persistV6LifecycleSnapshot(directory, { worldId: 'formal-world', worldMinute: 316_532,
+      summary: summary(316_532, 999), cursor: sourceOfTruth.cursor, observedAt: '2026-10-08T00:01:00.000Z' });
+
+    const rebuilt = await persistV6LifecycleSnapshot(directory, { worldId: 'formal-world', worldMinute: 316_531,
+      summary: summary(316_531, 7), cursor: sourceOfTruth.cursor, observedAt: '2026-10-08T00:02:00.000Z' },
+    { sourceOfTruth });
+    assert.deepEqual(rebuilt.cacheRecovery, { reason: 'snapshot_ahead_of_source_of_truth',
+      rejectedReasons: ['world_minute_ahead_of_database'] });
+    const restored = await readV6LifecycleObserverState(directory, 'formal-world');
+    const file = JSON.parse(await readFile(path.join(directory, 'v6-lifecycle-observer.json'), 'utf8'));
+    assert.equal(restored.latestWorldMinute, 316_531);
+    assert.equal(restored.lastObservationCursor.capabilityEventId, '31097');
+    assert.equal(file.snapshots.length, 1, 'the contaminated cache history is rejected as a whole');
+    assert.equal(file.snapshots[0].counts.gaps, 7, 'the rebuilt sample comes from the database snapshot');
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('V6 observer rejects a same-minute cache whose scoped capability-event cursor is ahead of PostgreSQL', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'synterra-v6-observer-cursor-ahead-'));
+  const sourceOfTruth = { worldMinute: 316_531, cursor: { capabilityEventId: '31097' } };
+  const summary = { worldId: 'formal-world', worldMinute: 316_531,
+    counts: { gaps: 7, matureGaps: 0, proposals: 0, candidateCycles: 0, validNoAction: 0,
+      experiments: 0, adoptedCapabilities: 0, capabilityUses: 0 },
+    genealogy: { maximumDepth: 0, secondOrderCapabilities: 0 }, integrity: { findings: [] } };
+  try {
+    await persistV6LifecycleSnapshot(directory, { worldId: 'formal-world', worldMinute: 316_531,
+      summary, cursor: sourceOfTruth.cursor, observedAt: '2026-10-08T00:00:00.000Z' }, { sourceOfTruth });
+    await persistV6LifecycleSnapshot(directory, { worldId: 'formal-world', worldMinute: 316_531,
+      summary, cursor: { capabilityEventId: '31098' }, observedAt: '2026-10-08T00:01:00.000Z' });
+
+    const rebuilt = await persistV6LifecycleSnapshot(directory, { worldId: 'formal-world', worldMinute: 316_531,
+      summary, cursor: sourceOfTruth.cursor, observedAt: '2026-10-08T00:02:00.000Z' }, { sourceOfTruth });
+    assert.deepEqual(rebuilt.cacheRecovery, { reason: 'snapshot_ahead_of_source_of_truth',
+      rejectedReasons: ['capability_event_cursor_ahead_of_database'] });
+    const restored = await readV6LifecycleObserverState(directory, 'formal-world');
+    assert.equal(restored.latestWorldMinute, 316_531);
+    assert.equal(restored.lastObservationCursor.capabilityEventId, '31097');
+    assert.equal(restored.snapshotCount, 1);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('V6 observer does not expose an unvalidated local sample while PostgreSQL startup sampling is pending', async () => {
+  const timers = new Set();
+  let finishCapture;
+  const pendingSample = new Promise((resolve) => { finishCapture = resolve; });
+  const observer = startV6LifecycleObserver({ pool: {}, worldId: 'observer-startup-world',
+    directory: path.join(os.tmpdir(), 'observer-startup-world'),
+    schedule: (callback) => { const timer = { callback, unref() {} }; timers.add(timer); return timer; },
+    unschedule: (timer) => timers.delete(timer),
+    captureSnapshot: () => pendingSample });
+  try {
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(observer.getStatus().lastSampleWorldMinute, null,
+      'a local cache is not trusted as a sample before a successful DB read');
+    finishCapture({ lastPollAt: '2026-10-08T00:15:00.000Z', latestSnapshotAt: '2026-10-08T00:15:00.000Z',
+      latestWorldMinute: 316_531, latestFindingCount: 0, cacheRecovery: {
+        reason: 'snapshot_ahead_of_source_of_truth', rejectedReasons: ['world_minute_ahead_of_database'] } });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(observer.getStatus().lastSampleWorldMinute, 316_531);
+    assert.deepEqual(observer.getStatus().lastCacheRecovery, { reason: 'snapshot_ahead_of_source_of_truth',
+      rejectedReasons: ['world_minute_ahead_of_database'] });
+  } finally {
+    await observer.stop();
+  }
+});
+
+test('V6 observer owns one read-only scheduler and reports fresh DB samples after restart', async () => {
   const directory = path.join(os.tmpdir(), 'synterra-v6-observer-runtime-test');
   const timers = new Set();
   const timerEvents = [];
@@ -77,8 +158,6 @@ test('V6 observer owns one read-only scheduler and resumes its sample status aft
     { lastPollAt: '2026-10-07T00:30:00.000Z', latestSnapshotAt: '2026-10-07T00:30:00.000Z',
       latestWorldMinute: 516, latestFindingCount: 3, snapshotCount: 13 }
   ];
-  const prior = { lastPollAt: '2026-10-07T00:00:00.000Z', latestSnapshotAt: '2026-10-07T00:00:00.000Z',
-    latestWorldMinute: 486, latestFindingCount: 5, snapshotCount: 11 };
   const schedule = (callback, delay) => {
     const timer = { callback, delay, unref() {} };
     timers.add(timer);
@@ -88,7 +167,6 @@ test('V6 observer owns one read-only scheduler and resumes its sample status aft
   const unschedule = (timer) => { timers.delete(timer); timerEvents.push({ type: 'cleared' }); };
   const options = { pool: {}, worldId: 'observer-test-world', directory,
     intervalMs: 15 * 60_000, schedule, unschedule,
-    readState: async () => prior,
     captureSnapshot: async () => samples.shift() };
   const controllers = [];
   try {
@@ -102,7 +180,7 @@ test('V6 observer owns one read-only scheduler and resumes its sample status aft
     assert.deepEqual(first.getStatus(), {
       available: true, running: true, worldId: 'observer-test-world', mode: 'read_only', sourceOfTruth: 'database', samplingIntervalMinutes: 15,
       lastSampleAt: '2026-10-07T00:15:00.000Z', lastSampleWorldMinute: 501, lastFindingCount: 4,
-      lastError: null, reason: null
+      lastCacheRecovery: null, lastError: null, reason: null
     });
     assert.equal(Object.hasOwn(first.getStatus(), 'automationExists'), false,
       'observer availability does not depend on a Codex automation');
@@ -117,8 +195,8 @@ test('V6 observer owns one read-only scheduler and resumes its sample status aft
     controllers.push(second);
     assert.equal(timers.size, 1, 'restart registers one replacement interval');
     await new Promise((resolve) => setImmediate(resolve));
-    assert.equal(second.getStatus().lastSampleWorldMinute, 486,
-      'the last successful sample is restored before the first post-restart sample finishes');
+    assert.equal(second.getStatus().lastSampleWorldMinute, null,
+      'restart does not present an unvalidated local cache as the current DB sample');
     finishSecondCapture(samples.shift());
     await new Promise((resolve) => setImmediate(resolve));
     assert.equal(second.getStatus().lastSampleAt, '2026-10-07T00:30:00.000Z');
@@ -130,7 +208,7 @@ test('V6 observer owns one read-only scheduler and resumes its sample status aft
   }
 });
 
-test('V6 observer reports a real unavailable reason and retains the last successful sample on failure', async () => {
+test('V6 observer reports a real unavailable reason and does not trust a cache when its first DB sample fails', async () => {
   const safeError = safeV6LifecycleObserverError(Object.assign(
     new Error('connection failed: postgres://resident:secret@localhost:5432/synterra?token=private'), { code: 'ECONNREFUSED' }));
   assert.match(safeError, /\[redacted database URL\]/);
@@ -160,8 +238,6 @@ test('V6 observer reports a real unavailable reason and retains the last success
   const observer = startV6LifecycleObserver({ pool: {}, worldId: 'observer-failure-world',
     directory: path.join(os.tmpdir(), 'observer-failure-world'), intervalMs: 60_000,
     schedule: (callback) => ({ callback, unref() {} }), unschedule() {},
-    readState: async () => ({ lastPollAt: '2026-10-07T00:00:00.000Z', latestWorldMinute: 486,
-      latestFindingCount: 5 }),
     captureSnapshot: async () => { throw Object.assign(new Error('read-only sample unavailable'), { code: 'SAMPLE_FAILED' }); },
     onError: () => { logged += 1; }
   });
@@ -170,8 +246,9 @@ test('V6 observer reports a real unavailable reason and retains the last success
     const status = observer.getStatus();
     assert.equal(status.available, true, 'a failed poll does not make the registered observer disappear');
     assert.equal(status.running, true);
-    assert.equal(status.lastSampleWorldMinute, 486);
-    assert.equal(status.lastFindingCount, 5);
+    assert.equal(status.lastSampleWorldMinute, null,
+      'the unvalidated persisted sample is not restored when the DB could not be read');
+    assert.equal(status.lastFindingCount, null);
     assert.match(status.lastError, /^SAMPLE_FAILED: read-only sample unavailable$/);
     assert.equal(logged, 1);
   } finally {
@@ -191,7 +268,6 @@ test('V6 observer stops sampling and reports unavailability when world-lock owne
       return timer;
     },
     unschedule: (timer) => timers.delete(timer),
-    readState: async () => null,
     captureSnapshot: async () => {
       captureCount += 1;
       return { lastPollAt: '2026-10-07T01:00:00.000Z', latestWorldMinute: 600, latestFindingCount: 0 };

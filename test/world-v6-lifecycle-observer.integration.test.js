@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import os from 'node:os';
 import path from 'node:path';
@@ -187,6 +187,89 @@ test('V6 lifecycle observer reports natural no-action, funnel state, usage, and 
   } finally {
     await pool.query('DELETE FROM worlds WHERE id=$1', [worldId]).catch(() => {});
     await pool.query('DELETE FROM agents WHERE id=ANY($1::uuid[])', [agents]).catch(() => {});
+    await pool.end();
+    await rm(snapshotDirectory, { recursive: true, force: true });
+  }
+});
+
+test('V6 observer rejects an ahead cache against the same world-scoped capability event stream and rebuilds read-only', {
+  skip: !enabled,
+  timeout: 120_000
+}, async () => {
+  assertIsolatedDatabase(databaseUrl);
+  const pool = new Pool({ connectionString: databaseUrl, max: 3 });
+  const worldId = randomUUID();
+  const unrelatedWorldId = randomUUID();
+  const agentId = randomUUID();
+  const snapshotDirectory = await mkdtemp(path.join(os.tmpdir(), 'synterra-v6-cursor-scope-'));
+  try {
+    await pool.query(await readFile(path.join(repoRoot, 'schema.sql'), 'utf8'));
+    await pool.query(`INSERT INTO agents(id,name,public_key,gender)
+      VALUES($1,'Cursor Scope Observer',$2,'female')`, [agentId, `observer-key-${agentId}`]);
+    await pool.query(`INSERT INTO worlds(id,owner_agent_id,name,chain_id,open)
+      VALUES($1,$3,'Cursor scope world',5042,true),($2,$3,'Unrelated cursor world',5042,true)`,
+    [worldId, unrelatedWorldId, agentId]);
+    await pool.query(`INSERT INTO world_members(world_id,agent_id,role,energy,food,social,location)
+      VALUES($1,$3,'owner',100,100,80,'Library'),($2,$3,'owner',100,100,80,'Library')`,
+    [worldId, unrelatedWorldId, agentId]);
+    await pool.query(`INSERT INTO world_runtime_state(world_id,tick_count,world_minutes,last_tick_at,typesafe_next_at)
+      VALUES($1,10,316531,now(),now()+interval '1 day'),($2,10,316531,now(),now()+interval '1 day')`,
+    [worldId, unrelatedWorldId]);
+    const targetEvent = await pool.query(`INSERT INTO world_capability_events(world_id,actor_agent_id,event_type,event_key,
+        world_minute,details) VALUES($1,$2,'capability_gap_observed','scope-target-event',316531,'{}'::jsonb) RETURNING id`,
+    [worldId, agentId]);
+    await pool.query(`INSERT INTO world_capability_events(world_id,actor_agent_id,event_type,event_key,world_minute,details)
+      SELECT $1,$2,'other_world_event_'||n,'scope-unrelated-'||n,316531,'{}'::jsonb
+      FROM generate_series(1,5) n`, [unrelatedWorldId, agentId]);
+
+    const first = await captureV6LifecycleSnapshot(pool, { worldId, directory: snapshotDirectory,
+      now: new Date('2026-10-08T00:00:00.000Z') });
+    const targetCursor = String(targetEvent.rows[0].id);
+    const globalCursor = (await pool.query('SELECT max(id)::text AS cursor FROM world_capability_events')).rows[0].cursor;
+    assert.ok(BigInt(globalCursor) > BigInt(targetCursor), 'fixture has unrelated later events in the shared sequence');
+    assert.equal(first.cursor.capabilityEventId, targetCursor,
+      'the persisted cursor is the maximum event ID for this world, not the table-wide maximum');
+
+    const statePath = path.join(snapshotDirectory, 'v6-lifecycle-observer.json');
+    const contaminated = JSON.parse(await readFile(statePath, 'utf8'));
+    const oneAhead = String(BigInt(targetCursor) + 1n);
+    contaminated.lastObservationCursor.capabilityEventId = oneAhead;
+    contaminated.snapshots.at(-1).cursor.capabilityEventId = oneAhead;
+    await writeFile(statePath, `${JSON.stringify(contaminated, null, 2)}\n`, { mode: 0o600 });
+
+    const before = await pool.query(`SELECT
+      (SELECT world_minutes FROM world_runtime_state WHERE world_id=$1) AS minute,
+      (SELECT count(*)::int FROM world_capability_events WHERE world_id=$1) AS events,
+      (SELECT count(*)::int FROM world_capability_gaps WHERE world_id=$1) AS gaps,
+      (SELECT count(*)::int FROM world_capability_observations WHERE world_id=$1) AS observations,
+      (SELECT count(*)::int FROM world_capability_proposals WHERE world_id=$1) AS proposals,
+      (SELECT count(*)::int FROM world_capability_reviews WHERE world_id=$1) AS reviews,
+      (SELECT count(*)::int FROM world_capability_experiments WHERE world_id=$1) AS experiments,
+      (SELECT count(*)::int FROM world_capability_uses WHERE world_id=$1) AS uses,
+      (SELECT count(*)::int FROM world_history WHERE world_id=$1) AS history`, [worldId]);
+    const rebuilt = await captureV6LifecycleSnapshot(pool, { worldId, directory: snapshotDirectory,
+      now: new Date('2026-10-08T00:15:00.000Z') });
+    assert.deepEqual(rebuilt.cacheRecovery, { reason: 'snapshot_ahead_of_source_of_truth',
+      rejectedReasons: ['capability_event_cursor_ahead_of_database'] });
+    assert.equal(rebuilt.cursor.capabilityEventId, targetCursor);
+    const rebuiltFile = JSON.parse(await readFile(statePath, 'utf8'));
+    assert.equal(rebuiltFile.snapshots.length, 1, 'recovery rejects the full cache history instead of clamping its cursor');
+    assert.equal(rebuiltFile.snapshots[0].cursor.capabilityEventId, targetCursor);
+    const after = await pool.query(`SELECT
+      (SELECT world_minutes FROM world_runtime_state WHERE world_id=$1) AS minute,
+      (SELECT count(*)::int FROM world_capability_events WHERE world_id=$1) AS events,
+      (SELECT count(*)::int FROM world_capability_gaps WHERE world_id=$1) AS gaps,
+      (SELECT count(*)::int FROM world_capability_observations WHERE world_id=$1) AS observations,
+      (SELECT count(*)::int FROM world_capability_proposals WHERE world_id=$1) AS proposals,
+      (SELECT count(*)::int FROM world_capability_reviews WHERE world_id=$1) AS reviews,
+      (SELECT count(*)::int FROM world_capability_experiments WHERE world_id=$1) AS experiments,
+      (SELECT count(*)::int FROM world_capability_uses WHERE world_id=$1) AS uses,
+      (SELECT count(*)::int FROM world_history WHERE world_id=$1) AS history`, [worldId]);
+    assert.deepEqual(after.rows[0], before.rows[0],
+      'cache rejection and reconstruction do not mutate PostgreSQL lifecycle or world state');
+  } finally {
+    await pool.query('DELETE FROM worlds WHERE id=ANY($1::uuid[])', [[worldId, unrelatedWorldId]]).catch(() => {});
+    await pool.query('DELETE FROM agents WHERE id=$1', [agentId]).catch(() => {});
     await pool.end();
     await rm(snapshotDirectory, { recursive: true, force: true });
   }
