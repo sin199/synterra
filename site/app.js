@@ -125,6 +125,12 @@ function displayCount(value) {
   return numberFormat.format(Number.isFinite(number) && number >= 0 ? number : 0);
 }
 
+function shown(value, suffix = '') {
+  if (value === undefined || value === null || value === '' || (typeof value === 'number' && !Number.isFinite(value))) return '—';
+  const number = Number(value);
+  return `${Number.isFinite(number) && String(value).trim() !== '' ? number.toLocaleString('en-US', { maximumFractionDigits: 2 }) : value}${suffix}`;
+}
+
 function setText(element, value) {
   if (element) element.textContent = value;
 }
@@ -768,7 +774,7 @@ function renderEvolutionList(container, entries, emptyText, describe) {
     const heading = document.createElement('strong');
     heading.textContent = entry.title || entry.name || entry.eventType || 'World record';
     const detail = document.createElement('span');
-    detail.textContent = describe(entry);
+    detail.textContent = String(describe(entry) ?? '').replace(/\b(?:undefined|null|NaN)\b/g, '—');
     row.append(heading, detail);
     container.append(row);
   }
@@ -1136,14 +1142,14 @@ function renderWorldEvolution() {
     const services = (item.services || []).map((service) => `${service.name} · ${service.stockUnits} in stock`).join('; ');
     const workers = (item.workers || []).length;
     const activeAgreements = (item.agreements || []).filter((agreement) => agreement.status === 'active').length;
-    return `${item.status} · cash ${item.cashBalance} USDC · revenue ${item.revenue} · P&L ${item.profitLoss} · ${workers} employees · ${activeAgreements} active agreements${services ? ` · ${services}` : ''}`;
+    return `${item.status || 'unknown'} · cash ${shown(item.cashBalance, ' USDC')} · revenue ${shown(item.revenue)} · P&L ${shown(item.profitLoss)} · ${workers} employees · ${activeAgreements} active agreements${services ? ` · ${services}` : ''}`;
   });
   const serviceLabels = { research_service: 'Research services', engineering_service: 'Engineering services', social_service: 'Social services',
     food_service: 'Food services', trading_service: 'Market research' };
   const demandRows = (evolution.economy?.demand || []).filter((item) => Number(item.demandCount) > 0)
     .map((item) => ({ ...item, title: serviceLabels[item.serviceType] || item.serviceType }));
   renderEvolutionList(economicDemandList, demandRows, 'No observable service demand today.', (item) =>
-    `Demand ${item.demandCount} · supply ${item.supplyCount} · unmet ${item.unmetCount}`);
+    `Demand ${shown(item.demandCount)} · supply ${shown(item.supplyCount)} · unmet ${shown(item.unmetCount)}`);
   renderEvolutionList(historyList, evolution.history, 'No major history recorded in this world yet.', (item) =>
     `${item.detail || item.eventType || ''} · Day ${Math.max(1, Math.floor(Number(item.worldTime || 0) / 1_440) + 1)}`);
   const systemLabels = { opportunity: 'Opportunity', project: 'Project', organization: 'Organization', information: 'Info sharing',
@@ -1309,7 +1315,10 @@ function renderMapData(data) {
   renderTrading();
 }
 
+let mapRequestInFlight = false;
 async function loadMapData() {
+  if (mapRequestInFlight) return;
+  mapRequestInFlight = true;
   try {
     const response = await fetch('/local/map-data', { headers: { Accept: 'application/json' }, cache: 'no-store' });
     if (!response.ok) throw new Error(`Map request failed (${response.status})`);
@@ -1325,7 +1334,9 @@ async function loadMapData() {
     setText(mapState, latestMapData ? 'Update failed · showing last snapshot' : 'Map data unavailable');
     setText(mapUpdated, latestMapData ? `Last updated ${formatTime(latestMapData.generatedAt)}` : 'No data yet');
     mapError.hidden = false;
-    mapError.textContent = 'The map only opens on the machine running Synterra. Check that the service is online and visit http://127.0.0.1:8788/#map.';
+    mapError.textContent = 'Live world data is temporarily unreachable. The page will keep retrying automatically.';
+  } finally {
+    mapRequestInFlight = false;
   }
 }
 
@@ -1336,6 +1347,7 @@ window.setInterval(() => {
     loadMapData();
   }
 }, 2_000);
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') loadMapData(); });
 window.setInterval(() => {
   if (document.visibilityState === 'visible' && selectedAgentId) loadResidentDetail(selectedAgentId);
 }, 30_000);

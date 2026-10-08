@@ -3,6 +3,7 @@ import { Pool } from 'pg';
 import { prepareStartupSchema } from './startup-schema.js';
 import { createHash, createPublicKey, randomBytes, randomUUID, timingSafeEqual, verify } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
+import { compressJsonOnSend, sendSiteFile, SITE_FONT_FILES } from './static-assets.js';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { chargeMeal, MEAL_COST_UNITS } from './economy.js';
@@ -239,7 +240,7 @@ app.addHook('preHandler', async (request, reply) => {
   const localResidentDetail = /^\/local\/map-data\/residents\/[^/]+$/.test(pathOnly)
     && ['127.0.0.1', '::1', 'localhost'].includes(HOST);
   if (pathOnly === '/' || pathOnly === '/styles.css' || pathOnly === '/app.js' || pathOnly === '/world3d.js' || pathOnly === '/crypto-plaza.js' ||
-      pathOnly === '/vendor/three.module.min.js' || pathOnly === '/v6-observer-status.js' || pathOnly === '/public/stats' ||
+      pathOnly === '/vendor/three.module.min.js' || pathOnly === '/v6-observer-status.js' || pathOnly === '/og.jpg' || pathOnly.startsWith('/fonts/') || pathOnly === '/public/stats' ||
       pathOnly === '/local/map-data' || localResidentDetail || pathOnly === '/health' || pathOnly === '/v1/agents/challenges' || pathOnly === '/v1/agents') return;
 
   const agentId = request.headers['x-agent-id'];
@@ -270,48 +271,22 @@ app.setErrorHandler((error, request, reply) => {
   return fail(reply, status, status >= 500 ? 'INTERNAL_ERROR' : (error.message || 'REQUEST_FAILED'));
 });
 
-app.get('/', async (_request, reply) => {
-  reply.header('Content-Type', 'text/html; charset=utf-8');
-  reply.header('X-Content-Type-Options', 'nosniff');
-  return readFile(path.join(SITE_ROOT, 'index.html'));
+const JS_TYPE = 'text/javascript; charset=utf-8';
+app.get('/', (request, reply) => sendSiteFile(request, reply, SITE_ROOT, 'index.html', { type: 'text/html; charset=utf-8' }));
+app.get('/styles.css', (request, reply) => sendSiteFile(request, reply, SITE_ROOT, 'styles.css', { type: 'text/css; charset=utf-8' }));
+app.get('/app.js', (request, reply) => sendSiteFile(request, reply, SITE_ROOT, 'app.js', { type: JS_TYPE }));
+app.get('/world3d.js', (request, reply) => sendSiteFile(request, reply, SITE_ROOT, 'world3d.js', { type: JS_TYPE }));
+app.get('/crypto-plaza.js', (request, reply) => sendSiteFile(request, reply, SITE_ROOT, 'crypto-plaza.js', { type: JS_TYPE }));
+app.get('/v6-observer-status.js', (request, reply) => sendSiteFile(request, reply, SITE_ROOT, 'v6-observer-status.js', { type: JS_TYPE }));
+app.get('/vendor/three.module.min.js', (request, reply) => sendSiteFile(request, reply, SITE_ROOT, path.join('vendor', 'three.module.min.js'),
+  { type: JS_TYPE, cacheControl: 'public, max-age=86400' }));
+app.get('/og.jpg', (request, reply) => sendSiteFile(request, reply, SITE_ROOT, 'og.jpg', { type: 'image/jpeg', cacheControl: 'public, max-age=86400' }));
+app.get('/fonts/:file', (request, reply) => {
+  if (!SITE_FONT_FILES.has(request.params.file)) return fail(reply, 404, 'NOT_FOUND');
+  return sendSiteFile(request, reply, SITE_ROOT, path.join('fonts', request.params.file),
+    { type: 'font/woff2', cacheControl: 'public, max-age=31536000, immutable' });
 });
-
-app.get('/styles.css', async (_request, reply) => {
-  reply.header('Content-Type', 'text/css; charset=utf-8');
-  reply.header('X-Content-Type-Options', 'nosniff');
-  return readFile(path.join(SITE_ROOT, 'styles.css'));
-});
-
-app.get('/app.js', async (_request, reply) => {
-  reply.header('Content-Type', 'text/javascript; charset=utf-8');
-  reply.header('X-Content-Type-Options', 'nosniff');
-  return readFile(path.join(SITE_ROOT, 'app.js'));
-});
-
-app.get('/world3d.js', async (_request, reply) => {
-  reply.header('Content-Type', 'text/javascript; charset=utf-8');
-  reply.header('X-Content-Type-Options', 'nosniff');
-  return readFile(path.join(SITE_ROOT, 'world3d.js'));
-});
-
-app.get('/crypto-plaza.js', async (_request, reply) => {
-  reply.header('Content-Type', 'text/javascript; charset=utf-8');
-  reply.header('X-Content-Type-Options', 'nosniff');
-  return readFile(path.join(SITE_ROOT, 'crypto-plaza.js'));
-});
-
-app.get('/vendor/three.module.min.js', async (_request, reply) => {
-  reply.header('Content-Type', 'text/javascript; charset=utf-8');
-  reply.header('X-Content-Type-Options', 'nosniff');
-  reply.header('Cache-Control', 'public, max-age=86400');
-  return readFile(path.join(SITE_ROOT, 'vendor', 'three.module.min.js'));
-});
-
-app.get('/v6-observer-status.js', async (_request, reply) => {
-  reply.header('Content-Type', 'text/javascript; charset=utf-8');
-  reply.header('X-Content-Type-Options', 'nosniff');
-  return readFile(path.join(SITE_ROOT, 'v6-observer-status.js'));
-});
+app.addHook('onSend', compressJsonOnSend);
 
 async function readV6LifecycleObserverRuntimeStatus(snapshot, worldId = worldEngine.worldId || null) {
   if (v6LifecycleObserver?.worldId === worldId) return v6LifecycleObserver.getStatus();

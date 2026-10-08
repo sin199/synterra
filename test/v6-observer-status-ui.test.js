@@ -21,7 +21,7 @@ test('World Evolution UI presents live observer health from the dedicated API st
   assert.match(server, /pathOnly === '\/v6-observer-status\.js'/,
     'the imported browser module is available through the unauthenticated local static route');
   assert.match(server, /app\.get\('\/v6-observer-status\.js'/);
-  assert.match(server, /readFile\(path\.join\(SITE_ROOT, 'v6-observer-status\.js'\)\)/);
+  assert.match(server, /sendSiteFile\(request, reply, SITE_ROOT, 'v6-observer-status\.js'/);
   assert.doesNotMatch(server, /v6Lifecycle\.observerSnapshot\s*=/,
     'observer runtime status stays separate from V6 lifecycle facts');
 });
