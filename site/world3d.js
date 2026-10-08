@@ -401,7 +401,7 @@ function poseResident(figure, activity, walking, time, reducedMotion, options = 
       case 'trade': armLx = -1.0; armRx = -1.0; armLz = -0.2; armRz = 0.2; props.tablet.visible = true; headX = 0.3 + Math.sin(t * 3) * 0.06; break;
       case 'socialize': armRz = 2.4 + Math.sin(t * 6) * 0.35; armLx = -0.15; headX = -0.05 + Math.sin(t * 2.3) * 0.08; break;
       case 'care':
-        if (activity.label === '休息') { sit = true; headX = 0.25; }
+        if (activity.label === 'Resting') { sit = true; headX = 0.25; }
         else { armRx = -1.9 + Math.max(0, Math.sin(t * 1.8)) * 0.9; props.cup.visible = true; }
         break;
       default:
@@ -704,12 +704,12 @@ const WEATHER_LOOK = {
   heatwave: { cloud: 0, overcast: 0, rain: 0, snow: 0, storm: 0, fog: 0, heat: 1 }
 };
 const WEATHER_ICON = { clear: '☀', cloudy: '☁', fog: '≋', rain: '☂', storm: '⚡', snow: '❄', heatwave: '♨' };
-const SEASON_LABEL = { spring: ['SPRING', '春'], summer: ['SUMMER', '夏'], autumn: ['AUTUMN', '秋'], winter: ['WINTER', '冬'] };
-const WEEKDAY_ZH = { Monday: '周一', Tuesday: '周二', Wednesday: '周三', Thursday: '周四', Friday: '周五', Saturday: '周六', Sunday: '周日' };
-const CLOSED_REASON = { storm: '风暴关闭', closed_hours: '已打烊', inactive: '停用', unknown: '关闭' };
-const VARIANT_LABEL = { sleep: '睡觉', home_rest: '在家休息', home_meal: '在家做饭', cafe_meal: '咖啡馆用餐', picnic: '野餐', snack: '小吃',
-  meal: '用餐', garden_stroll: '花园散步', garden_rest: '花园小憩', stargazing: '观星', observatory_study: '观测学习', library_study: '图书馆学习',
-  gathering: '周末聚会', coffee_chat: '咖啡闲聊', chat: '聊天', night_shift: '夜班', data_shift: '数据值班', workshop_shift: '工坊轮班' };
+const SEASON_LABEL = { spring: ['SPRING', 'Spring'], summer: ['SUMMER', 'Summer'], autumn: ['AUTUMN', 'Autumn'], winter: ['WINTER', 'Winter'] };
+const WEEKDAY_ZH = { Monday: 'Mon', Tuesday: 'Tue', Wednesday: 'Wed', Thursday: 'Thu', Friday: 'Fri', Saturday: 'Sat', Sunday: 'Sun' };
+const CLOSED_REASON = { storm: 'Storm closure', closed_hours: 'Closed', inactive: 'Inactive', unknown: 'Closed' };
+const VARIANT_LABEL = { sleep: 'Sleeping', home_rest: 'Resting at home', home_meal: 'Home meal', cafe_meal: 'Café meal', picnic: 'Picnic', snack: 'Snack',
+  meal: 'Meal', garden_stroll: 'Garden stroll', garden_rest: 'Garden break', stargazing: 'Stargazing', observatory_study: 'Observatory study', library_study: 'Library study',
+  gathering: 'Weekend gathering', coffee_chat: 'Coffee chat', chat: 'Chat', night_shift: 'Night shift', data_shift: 'Data shift', workshop_shift: 'Workshop shift' };
 const isHome = (location) => typeof location === 'string' && location.startsWith('home:');
 
 // ---------------------------------------------------------------------------------------------
@@ -1161,28 +1161,28 @@ export function createWorld3D(canvas, labelsElement, onSelect) {
   function activityFor(resident, now) {
     if (resident.currentStatus === 'walking') {
       const target = resident.targetLocationLabel || resident.targetLocation;
-      const shortTarget = isHome(resident.targetLocation) ? '家' : String(target || '目标地点').replace(/^.+?'s\s+/, '');
-      return { label: `前往 ${shortTarget}`, kind: 'travel' };
+      const shortTarget = isHome(resident.targetLocation) ? 'home' : String(target || 'destination').replace(/^.+?'s\s+/, '');
+      return { label: `To ${shortTarget}`, kind: 'travel' };
     }
-    if (resident.asleep) return { label: '睡觉', kind: 'care' };
+    if (resident.asleep) return { label: 'Sleeping', kind: 'care' };
     if (resident.currentStatus === 'performing' && VARIANT_LABEL[resident.activityVariant]) {
       const kinds = { rest: 'care', eat: 'care', learn: 'learn', socialize: 'socialize', work: 'work', cooperate: 'work', trade: 'trade' };
       return { label: VARIANT_LABEL[resident.activityVariant], kind: kinds[resident.currentAction] || 'care' };
     }
     if (resident.currentStatus === 'performing') {
-      const actions = { work: ['工作', 'work'], learn: ['学习', 'learn'], rest: ['休息', 'care'],
-        eat: ['进食', 'care'], socialize: ['社交', 'socialize'], trade: ['交易', 'trade'] };
-      const [label, kind] = actions[resident.currentAction] || ['行动中', 'work'];
+      const actions = { work: ['Working', 'work'], learn: ['Learning', 'learn'], rest: ['Resting', 'care'],
+        eat: ['Eating', 'care'], socialize: ['Socializing', 'socialize'], trade: ['Trading', 'trade'] };
+      const [label, kind] = actions[resident.currentAction] || ['Busy', 'work'];
       return { label, kind };
     }
     const trade = (data?.trading?.recentTrades || []).find((item) => item.agentName === resident.name &&
       Number.isFinite(Date.parse(item.createdAt)) && now - Date.parse(item.createdAt) >= 0 && now - Date.parse(item.createdAt) < 90_000);
-    if (trade) return { label: trade.side === 'buy' ? '买入' : '卖出', kind: 'trade' };
+    if (trade) return { label: trade.side === 'buy' ? 'Buying' : 'Selling', kind: 'trade' };
     const age = resident.lastEventAt ? now - Date.parse(resident.lastEventAt) : Infinity;
     if (age < 90_000) {
-      const actions = { 'action.travel': ['移动', 'travel'], 'action.work': ['工作', 'work'],
-        'action.socialize': ['社交', 'socialize'], 'action.eat': ['进食', 'care'], 'action.rest': ['休息', 'care'],
-        'action.build_scene': ['建造', 'build'] };
+      const actions = { 'action.travel': ['Moving', 'travel'], 'action.work': ['Working', 'work'],
+        'action.socialize': ['Socializing', 'socialize'], 'action.eat': ['Eating', 'care'], 'action.rest': ['Resting', 'care'],
+        'action.build_scene': ['Building', 'build'] };
       const [label, kind] = actions[resident.lastEventType] || [];
       if (label) return { label, kind };
     }
@@ -1197,7 +1197,7 @@ export function createWorld3D(canvas, labelsElement, onSelect) {
       if (!labelNodes.has(key)) {
         const node = document.createElement('span'); node.className = 'world3d-scene-label';
         node.textContent = sceneItem.name.replace(/^.+?'s\s+/, '');
-        node.title = sceneItem.name; node.setAttribute('aria-label', `场景 ${sceneItem.name}`);
+        node.title = sceneItem.name; node.setAttribute('aria-label', `Place ${sceneItem.name}`);
         labelsElement.append(node); labelNodes.set(key, node);
       }
       const node = labelNodes.get(key);
@@ -1205,9 +1205,9 @@ export function createWorld3D(canvas, labelsElement, onSelect) {
       const closed = sceneItem.openNow === false;
       node.classList.toggle('is-closed', closed);
       const shortName = sceneItem.name.replace(/^.+?'s\s+/, '');
-      node.textContent = closed ? `${shortName} · ${CLOSED_REASON[sceneItem.closedReason] || '关闭'}` : shortName;
-      const hours = sceneItem.opensAt && closed ? ` · ${sceneItem.opensAt} 开门` : sceneItem.closesAt && !closed ? ` · 营业至 ${sceneItem.closesAt}` : '';
-      node.title = `${sceneItem.name}${closed ? ` · ${CLOSED_REASON[sceneItem.closedReason] || '关闭'}` : ''}${hours}`;
+      node.textContent = closed ? `${shortName} · ${CLOSED_REASON[sceneItem.closedReason] || 'Closed'}` : shortName;
+      const hours = sceneItem.opensAt && closed ? ` · Opens ${sceneItem.opensAt}` : sceneItem.closesAt && !closed ? ` · Open until ${sceneItem.closesAt}` : '';
+      node.title = `${sceneItem.name}${closed ? ` · ${CLOSED_REASON[sceneItem.closedReason] || 'Closed'}` : ''}${hours}`;
       node.style.setProperty('--place-color', (TYPE_STYLE[sceneItem.sceneType] || TYPE_STYLE.commons).label);
     }
     for (const resident of residents) {
@@ -1229,7 +1229,7 @@ export function createWorld3D(canvas, labelsElement, onSelect) {
       const fill = ownTrade(resident, Date.now());
       if (fill) {
         const size = Number(fill.size ?? fill.quantity);
-        const label = `${fill.side === 'sell' ? '매도 SELL' : '매수 BUY'} ${Number.isFinite(size) ? size.toFixed(size >= 1 ? 2 : 4) : ''} ${fill.asset || ''}`.replace(/\s+/g, ' ').trim();
+        const label = `${fill.side === 'sell' ? 'Sell' : 'Buy'} ${Number.isFinite(size) ? size.toFixed(size >= 1 ? 2 : 4) : ''} ${fill.asset || ''}`.replace(/\s+/g, ' ').trim();
         actionNode.textContent = label; actionNode.dataset.kind = 'trade'; actionNode.dataset.side = fill.side === 'sell' ? 'sell' : 'buy'; actionNode.hidden = false;
       } else {
         actionNode.textContent = activity?.label || '';
@@ -1238,7 +1238,7 @@ export function createWorld3D(canvas, labelsElement, onSelect) {
         actionNode.hidden = !activity;
       }
       node.title = fill ? `${resident.name} · ${actionNode.textContent}` : activity ? `${resident.name} · ${activity.label}` : resident.name;
-      node.setAttribute('aria-label', activity ? `查看 ${resident.name}，${activity.label}` : `查看 ${resident.name}`);
+      node.setAttribute('aria-label', activity ? `View ${resident.name}, ${activity.label}` : `View ${resident.name}`);
       node.classList.toggle('is-selected', resident.id === selectedId);
     }
     for (const slot of homeSlots) {
@@ -1252,7 +1252,7 @@ export function createWorld3D(canvas, labelsElement, onSelect) {
       const owner = residents.find((resident) => resident.id === slot.id);
       const node = labelNodes.get(key); node.dataset.residentId = slot.id;
       const label = owner?.home?.label || `${owner?.name || ''} home`;
-      node.title = `${label} · 睡觉中`; node.setAttribute('aria-label', `${label}，${owner?.name || ''} 正在睡觉`);
+      node.title = `${label} · Asleep`; node.setAttribute('aria-label', `${label}, ${owner?.name || ''} is asleep`);
     }
     for (const [key, node] of labelNodes) if (!wanted.has(key)) { node.remove(); labelNodes.delete(key); }
   }
@@ -1518,17 +1518,17 @@ export function createWorld3D(canvas, labelsElement, onSelect) {
     hud.replaceChildren();
     const row = (className, ...children) => { const node = document.createElement('div'); node.className = className; node.append(...children); hud.append(node); return node; };
     const span = (className, text) => { const node = document.createElement('span'); node.className = className; node.textContent = text; return node; };
-    const weekday = calendar?.weekday ? `${String(calendar.weekday).slice(0, 3).toUpperCase()} ${WEEKDAY_ZH[calendar.weekday] || ''}`.trim() : '';
+    const weekday = calendar?.weekday ? String(calendar.weekday).slice(0, 3).toUpperCase() : '';
     const top = row('world3d-hud-day', span('world3d-hud-eyebrow', [day ? `DAY ${day}` : null, weekday || null].filter(Boolean).join(' · ')));
-    if (calendar?.isWeekend) top.append(span('world3d-hud-chip', '周末'));
+    if (calendar?.isWeekend) top.append(span('world3d-hud-chip', 'Weekend'));
     const season = SEASON_LABEL[calendar?.season];
-    row('world3d-hud-clock', span('world3d-hud-time', time), span('world3d-hud-season', season ? `${season[0]} ${season[1]}` : ''));
+    row('world3d-hud-clock', span('world3d-hud-time', time), span('world3d-hud-season', season ? season[0] : ''));
     if (weather) {
       const parts = [weather.label || condition || '', Number.isFinite(temperature) ? `${Math.round(temperature)}°C` : ''].filter(Boolean).join(' · ');
       const line = row('world3d-hud-weather', span('world3d-hud-icon', icon), span('world3d-hud-weather-text', parts));
       line.dataset.condition = condition || 'clear';
       const wind = Number(weather.windKph);
-      if (Number.isFinite(wind)) line.append(span('world3d-hud-wind', `风 ${Math.round(wind)} km/h`));
+      if (Number.isFinite(wind)) line.append(span('world3d-hud-wind', `Wind ${Math.round(wind)} km/h`));
     }
     if (forecast.length) {
       const list = row('world3d-hud-forecast');
@@ -1542,7 +1542,7 @@ export function createWorld3D(canvas, labelsElement, onSelect) {
         list.append(cell);
       }
     }
-    hud.setAttribute('aria-label', `第 ${day ?? '?'} 天 ${calendar?.weekday || ''} ${time} ${season?.[1] || ''} ${weather?.label || ''} ${Number.isFinite(temperature) ? `${Math.round(temperature)}°C` : ''}`.trim());
+    hud.setAttribute('aria-label', `Day ${day ?? '?'} ${calendar?.weekday || ''} ${time} ${season?.[1] || ''} ${weather?.label || ''} ${Number.isFinite(temperature) ? `${Math.round(temperature)}°C` : ''}`.trim());
   }
 
   // hour-of-day remapped so the season's sunrise / sunset line up with the sky palette's dawn / dusk
@@ -1655,7 +1655,7 @@ export function createWorld3D(canvas, labelsElement, onSelect) {
         const activity = activityFor(item.resident, now);
         const atBar = Boolean(item.perch) && !walking;
         const jump = poseResident(figure, activity, walking, motion ? time : 0, !motion,
-          atBar ? { perch: item.perch.kind, drink: !activity || activity.kind === 'care' && activity.label !== '休息', react: crowd } : {});
+          atBar ? { perch: item.perch.kind, drink: !activity || activity.kind === 'care' && activity.label !== 'Resting', react: crowd } : {});
         figure.root.position.y += jump;
         const selected = item.resident.id === selectedId;
         figure.ring.visible = selected;
