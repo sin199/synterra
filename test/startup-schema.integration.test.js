@@ -14,6 +14,10 @@ const databaseUrl = process.env.SYNTERRA_SCHEMA_TEST_DATABASE_URL;
 const enabled = process.env.SYNTERRA_SCHEMA_TEST_ISOLATED === '1' && Boolean(databaseUrl);
 const rootDirectory = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const quote = (name) => '"' + name.replaceAll('"', '""') + '"';
+const oldEquivalentHistoryConstraint = `CHECK (entity_type ~ '^[a-z][a-z0-9_.-]{1,79}$'::text OR
+  (entity_type = ANY (ARRAY['opportunity'::text, 'project'::text, 'organization'::text, 'place'::text,
+    'cooperation'::text, 'world'::text, 'business'::text, 'job'::text, 'order'::text,
+    'agreement'::text, 'norm'::text, 'capability'::text, 'capability_proposal'::text, 'agent_goal'::text])))`;
 
 async function snapshot(client) {
   const tables = (await client.query("SELECT tablename FROM pg_tables WHERE schemaname='public' ORDER BY tablename")).rows;
@@ -90,7 +94,9 @@ test('startup schema apply/validate and fail-closed checks on isolated PostgreSQ
       await fixture.query('COMMIT');
     } finally { fixture.release(); }
 
-    await t.test('validate under actual synterra_app role executes read-only SQL and preserves every business row and trigger', async () => {
+    await t.test('validate accepts legacy equivalent history constraint and preserves every business row and trigger', async () => {
+      await pool.query('ALTER TABLE world_history DROP CONSTRAINT world_history_entity_type_check');
+      await pool.query(`ALTER TABLE world_history ADD CONSTRAINT world_history_entity_type_check ${oldEquivalentHistoryConstraint}`);
       const appUrl = new URL(databaseUrl); appUrl.username = 'synterra_app'; appUrl.password = '';
       const appPool = new Pool({ connectionString: appUrl.href });
       const before = await snapshot(pool);
@@ -104,11 +110,33 @@ test('startup schema apply/validate and fail-closed checks on isolated PostgreSQ
         } };
       } };
       try {
-        assert.equal((await prepareStartupSchema(guardedPool, { rootDirectory, mode: 'validate' })).validated, true);
+        const log = console.log;
+        const messages = [];
+        console.log = message => messages.push(String(message));
+        try { assert.equal((await prepareStartupSchema(guardedPool, { rootDirectory, mode: 'validate' })).validated, true); }
+        finally { console.log = log; }
+        assert.equal(JSON.parse(messages[0]).migrationValidation, 'passed');
+        assert.equal(JSON.parse(messages[0]).checksumValidation, 'passed');
+        assert.equal(JSON.parse(messages[0]).requiredObjects, 'passed');
+        assert.equal(JSON.parse(messages[0]).runtimeGrants, 'passed');
+        assert.equal(JSON.parse(messages[0]).schemaSql, 'not_executed');
         assert.ok(sql[0].includes('READ ONLY'));
         assert.deepEqual(await snapshot(pool), before);
         assert.equal((await pool.query('SELECT balance::text FROM world_economic_accounts WHERE id=$1',[account.id])).rows[0].balance, '123.00000000');
       } finally { await appPool.end(); }
+    });
+
+    await t.test('validate rejects a non-equivalent history constraint without altering it', async () => {
+      await pool.query('ALTER TABLE world_history DROP CONSTRAINT world_history_entity_type_check');
+      await pool.query(`ALTER TABLE world_history ADD CONSTRAINT world_history_entity_type_check CHECK (char_length(entity_type) > 1)`);
+      const before = (await pool.query(`SELECT pg_get_constraintdef(oid,true) AS definition FROM pg_constraint
+        WHERE conrelid='public.world_history'::regclass AND conname='world_history_entity_type_check'`)).rows[0].definition;
+      await assert.rejects(prepareStartupSchema(pool,{rootDirectory,mode:'validate'}), /constraint world_history\.world_history_entity_type_check/);
+      const after = (await pool.query(`SELECT pg_get_constraintdef(oid,true) AS definition FROM pg_constraint
+        WHERE conrelid='public.world_history'::regclass AND conname='world_history_entity_type_check'`)).rows[0].definition;
+      assert.equal(after, before);
+      await pool.query('ALTER TABLE world_history DROP CONSTRAINT world_history_entity_type_check');
+      await pool.query(`ALTER TABLE world_history ADD CONSTRAINT world_history_entity_type_check ${oldEquivalentHistoryConstraint}`);
     });
 
     async function rejectMutation(name, sql, reason) {

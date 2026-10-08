@@ -78,8 +78,12 @@ export async function prepareStartupSchema(pool, { rootDirectory, mode = 'apply'
         }
       }
       for (const [name, definition] of Object.entries(expected.constraints)) {
+        const compatible = expected.compatibleConstraintDefinitions?.[name] || [];
+        const acceptedDefinitions = [definition, ...compatible];
         if (!constraints.rows.some((row) => row.table_name === table && row.name === name
-            && row.definition === definition && row.validated)) throw incompatible(`missing or incompatible constraint ${table}.${name}`);
+            && acceptedDefinitions.includes(row.definition) && row.validated)) {
+          throw incompatible(`missing or incompatible constraint ${table}.${name}`);
+        }
       }
       for (const name of expected.notNullColumns) {
         if (!columns.rows.some((row) => row.table_name === table && row.name === name && row.not_null)) {
@@ -120,6 +124,9 @@ export async function prepareStartupSchema(pool, { rootDirectory, mode = 'apply'
     [Object.entries(coreWrites).filter(([privileges]) => privileges.includes('INSERT')).flatMap(([, names]) => names)]);
     for (const row of sequences.rows) if (!row.allowed) throw incompatible(`runtime sequence USAGE missing on ${row.name}`);
     await client.query('COMMIT');
+    console.log(JSON.stringify({ event: 'startup_schema_validation', mode: 'validate',
+      migrationValidation: 'passed', checksumValidation: 'passed', requiredObjects: 'passed',
+      runtimeGrants: 'passed', schemaSql: 'not_executed' }));
     return { mode, validated: true, migrations: migrations.map(({ name }) => name), tables: tables.length };
   } catch (error) {
     await client.query('ROLLBACK');

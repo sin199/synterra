@@ -1382,6 +1382,11 @@
     "uniqueIndexes": {
       "world_history_pkey": "CREATE UNIQUE INDEX world_history_pkey ON public.world_history USING btree (id)",
       "world_history_world_id_event_key_key": "CREATE UNIQUE INDEX world_history_world_id_event_key_key ON public.world_history USING btree (world_id, event_key)"
+    },
+    "compatibleConstraintDefinitions": {
+      "world_history_entity_type_check": [
+        "CHECK (entity_type ~ '^[a-z][a-z0-9_.-]{1,79}$'::text OR (entity_type = ANY (ARRAY['opportunity'::text, 'project'::text, 'organization'::text, 'place'::text, 'cooperation'::text, 'world'::text, 'business'::text, 'job'::text, 'order'::text, 'agreement'::text, 'norm'::text, 'capability'::text, 'capability_proposal'::text, 'agent_goal'::text])))"
+      ]
     }
   },
   "world_members": {
