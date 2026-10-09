@@ -14,6 +14,7 @@ test('booking reservation checks available balance before recording a debit', as
   const client = {
     async query(sql, params) {
       calls.push({ sql, params });
+      if (sql.includes('FROM world_genesis_currency_activations')) return { rows: [] };
       if (sql.includes('can_reserve')) return { rows: [{ can_reserve: true }] };
       if (sql.includes('INSERT INTO token_ledger')) return { rows: [] };
       throw new Error(`Unexpected query: ${sql}`);
@@ -31,6 +32,7 @@ test('booking reservation rejects insufficient balance without a debit', async (
   const client = {
     async query(sql) {
       calls.push(sql);
+      if (sql.includes('FROM world_genesis_currency_activations')) return { rows: [] };
       return { rows: [{ can_reserve: false }] };
     }
   };
@@ -40,19 +42,38 @@ test('booking reservation rejects insufficient balance without a debit', async (
     }),
     (error) => error.message === 'INSUFFICIENT_INTERNAL_UNITS' && error.statusCode === 409
   );
-  assert.equal(calls.length, 1);
+  assert.equal(calls.length, 2);
+  assert.ok(calls.some((sql) => sql.includes('can_reserve')));
   assert.ok(!calls.some((sql) => sql.includes('INSERT INTO token_ledger')));
 });
 
 test('refund and provider income use separate idempotent positive ledger entries', async () => {
   const calls = [];
-  const client = { async query(sql, params) { calls.push({ sql, params }); return { rows: [] }; } };
+  const client = { async query(sql, params) {
+    calls.push({ sql, params });
+    return { rows: [] };
+  } };
   const booking = { id: 'booking-3', world_id: 'world-1', requester_id: 'agent-a', provider_id: 'agent-b', price_units: '4.00000000' };
   await refundAdultServiceFunds(client, booking);
   await payAdultServiceProvider(client, booking);
-  assert.deepEqual(calls.map((call) => call.params), [
+  assert.deepEqual(calls.filter((call) => call.sql.includes('INSERT INTO token_ledger')).map((call) => call.params), [
     ['world-1', 'agent-a', '4.00000000', 'adult-service:booking-3:refund'],
     ['world-1', 'agent-b', '4.00000000', 'adult-service:booking-3:income']
   ]);
-  assert.ok(calls.every((call) => call.sql.includes('ON CONFLICT (world_id,agent_id,action_id) DO NOTHING')));
+  assert.ok(calls.filter((call) => call.sql.includes('INSERT INTO token_ledger'))
+    .every((call) => call.sql.includes('ON CONFLICT (world_id,agent_id,action_id) DO NOTHING')));
+});
+
+test('post-Genesis adult-service reservations cannot spend retired internal units', async () => {
+  const calls = [];
+  const client = { async query(sql) {
+    calls.push(sql);
+    if (sql.includes('FROM world_genesis_currency_activations')) return { rows: [{ world_id: 'world-1' }] };
+    throw new Error(`Unexpected query after Genesis activation: ${sql}`);
+  } };
+  await assert.rejects(() => reserveAdultServiceFunds(client, {
+    worldId: 'world-1', requesterId: 'agent-a', bookingId: 'booking-4', priceUnits: '4.00000000'
+  }), (error) => error.message === 'LEGACY_SIMULATED_ECONOMY_RETIRED');
+  assert.equal(calls.length, 1);
+  assert.ok(!calls.some((sql) => sql.includes('INSERT INTO token_ledger')));
 });

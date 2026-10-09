@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { Interface, keccak256 } from 'ethers';
@@ -17,7 +17,8 @@ import { ArcReadOnlyObserver } from '../src/arc/observer.js';
 import { ArcSettlementOutboxWorker } from '../src/arc/settlement-worker.js';
 import { ArcAgentTokenIssuanceWorker } from '../src/arc/token-issuance-worker.js';
 import { currencyGenesisInfrastructureFacts } from '../src/arc/currency-genesis-context.js';
-import { confirmWorldTokenIssuance } from '../src/world-token-issuance.js';
+import { advanceWorldCurrencyGenesis, confirmWorldTokenIssuance } from '../src/world-token-issuance.js';
+import { chooseCivilizationOption } from '../src/agent-runtime/typesafe.js';
 import { reserveArcMainnetPilotCost, releaseArcMainnetPilotCost,
   setArcMainnetPilotCostStatus } from '../src/arc/pilot-budget.js';
 import { DeterministicFakeArcSigner, createIsolatedArcMainnetConfig } from './helpers/arc-mainnet-fakes.js';
@@ -30,7 +31,10 @@ const repoRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const CONTRACT = '0x1111111111111111111111111111111111111111';
 const PAYER = '0x2222222222222222222222222222222222222222';
 const RECIPIENT = '0x3333333333333333333333333333333333333333';
-const HASH = `0x${'ab'.repeat(32)}`;
+// The isolated database intentionally keeps generated test rows between runs.
+// Use a fresh chain hash so a prior fake submission cannot collide with the
+// production-shaped unique (chain_id, transaction_hash) constraint.
+const HASH = `0x${randomBytes(32).toString('hex')}`;
 const SYSTEM_EMITTER = '0xffffFFFfFFffffffffffffffFfFFFfffFFFfFFfE';
 const RUNTIME_CODE = '0x6001600055';
 const RUNTIME_CODE_HASH = keccak256(RUNTIME_CODE);
@@ -147,12 +151,15 @@ test('Arc Mainnet Agent action reaches persistent outbox, policy evaluation, and
     await pool.query('DELETE FROM arc_infrastructure_nonce_reservations');
     await pool.query('DELETE FROM arc_infrastructure_nonce_cursors');
     await pool.query(`INSERT INTO agents(id,name,public_key) VALUES
-      ($1,'Arc Mainnet Test Resident A',$2),($3,'Arc Mainnet Test Resident B',$4)`,
+      ($1,'Synterra-01',$2),($3,'Arc Mainnet Test Resident B',$4)`,
     [payerId, `arc-mainnet-test-${payerId}`, recipientId, `arc-mainnet-test-${recipientId}`]);
     await pool.query(`INSERT INTO worlds(id,owner_agent_id,name,chain_id)
       VALUES($1,$2,'Arc Mainnet isolated integration world',$3)`, [worldId, payerId, ARC_MAINNET_CHAIN_ID]);
     await pool.query(`INSERT INTO world_members(world_id,agent_id,role,location)
       VALUES($1,$2,'owner','town-square'),($1,$3,'resident','town-square')`, [worldId, payerId, recipientId]);
+    await pool.query(`INSERT INTO world_genesis_issuer_assignments(world_id,capability_generation,issuer_agent_id,
+        selection_source,assigned_world_minute)
+      VALUES($1,1,$2,'creator_genesis_assignment',1000)`, [worldId, payerId]);
     await pool.query(`INSERT INTO world_runtime_state(world_id,tick_count,world_minutes,last_tick_at,typesafe_next_at)
       VALUES($1,0,3000,$2,$2)`, [worldId, new Date(nowMs - 2_000)]);
     await pool.query(`INSERT INTO world_epochs(world_id,epoch_code,name,status,started_world_minute,description)
@@ -183,14 +190,21 @@ test('Arc Mainnet Agent action reaches persistent outbox, policy evaluation, and
     const rpcClient = fakeMainnetRpc({ worldId, config });
 
     let allowProposal = false;
+    let allowIssuerDecision = false;
     let responseRecorded = false;
     let authoringContextObserved = null;
+    let reviewOutcomeOverride = null;
     const cognitionChoices = [];
     const cognitionFacts = new Map();
     engine = await startWorldEngine(pool, { worldId, nowProvider: () => engineNowMs, schedule: false,
       currencyGenesisEnabled: true,
+      onError: () => true,
       chooseCivilizationOption: async (request) => {
         if (request.choiceType !== 'currency_genesis') return null;
+        if (reviewOutcomeOverride) {
+          if (reviewOutcomeOverride.type === 'throw') throw reviewOutcomeOverride.error;
+          return reviewOutcomeOverride.value;
+        }
         cognitionFacts.set(request.agentId, request.state.worldFacts);
         for (const [key, value] of Object.entries(currencyGenesisInfrastructureFacts({
           requirement: { status: request.state.requirementStatus } }))) {
@@ -207,17 +221,14 @@ test('Arc Mainnet Agent action reaches persistent outbox, policy evaluation, and
             && options.some((option) => option.id.startsWith('response:') && option.id.endsWith(':support'))) {
           selected = options.find((option) => option.id.startsWith('response:') && option.id.endsWith(':support'));
           responseRecorded = true;
-        } else if (allowProposal && responseRecorded && request.agentId === payerId) {
-          selected = options.find((option) => option.id === `nominate:${request.state.currentProposal?.id}:${recipientId}`)
-            || options.find((option) => option.id.startsWith('nominate:') && option.id.endsWith(`:${recipientId}`))
-            || choose;
-        } else if (allowProposal && request.agentId === recipientId) {
-          selected = options.find((option) => option.id === `candidate:${recipientId}:accept`)
+        } else if (allowProposal && allowIssuerDecision && responseRecorded && request.agentId === payerId) {
+          selected = options.find((option) => option.id === `issuer:${request.state.currentProposal?.id}:issue`)
             || options.find((option) => option.id.startsWith('issuer:') && option.id.endsWith(':issue'))
             || choose;
         }
         if (selected) cognitionChoices.push({ agentId: request.agentId, choice: selected.id });
-        return selected ? { choice: { id: selected.id }, confidence: 0.99, model: 'isolated-resident-cognition' } : null;
+        return selected ? { choice: { id: selected.id }, confidence: 0.99,
+          provider: 'isolated-resident-cognition', model: 'isolated-resident-cognition' } : null;
       },
       authorCurrencyProposal: async (input) => {
         assert.strictEqual(input.worldFacts, cognitionFacts.get(input.resident.agentId),
@@ -271,6 +282,69 @@ test('Arc Mainnet Agent action reaches persistent outbox, policy evaluation, and
     assert.equal(requirement.rows[0].status, 'UNRESOLVED', 'a no-action cognition choice keeps the persistent requirement alive');
     assert.equal(Number((await pool.query(`SELECT count(*)::int AS count FROM arc_token_issuance_intents WHERE world_id=$1`,
       [worldId])).rows[0].count), 0, 'no proposal is created before a resident chooses one');
+    let outcomeEvents = await pool.query(`SELECT actor_agent_id,world_minute,action_id,details FROM world_v7_events
+      WHERE world_id=$1 AND event_type='currency_genesis.review_outcome' AND details->>'outcome'='explicit_no_action'`, [worldId]);
+    assert.equal(outcomeEvents.rowCount, 2, 'each resident review gets an explicit no-action outcome');
+    assert.ok(outcomeEvents.rows.every((row) => row.details.reasonCode === 'offered_choice_selected'
+      && row.details.provider === 'isolated-resident-cognition' && row.details.confidence === 0.99));
+    const attributedInference = await pool.query(`SELECT attribution_type,agent_id,resource_category,provider,model,
+        quantity_raw::text AS quantity_raw,unit,cost_status,cost_currency,cost_microunits::text AS cost_microunits,metadata
+      FROM world_infrastructure_usage_events WHERE world_id=$1 ORDER BY agent_id`, [worldId]);
+    assert.equal(attributedInference.rowCount, 2, 'each actual review provider request emits one attributable usage record');
+    assert.ok(attributedInference.rows.every((row) => row.attribution_type === 'agent'
+      && row.agent_id && row.resource_category === 'ai_inference'
+      && row.provider === 'isolated-resident-cognition' && row.model === 'isolated-resident-cognition'
+      && row.quantity_raw === '1' && row.unit === 'provider_request_attempt'
+      && row.cost_status === 'unpriced' && row.cost_currency === null && row.cost_microunits === null
+      && row.metadata.outcome === 'explicit_no_action'));
+    assert.equal(Number((await pool.query(`SELECT count(*)::int AS count FROM world_infrastructure_fee_policies
+      WHERE world_id=$1`, [worldId])).rows[0].count), 0,
+    'the infrastructure metering path does not configure an operator fee or Agent tax');
+
+    const assertLatestReviewOutcome = async (expected) => {
+      const latest = await pool.query(`SELECT world_minute FROM world_v7_events WHERE world_id=$1
+        AND event_type='currency_genesis.review_outcome' ORDER BY world_minute DESC,created_at DESC LIMIT 1`, [worldId]);
+      const events = await pool.query(`SELECT details->>'outcome' AS outcome FROM world_v7_events
+        WHERE world_id=$1 AND event_type='currency_genesis.review_outcome' AND world_minute=$2`,
+      [worldId, latest.rows[0].world_minute]);
+      assert.equal(events.rowCount, 2);
+      assert.ok(events.rows.every((row) => row.outcome === expected),
+        `expected ${expected} outcomes, got ${JSON.stringify(events.rows)}`);
+    };
+    const runReviewFailure = async (override, expectedOutcome) => {
+      reviewOutcomeOverride = override;
+      await runCurrencyReview();
+      await assertLatestReviewOutcome(expectedOutcome);
+      const currentRequirement = await pool.query(`SELECT status FROM arc_currency_genesis_requirements WHERE world_id=$1`, [worldId]);
+      assert.equal(currentRequirement.rows[0].status, 'UNRESOLVED', 'outcome diagnostics do not advance requirement state');
+      assert.equal(Number((await pool.query(`SELECT count(*)::int AS count FROM arc_token_issuance_intents WHERE world_id=$1`,
+        [worldId])).rows[0].count), 0, 'outcome diagnostics do not create a proposal');
+    };
+    await runReviewFailure({ type: 'throw', error: Object.assign(new Error('timed out'), { name: 'APITimeoutError' }) },
+      'provider_timeout');
+    await runReviewFailure({ type: 'return', value: {} }, 'malformed_output');
+    await runReviewFailure({ type: 'return', value: { choice: { id: 'no_action' }, confidence: 0.1,
+      model: 'isolated-resident-cognition', provider: 'isolated-resident-cognition' } }, 'low_confidence');
+    await runReviewFailure({ type: 'throw', error: new Error('simulated provider error') }, 'provider_error');
+    await runReviewFailure({ type: 'return', value: { choice: { id: 'not-an-offered-option' }, confidence: 0.99,
+      model: 'isolated-resident-cognition', provider: 'isolated-resident-cognition' } }, 'invalid_choice');
+    await runReviewFailure({ type: 'return', value: null }, 'no_valid_decision');
+
+    const savedApiKey = process.env.TYPESAFE_API_KEY;
+    delete process.env.TYPESAFE_API_KEY;
+    let unavailableResult;
+    try {
+      unavailableResult = await chooseCivilizationOption({ choiceType: 'currency_genesis', options: [
+        { id: 'no_action', label: 'No action', description: 'none' },
+        { id: 'propose_currency', label: 'Propose', description: 'proposal' }
+      ] }, {});
+    } finally {
+      if (savedApiKey === undefined) delete process.env.TYPESAFE_API_KEY;
+      else process.env.TYPESAFE_API_KEY = savedApiKey;
+    }
+    assert.equal(unavailableResult.currencyReviewDiagnostic.outcome, 'provider_unavailable');
+    await runReviewFailure({ type: 'return', value: unavailableResult }, 'provider_unavailable');
+
     assert.ok(cognitionChoices.some((entry) => entry.choice === 'no_action'));
     assert.equal(authoringContextObserved, null, 'network facts alone do not invoke authoring');
     for (const table of ['arc_token_issuance_issuer_candidates', 'arc_token_issuance_decisions', 'arc_agent_tokens']) {
@@ -278,26 +352,45 @@ test('Arc Mainnet Agent action reaches persistent outbox, policy evaluation, and
     }
     assert.equal(cognitionFacts.get(payerId).mainnetWriteGate, false);
 
+    reviewOutcomeOverride = null;
     allowProposal = true;
     await runCurrencyReview();
-    let proposal = await pool.query(`SELECT id,status,decision_path,issuer_agent_id,name,specification_hash
+    let proposal = await pool.query(`SELECT id,status,decision_path,issuer_agent_id,issuer_selection_source,name,specification_hash
       FROM arc_token_issuance_intents WHERE world_id=$1 ORDER BY created_world_minute,id LIMIT 1`, [worldId]);
     for (let attempt = 0; attempt < 4 && (!proposal.rowCount || !responseRecorded); attempt += 1) {
       await runCurrencyReview();
-      proposal = await pool.query(`SELECT id,status,decision_path,issuer_agent_id,name,specification_hash
+      proposal = await pool.query(`SELECT id,status,decision_path,issuer_agent_id,issuer_selection_source,name,specification_hash
         FROM arc_token_issuance_intents WHERE world_id=$1 ORDER BY created_world_minute,id LIMIT 1`, [worldId]);
     }
     assert.equal(proposal.rowCount, 1, 'a resident created a proposal through the persistent World Engine review');
     assert.equal(proposal.rows[0].decision_path, 'world_engine');
+    outcomeEvents = await pool.query(`SELECT details FROM world_v7_events WHERE world_id=$1
+      AND actor_agent_id=$2 AND event_type='currency_genesis.review_outcome'
+      AND details->>'outcome'='explicit_propose'`, [worldId, payerId]);
+    assert.ok(outcomeEvents.rowCount >= 1 && outcomeEvents.rows.some((row) =>
+      row.details.actionId === 'propose_currency' && row.details.confidence === 0.99));
     assert.ok(authoringContextObserved, 'a resident who chose the proposal action invoked local authoring');
     assert.equal(proposal.rows[0].name, 'Research Exchange', JSON.stringify(authoringContextObserved));
-    assert.ok(proposal.rows[0].specification_hash === null, 'proposal authoring is not itself execution confirmation');
+    assert.equal(proposal.rows[0].status, 'proposed', 'a complete Agent-authored specification remains unconfirmed');
+    assert.equal(proposal.rows[0].specification_hash, null,
+      'proposal authoring is not itself execution confirmation');
+    const preConfirmationDecisions = await pool.query(`SELECT decision,agent_id,action_id FROM arc_token_issuance_decisions
+      WHERE world_id=$1 AND intent_id=$2 AND agent_id=$3
+        AND decision IN ('issuer_confirm','issuer_reject','issuer_defer')`, [worldId, proposal.rows[0].id, payerId]);
+    assert.equal(preConfirmationDecisions.rowCount, 0,
+      `proposal authoring and resident response do not create an issuer decision: ${JSON.stringify(preConfirmationDecisions.rows)}`);
     const proposalId = proposal.rows[0].id;
     const response = await pool.query(`SELECT decision,agent_id FROM arc_token_issuance_responses
       WHERE world_id=$1 AND intent_id=$2`, [worldId, proposalId]);
     assert.equal(response.rowCount, 1);
     assert.equal(response.rows[0].agent_id, recipientId);
     assert.equal(response.rows[0].decision, 'support');
+    outcomeEvents = await pool.query(`SELECT details FROM world_v7_events WHERE world_id=$1
+      AND actor_agent_id=$2 AND event_type='currency_genesis.review_outcome'
+      AND details->>'outcome'='explicit_response'`, [worldId, recipientId]);
+    assert.ok(outcomeEvents.rowCount >= 1 && outcomeEvents.rows.some((row) =>
+      String(row.details.actionId).startsWith('response:') && row.details.confidence === 0.99));
+    allowIssuerDecision = true;
     await assert.rejects(() => inTransaction(pool, (client) => confirmWorldTokenIssuance(client, {
       worldId, agentId: recipientId, intentId: proposalId, decision: null,
       actionId: 'missing-decision-confirmation', worldMinute: 3000
@@ -308,11 +401,12 @@ test('Arc Mainnet Agent action reaches persistent outbox, policy evaluation, and
       if (proposal.rows[0]?.status === 'issuer_confirmed') break;
       await runCurrencyReview();
     }
-    proposal = await pool.query(`SELECT id,status,decision_path,issuer_agent_id,name,symbol,specification_hash,
+    proposal = await pool.query(`SELECT id,status,decision_path,issuer_agent_id,issuer_selection_source,name,symbol,specification_hash,
         transaction_hash,initial_supply_human,distribution,unallocated_supply_handling,ownership_model,authority_model
       FROM arc_token_issuance_intents WHERE world_id=$1 AND id=$2`, [worldId, proposalId]);
-    assert.equal(proposal.rows[0].issuer_agent_id, recipientId, 'the proposed issuer emerges from resident nomination and acceptance');
-    assert.equal(proposal.rows[0].status, 'issuer_confirmed', 'the selected issuer explicitly confirmed the complete Agent-authored specification');
+    assert.equal(proposal.rows[0].issuer_agent_id, payerId, 'Generation 1 uses the explicitly assigned Synterra-01 issuer');
+    assert.equal(proposal.rows[0].issuer_selection_source, 'creator_genesis_assignment');
+    assert.equal(proposal.rows[0].status, 'issuer_confirmed', 'Synterra-01 explicitly confirmed its complete Agent-authored specification');
     assert.equal(proposal.rows[0].name, 'Research Exchange');
     assert.equal(proposal.rows[0].symbol, 'REX');
     assert.equal(proposal.rows[0].initial_supply_human, '1000000000');
@@ -321,10 +415,15 @@ test('Arc Mainnet Agent action reaches persistent outbox, policy evaluation, and
     assert.equal(proposal.rows[0].authority_model, 'no_mint_no_burn');
     assert.ok(cognitionChoices.some((entry) => entry.choice === 'propose_currency'));
     assert.ok(cognitionChoices.some((entry) => entry.choice.startsWith('response:') && entry.choice.endsWith(':support')));
-    assert.ok(cognitionChoices.some((entry) => entry.choice === `nominate:${proposalId}:${recipientId}`));
-    assert.ok(cognitionChoices.some((entry) => entry.choice === `candidate:${recipientId}:accept`));
-    assert.ok(cognitionChoices.some((entry) => entry.agentId === recipientId
+    assert.ok(!cognitionChoices.some((entry) => entry.choice.startsWith(`nominate:${proposalId}:`)));
+    assert.ok(!cognitionChoices.some((entry) => entry.choice.startsWith(`candidate:${recipientId}:`)));
+    assert.ok(cognitionChoices.some((entry) => entry.agentId === payerId
       && entry.choice === `issuer:${proposalId}:issue`));
+    outcomeEvents = await pool.query(`SELECT details FROM world_v7_events WHERE world_id=$1
+      AND actor_agent_id=$2 AND event_type='currency_genesis.review_outcome'
+      AND details->>'outcome'='other'`, [worldId, payerId]);
+    assert.ok(outcomeEvents.rows.some((row) => row.details.actionId === `issuer:${proposalId}:issue`),
+      'the explicit issuer decision is distinguishable from a provider non-decision');
     assert.match(proposal.rows[0].specification_hash, /^0x[0-9a-f]{64}$/i,
       'the Agent-authored specification has a canonical hash before broadcast');
     assert.equal(proposal.rows[0].transaction_hash, null, 'no chain submission is claimed by off-chain confirmation');
@@ -345,6 +444,16 @@ test('Arc Mainnet Agent action reaches persistent outbox, policy evaluation, and
     assert.equal(tokenBroadcasts, 0, 'closed Mainnet gate prevents token issuance broadcast');
     await tokenWorker.stop();
     tokenWorker = null;
+
+    const latestRuntime = await pool.query(`SELECT world_minutes FROM world_runtime_state WHERE world_id=$1`, [worldId]);
+    await inTransaction(pool, (client) => advanceWorldCurrencyGenesis(client, { worldId,
+      agent: { agentId: payerId }, worldMinute: Number(latestRuntime.rows[0].world_minutes) + 1,
+      reviewDue: false }));
+    outcomeEvents = await pool.query(`SELECT details FROM world_v7_events WHERE world_id=$1
+      AND event_type='currency_genesis.review_outcome' AND details->>'outcome'='skipped_not_due'`, [worldId]);
+    assert.equal(outcomeEvents.rowCount, 1, 'an explicit non-due review attempt is recorded once');
+    assert.equal(outcomeEvents.rows[0].details.reasonCode, 'review_not_due');
+
     const revalidatedSchema = await applyWorldSchemaAndMigrations(pool, { rootDirectory: repoRoot });
     assert.deepEqual(revalidatedSchema.applied, [], 'a restart reapplies no migration and preserves open currency history');
     assert.ok(revalidatedSchema.alreadyApplied.includes('0002_arc_agent_token_issuance.sql'));

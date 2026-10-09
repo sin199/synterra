@@ -1,3 +1,6 @@
+import { readActiveGenesisTokenAssets, readGenesisBusinessEquity,
+  readGenesisCurrencyActivation } from './genesis-economy.js';
+
 export function createResidentDetailHandler({ pool, host, validUuid, fail }) {
   return async (request, reply) => {
     if (!['127.0.0.1', '::1', 'localhost'].includes(host)) return fail(reply, 403, 'LOCAL_DASHBOARD_ONLY');
@@ -69,10 +72,15 @@ export function createResidentDetailHandler({ pool, host, validUuid, fail }) {
       ,pool.query(`SELECT asset_symbol AS asset,balance::text AS balance FROM world_economic_accounts
         WHERE world_id=$1 AND account_type='resident' AND owner_id=$2 ORDER BY asset_symbol`, [worldId, agentId])
       ,pool.query(`SELECT employment.id,employment.business_id AS "businessId",business.name AS "businessName",
-          job.role,employment.wage_usdc::text AS "wageUsdc",employment.started_world_time AS "startedWorldTime"
+          job.role,employment.wage_usdc::text AS "wageUsdc",employment.wage_token_id AS "wageTokenId",
+          employment.wage_raw::text AS "wageRaw",term.token_id AS "tokenWageOfferTokenId",
+          term.wage_raw::text AS "tokenWageOfferRaw",employment.started_world_time AS "startedWorldTime"
         FROM world_business_employment employment JOIN world_businesses business
           ON business.world_id=employment.world_id AND business.id=employment.business_id
         JOIN world_business_jobs job ON job.world_id=employment.world_id AND job.id=employment.job_id
+        LEFT JOIN world_business_job_token_terms term ON term.world_id=job.world_id AND term.job_id=job.id
+          AND term.token_id=(SELECT token_id FROM world_genesis_currency_activations activation
+            WHERE activation.world_id=employment.world_id)
         WHERE employment.world_id=$1 AND employment.agent_id=$2 AND employment.status='active'
         ORDER BY employment.started_world_time DESC`, [worldId, agentId])
       ,pool.query(`WITH RECURSIVE holdings(asset_type,asset_id,share,path) AS (
@@ -156,6 +164,45 @@ export function createResidentDetailHandler({ pool, host, validUuid, fail }) {
       [worldId, agentId])
     ]);
     if (!profile.rowCount) return fail(reply, 404, 'RESIDENT_NOT_FOUND');
+    const genesisCurrency = await readGenesisCurrencyActivation(pool, worldId);
+    let currentEconomy;
+    if (genesisCurrency) {
+      const [activeAssets, businessEquity] = await Promise.all([
+        readActiveGenesisTokenAssets(pool, { worldId, ownerAgentId: agentId }),
+        readGenesisBusinessEquity(pool, { worldId, agentId, tokenId: genesisCurrency.tokenId })
+      ]);
+      const economicEmployment = employment.rows.map((item) => {
+        const acceptedCurrentTokenWage = item.wageTokenId === genesisCurrency.tokenId
+          && item.wageRaw !== null && item.wageRaw !== undefined;
+        return { ...item, wageUsdc: null,
+          wageTokenId: acceptedCurrentTokenWage ? item.wageTokenId : null,
+          wageRaw: acceptedCurrentTokenWage ? item.wageRaw : null,
+          economicStatus: acceptedCurrentTokenWage ? 'active_token_wage' : 'historical_only',
+          legacyWage: acceptedCurrentTokenWage ? null : 'historical_only',
+          pendingTokenWageRaw: item.tokenWageOfferTokenId === genesisCurrency.tokenId
+            && (!acceptedCurrentTokenWage || String(item.wageRaw) !== String(item.tokenWageOfferRaw))
+            ? item.tokenWageOfferRaw : null,
+          requiresTokenWageAcceptance: !acceptedCurrentTokenWage
+            || String(item.wageRaw) !== String(item.tokenWageOfferRaw) };
+      });
+      currentEconomy = { currency: { tokenId: genesisCurrency.tokenId, tokenAddress: genesisCurrency.tokenAddress,
+          name: genesisCurrency.name, symbol: genesisCurrency.symbol, decimals: Number(genesisCurrency.decimals),
+          chainId: Number(genesisCurrency.chainId), authority: 'arc_chain' },
+        netWorthUsd: null, balances: activeAssets,
+        employment: economicEmployment.filter((item) => item.economicStatus === 'active_token_wage'),
+        legacyEmployment: economicEmployment.filter((item) => item.economicStatus === 'historical_only'),
+        ownership: businessEquity.investments.map((investment) => ({ assetType: 'business',
+          assetId: investment.businessId, name: investment.businessName, share: investment.ownershipShare,
+          tokenId: investment.tokenId, amountRaw: investment.amountRaw,
+          agreementId: investment.agreementId, transactionHash: investment.transactionHash,
+          blockNumber: investment.blockNumber, ownershipAuthority: investment.tokenOwnershipAuthority })),
+        pendingObligations: businessEquity.pendingObligations, recentTransactions: [], recentPurchases: [],
+        historicalSimulatedEconomy: 'historical_only' };
+    } else {
+      currentEconomy = { netWorthUsd: residentNetWorth.rows[0]?.netWorthUsd || '0.00000000',
+        balances: balances.rows, employment: employment.rows, ownership: ownership.rows,
+        recentTransactions: recentTransactions.rows, recentPurchases: recentPurchases.rows };
+    }
     const [selfModel, questions, concepts, policyExperiments, extensionRequests, values, observationMethods, createdCapabilities,
       usedCapabilities, coordination, resources, observationUses, entityParticipation] = await Promise.all([
       pool.query(`SELECT current_identity_summary AS "identitySummary",self_beliefs AS "selfBeliefs",
@@ -246,8 +293,6 @@ export function createResidentDetailHandler({ pool, host, validUuid, fail }) {
         emergentEntities: entityParticipation.rows },
       capabilityHistory: capabilityHistory.rows,
       institutions,
-      economy: { netWorthUsd: residentNetWorth.rows[0]?.netWorthUsd || '0.00000000', balances: balances.rows,
-        employment: employment.rows, ownership: ownership.rows, recentTransactions: recentTransactions.rows,
-        recentPurchases: recentPurchases.rows } };
+      economy: currentEconomy };
   };
 }

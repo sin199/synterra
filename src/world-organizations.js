@@ -1,5 +1,6 @@
 import { actionIdentifier, boundedNumber, jsonObject, requireWorldMember, requiredText, worldError, writeWorldHistory } from './world-domain.js';
 import { ensureEconomicAccount, getEconomicAccount, transferBetweenAccounts } from './economic-ledger.js';
+import { isGenesisCurrencyActive } from './genesis-economy.js';
 
 async function relationshipBetween(client, worldId, leftId, rightId) {
   const [a, b] = [leftId, rightId].sort();
@@ -65,10 +66,13 @@ export async function foundWorldOrganization(client, { worldId, founderAgentId, 
     JSON.stringify({ ...details, sharedProjectId: sharedProject?.id || null })]);
   if (!inserted.rowCount) throw worldError('ORGANIZATION_NAME_ALREADY_EXISTS');
   const organization = inserted.rows[0];
-  await ensureEconomicAccount(client, { worldId, accountType: 'organization', ownerId: organization.id });
-  await client.query(`INSERT INTO world_economic_ownership(world_id,asset_type,asset_id,owner_type,owner_id,share,invested_usdc,acquired_world_time)
-    VALUES($1,'organization',$2,'resident',$3,1,0,$4) ON CONFLICT DO NOTHING`,
-  [worldId, organization.id, founderAgentId, worldTime]);
+  const genesisActive = await isGenesisCurrencyActive(client, worldId);
+  if (!genesisActive) {
+    await ensureEconomicAccount(client, { worldId, accountType: 'organization', ownerId: organization.id });
+    await client.query(`INSERT INTO world_economic_ownership(world_id,asset_type,asset_id,owner_type,owner_id,share,invested_usdc,acquired_world_time)
+      VALUES($1,'organization',$2,'resident',$3,1,0,$4) ON CONFLICT DO NOTHING`,
+    [worldId, organization.id, founderAgentId, worldTime]);
+  }
   await client.query(`INSERT INTO world_organization_members(world_id,organization_id,agent_id,status,role,joined_world_time,
       updated_world_time,action_id)
     VALUES($1,$2,$3,'active','founder',$4,$4,$5),($1,$2,$6,'invited','member',$4,$4,$7)
@@ -147,6 +151,7 @@ export async function decideOrganizationMembership(client, { worldId, organizati
     [worldId, organizationId]);
   if (!organization.rowCount) throw worldError('ORGANIZATION_NOT_FOUND', 404);
   if (!['forming','active','dormant'].includes(organization.rows[0].status)) throw worldError('ORGANIZATION_NOT_ACTIVE');
+  const genesisCurrencyActive = await isGenesisCurrencyActive(client, worldId);
   const lockedRetry = await client.query(`SELECT organization_id AS id,status FROM world_organization_members
     WHERE world_id=$1 AND agent_id=$2 AND action_id=$3`, [worldId, agentId, key]);
   if (lockedRetry.rowCount) return { ...lockedRetry.rows[0], idempotent: true };
@@ -194,14 +199,16 @@ export async function decideOrganizationMembership(client, { worldId, organizati
     await writeWorldHistory(client, { worldId, eventKey: `organization:${organizationId}:member:${agentId}:accepted`,
       eventType: 'organization_joined', actorAgentId: agentId, entityType: 'organization', entityId: organizationId,
       worldTime, title: organization.rows[0].name, detail: 'A resident accepted an invitation and joined.' });
-    await client.query(`INSERT INTO world_economic_ownership(world_id,asset_type,asset_id,owner_type,owner_id,share,invested_usdc,acquired_world_time)
-      VALUES($1,'organization',$2,'resident',$3,1,0,$4) ON CONFLICT DO NOTHING`,
-    [worldId, organizationId, agentId, worldTime]);
-    await client.query(`UPDATE world_economic_ownership SET share=1::numeric/$3::numeric,updated_at=now()
-      WHERE world_id=$1 AND asset_type='organization' AND asset_id=$2 AND owner_type='resident'
-        AND owner_id IN (SELECT agent_id FROM world_organization_members
-          WHERE world_id=$1 AND organization_id=$2 AND status='active')`,
-    [worldId, organizationId, Number(memberCount.rows[0].count)]);
+    if (!genesisCurrencyActive) {
+      await client.query(`INSERT INTO world_economic_ownership(world_id,asset_type,asset_id,owner_type,owner_id,share,invested_usdc,acquired_world_time)
+        VALUES($1,'organization',$2,'resident',$3,1,0,$4) ON CONFLICT DO NOTHING`,
+      [worldId, organizationId, agentId, worldTime]);
+      await client.query(`UPDATE world_economic_ownership SET share=1::numeric/$3::numeric,updated_at=now()
+        WHERE world_id=$1 AND asset_type='organization' AND asset_id=$2 AND owner_type='resident'
+          AND owner_id IN (SELECT agent_id FROM world_organization_members
+            WHERE world_id=$1 AND organization_id=$2 AND status='active')`,
+      [worldId, organizationId, Number(memberCount.rows[0].count)]);
+    }
   }
   await client.query(`INSERT INTO world_events(world_id,actor_id,event_type,data,action_id)
     VALUES($1,$2,'world.organization_membership_decided',$3::jsonb,$4) ON CONFLICT(world_id,actor_id,action_id) DO NOTHING`,
@@ -212,6 +219,9 @@ export async function decideOrganizationMembership(client, { worldId, organizati
 export async function contributeOrganizationEffort(client, { worldId, organizationId, agentId, actionId, worldTime, effort,
   contributionType = 'effort', amountUsdc = null }) {
   await requireWorldMember(client, worldId, agentId);
+  if (contributionType === 'capital' && await isGenesisCurrencyActive(client, worldId)) {
+    throw worldError('LEGACY_SIMULATED_ECONOMY_RETIRED', 409);
+  }
   const key = actionIdentifier(actionId);
   const organization = await client.query(`SELECT * FROM world_organizations WHERE world_id=$1 AND id=$2 FOR UPDATE`,
     [worldId, organizationId]);
@@ -272,5 +282,17 @@ export async function listWorldOrganizations(client, { worldId, statuses = ['for
     WHERE organization.world_id=$1 AND organization.status=ANY($2::text[])
     ORDER BY organization.reputation DESC,organization.created_world_time DESC,organization.id LIMIT $3`,
   [worldId, statuses, Math.trunc(boundedNumber(limit, 1, 100, 'limit'))]);
-  return rows.rows;
+  if (!await isGenesisCurrencyActive(client, worldId)) return rows.rows;
+  return rows.rows.map((row) => {
+    const resources = { ...(row.resources || {}) };
+    const governanceRules = { ...(row.governance_rules || {}) };
+    for (const key of Object.keys(resources)) {
+      if (/^(?:usdc|simulated_usdc|cash|cashbalance|capitalcontributed)$/i.test(key)) delete resources[key];
+    }
+    for (const key of Object.keys(governanceRules)) {
+      if (/^(?:spending_limit_usdc|treasury_usdc|capital_limit_usdc)$/i.test(key)) delete governanceRules[key];
+    }
+    return { ...row, resources, governance_rules: governanceRules, cash_balance: null, contributed_capital: null,
+      legacySimulatedEconomy: 'historical_only' };
+  });
 }

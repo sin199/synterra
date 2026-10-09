@@ -21,7 +21,7 @@ import { foundWorldOrganization, decideOrganizationMembership, contributeOrganiz
 import { shareWorldInformation, decideWorldInformationShare, expireInformationShares,
   listInformationInbox } from './world-information.js';
 import { expireInstitutionalState, planInstitutionalAction, proposeWorldAgreement, proposeOrganizationGovernance,
-  recordAgreementExecutionStage,
+  proposeGenesisTokenBusinessInvestment, recordAgreementExecutionStage,
   resolveWorldCommitment, respondToWorldAgreement, voteOrganizationProposal } from './world-institutions.js';
 import { applyToWorldBusinessJob, buildBusinessCandidates, closeWorldBusiness,
   completeWorldBusinessShift, decideWorldBusinessApplication, distributeWorldBusinessProfit,
@@ -31,6 +31,7 @@ import { applyToWorldBusinessJob, buildBusinessCandidates, closeWorldBusiness,
   observeWorldBusinessMarket,
   observeResidentEconomicMarket,
   practiceWorldBusinessCapability, reviewWorldBusinessPrice, settleWorldBusinessMaintenance,
+  publishGenesisTokenServicePrice, publishGenesisTokenJobWage, acceptGenesisTokenEmploymentWage,
   withdrawWorldBusinessApplication,
   settleWorldPlaceMaintenance, explainBusinessOpportunityGaps } from './world-businesses.js';
 import { advanceWorldCivilization, buildCapabilityUseCandidates, initializeWorldCivilization,
@@ -45,6 +46,7 @@ import { activityDurationSeconds, activityNeedEffects, activityVariant, applyEnv
 import { writeWorldHistory } from './world-domain.js';
 import { advanceWorldCurrencyGenesis, ensureWorldCurrencyGenesisRequirement } from './world-token-issuance.js';
 import { ensureResidentEconomicAccounts } from './economic-ledger.js';
+import { readGenesisCurrencyActivation, readGenesisTokenWalletSnapshots } from './genesis-economy.js';
 
 export const WORLD_TICK_MS = 1_000;
 const TYPE_SAFE_INTERVAL_MS = 30 * 60_000;
@@ -63,6 +65,7 @@ const ACTION_SECONDS = Object.freeze({ work: 16, cooperate: 16, learn: 11, rest:
   business_withdraw: 6,
   business_work: 16, business_invest: 12, business_price: 10, business_distribute: 10, business_close: 10,
   business_skill_practice: 12, business_seek_cofounder: 14, business_market_observe: 12, business_reopen: 18,
+  business_token_price: 10, business_token_wage: 10, business_wage_accept: 8,
   agreement_propose: 12, agreement_respond: 8, commitment_resolve: 8, organization_propose: 12, organization_vote: 8,
   capability_use: 15 });
 const GOALS = Object.freeze(['wealth','learn','community','wellbeing','balanced','wealth','learn','community','wellbeing','balanced']);
@@ -102,6 +105,24 @@ function recoveryBlocker(reasonCode) {
 function finite(value, fallback = 0) {
   const number = Number(value);
   return Number.isFinite(number) ? number : fallback;
+}
+
+export function markPreGenesisEconomicMemories(memories, activationWorldMinute) {
+  const cutoff = Number(activationWorldMinute);
+  if (!Array.isArray(memories) || !Number.isSafeInteger(cutoff) || cutoff < 0) return memories || [];
+  return memories.map((memory) => {
+    const worldMinute = Number(memory?.worldMinutes ?? memory?.world_minutes);
+    const type = String(memory?.memoryType ?? memory?.memory_type ?? '').toLowerCase();
+    const content = `${memory?.summary || ''} ${JSON.stringify(memory?.metadata || {})}`;
+    const refersToSimulatedAssets = ['economic','business'].includes(type)
+      || /simulated\s*(?:usdc|usd|token)|internal\s*(?:units|token)|paper\s*(?:balance|position|asset)|(?:usdc|usd)\s*(?:balance|ledger|wage|quote)/i.test(content);
+    if (!Number.isSafeInteger(worldMinute) || worldMinute > cutoff || !refersToSimulatedAssets) return memory;
+    return { ...memory, historicalOnly: true, assetAuthority: 'none',
+      legacySimulatedEconomy: 'historical_only',
+      summary: `[Pre-Genesis simulated-economy history; not a current asset or purchasing power] ${String(memory.summary || '').slice(0, 400)}`,
+      metadata: { ...safeJson(memory.metadata), legacySimulatedEconomy: 'historical_only',
+        assetAuthority: 'none', economicEra: 'pre_genesis' } };
+  });
 }
 
 export function clamp(value, min = 0, max = 100) {
@@ -464,6 +485,13 @@ async function loadWorldInitiatives(client, worldId, worldMinutes, residents, sc
     if (!data) continue;
     data.organizationMemberships = data.organizationMemberships.map((membership) => {
       const organization = organizationById.get(membership.id);
+      const resources = safeJson(organization?.resources);
+      if (economy.genesisCurrencyActive) {
+        const activeResources = Object.fromEntries(Object.entries(resources).filter(([key]) =>
+          !/^(?:usdc|simulated_usdc|cash|cashbalance|capitalcontributed)$/i.test(key)));
+        return { ...membership, cashBalance: null, resources: activeResources,
+          legacySimulatedEconomy: 'historical_only' };
+      }
       return { ...membership, cashBalance: Number(organization?.cash_balance || 0) };
     });
     data.businesses = economy.businesses;
@@ -479,12 +507,19 @@ async function loadWorldInitiatives(client, worldId, worldMinutes, residents, sc
     data.economicProjects = economy.projects;
     data.places = economy.places;
     data.residentSkills = economy.residentSkills;
+    data.genesisCurrencyActive = economy.genesisCurrencyActive;
+    data.genesisCurrency = economy.genesisCurrency;
+    data.genesisTokenWallet = economy.genesisWallets?.[resident.agent_id] || null;
+    if (economy.genesisCurrencyActive) {
+      data.ownership = [];
+      data.legacySimulatedEconomy = 'historical_only';
+    }
     data.worldMinutes = worldMinutes;
     data.scenes = scenes;
   }
   return { byAgent, opportunities: activeOpportunities, projects: activeProjects, worldNeeds, economy,
     newIdeas: environmentOpportunityIdeas({ residents, scenes, worldMinutes, projects: activeProjects,
-      opportunities: activeOpportunities }) };
+      opportunities: activeOpportunities, genesisCurrencyActive: economy.genesisCurrencyActive }) };
 }
 
 async function recordWorldEvent(client, worldId, agentId, tick, type, data) {
@@ -564,13 +599,15 @@ async function refreshSocialProfile(client, worldId, agentId, worldMinutes, sour
       JOIN agents other ON other.id=CASE WHEN r.agent_a_id=$2 THEN r.agent_b_id ELSE r.agent_a_id END
       WHERE r.world_id=$1 AND (r.agent_a_id=$2 OR r.agent_b_id=$2)`, [worldId, agentId]);
   const wealthResult = await client.query(`SELECT COALESCE(sum(balance),0)::text AS value
-      FROM world_economic_accounts WHERE world_id=$1 AND account_type='resident' AND account_key=$2 AND asset_symbol='USDC'`,
+      FROM world_economic_accounts WHERE world_id=$1 AND account_type='resident' AND account_key=$2 AND asset_symbol='USDC'
+        AND NOT EXISTS (SELECT 1 FROM world_genesis_currency_activations WHERE world_id=$1)`,
   [worldId, agentId]);
   const incomeResult = await client.query(`SELECT COALESCE(sum(posting.amount),0)::text AS value
     FROM world_economic_accounts account JOIN world_economic_postings posting ON posting.account_id=account.id
     JOIN world_economic_transactions tx ON tx.id=posting.transaction_id
     WHERE tx.world_id=$1 AND account.account_type='resident' AND account.account_key=$2
-      AND account.asset_symbol='USDC' AND posting.amount>0`, [worldId, agentId]);
+      AND account.asset_symbol='USDC' AND posting.amount>0
+      AND NOT EXISTS (SELECT 1 FROM world_genesis_currency_activations WHERE world_id=$1)`, [worldId, agentId]);
   const actionResult = await client.query(`SELECT actions_taken FROM agent_minds WHERE world_id=$1 AND agent_id=$2`, [worldId, agentId]);
   const needResult = await client.query(`SELECT energy,food,social FROM world_members WHERE world_id=$1 AND agent_id=$2`, [worldId, agentId]);
   const recentActionResult = await client.query(`SELECT memory_type,metadata FROM agent_memories
@@ -629,13 +666,15 @@ async function reflectResident(client, worldId, agent, tickCount, worldMinutes, 
     FROM world_relationships r JOIN agents other ON other.id=CASE WHEN r.agent_a_id=$2 THEN r.agent_b_id ELSE r.agent_a_id END
     WHERE r.world_id=$1 AND (r.agent_a_id=$2 OR r.agent_b_id=$2)`, [worldId, agent.agentId]);
   const wealthResult = await client.query(`SELECT COALESCE(sum(balance),0)::text AS value
-    FROM world_economic_accounts WHERE world_id=$1 AND account_type='resident' AND account_key=$2 AND asset_symbol='USDC'`,
+    FROM world_economic_accounts WHERE world_id=$1 AND account_type='resident' AND account_key=$2 AND asset_symbol='USDC'
+      AND NOT EXISTS (SELECT 1 FROM world_genesis_currency_activations WHERE world_id=$1)`,
   [worldId, agent.agentId]);
   const incomeResult = await client.query(`SELECT COALESCE(sum(posting.amount),0)::text AS value
     FROM world_economic_accounts account JOIN world_economic_postings posting ON posting.account_id=account.id
     JOIN world_economic_transactions tx ON tx.id=posting.transaction_id
     WHERE tx.world_id=$1 AND account.account_type='resident' AND account.account_key=$2
-      AND account.asset_symbol='USDC' AND posting.amount>0`, [worldId, agent.agentId]);
+      AND account.asset_symbol='USDC' AND posting.amount>0
+      AND NOT EXISTS (SELECT 1 FROM world_genesis_currency_activations WHERE world_id=$1)`, [worldId, agent.agentId]);
   const goalResult = await client.query(`SELECT id,goal_type AS "goalType",category,description,priority::text AS priority,
       progress::text AS progress,status,source,metadata,updated_world_minutes AS "updatedWorldMinutes" FROM world_agent_goals
     WHERE world_id=$1 AND agent_id=$2 AND status='active' ORDER BY CASE goal_type WHEN 'primary' THEN 0 WHEN 'secondary' THEN 1 ELSE 2 END,
@@ -979,6 +1018,7 @@ async function completeWorldInitiativeActivity(client, worldId, agent, runtime, 
       detail = await purchaseWorldBusinessService(client, { worldId, serviceId: context.serviceId,
         customerAgentId: agent.agentId, actionId: key, worldTime: nowWorld,
         maxPriceUsdc: context.maxPriceUsdc, contractAgreementId: context.contractAgreementId || null,
+        maxPriceRaw: context.maxPriceRaw,
         demand: pricingContext.demand ?? demandRow?.demandCount ?? 1,
         supply: pricingContext.supply ?? demandRow?.supplyCount ?? 0,
         relationship: pricingContext.relationship ?? (relation ? Number(relation.familiarity) * 0.3
@@ -986,9 +1026,14 @@ async function completeWorldInitiativeActivity(client, worldId, agent, runtime, 
         wealth: pricingContext.wealth ?? agent.usdc,
         priceSensitivity: pricingContext.priceSensitivity ?? agent.priceSensitivity });
     } else if (activity === 'business_invest') {
-      detail = await investInWorldBusiness(client, { worldId, businessId: context.businessId,
-        investorAgentId: agent.agentId, amount: context.amountUsdc, fundingSource: context.fundingSource,
-        actionId: key, worldTime: nowWorld });
+      const genesisCurrency = await readGenesisCurrencyActivation(client, worldId);
+      detail = genesisCurrency
+        ? await proposeGenesisTokenBusinessInvestment(client, { worldId, businessId: context.businessId,
+          investorAgentId: agent.agentId, amountRaw: context.amountRaw, ownershipShare: context.ownershipShare,
+          actionId: key, worldTime: nowWorld })
+        : await investInWorldBusiness(client, { worldId, businessId: context.businessId,
+          investorAgentId: agent.agentId, amount: context.amountUsdc, fundingSource: context.fundingSource,
+          actionId: key, worldTime: nowWorld });
     } else if (activity === 'business_price') {
       const service = (agent.services || []).find((item) => item.id === context.serviceId);
       const demandRow = (agent.demand || []).find((item) => item.serviceType === service?.service_type);
@@ -996,6 +1041,17 @@ async function completeWorldInitiativeActivity(client, worldId, agent, runtime, 
         serviceId: context.serviceId, agentId: agent.agentId, direction: context.direction,
         actionId: key, worldTime: nowWorld, demand: demandRow?.demandCount || 0,
         supply: demandRow?.supplyCount || 0 });
+    } else if (activity === 'business_token_price') {
+      detail = await publishGenesisTokenServicePrice(client, { worldId, businessId: context.businessId,
+        serviceId: context.serviceId, agentId: agent.agentId, priceRaw: context.priceRaw,
+        actionId: key, worldTime: nowWorld });
+    } else if (activity === 'business_token_wage') {
+      detail = await publishGenesisTokenJobWage(client, { worldId, businessId: context.businessId,
+        jobId: context.jobId, agentId: agent.agentId, wageRaw: context.wageRaw,
+        actionId: key, worldTime: nowWorld });
+    } else if (activity === 'business_wage_accept') {
+      detail = await acceptGenesisTokenEmploymentWage(client, { worldId, employmentId: context.employmentId,
+        agentId: agent.agentId, actionId: key, worldTime: nowWorld });
     } else if (activity === 'business_distribute') {
       detail = await distributeWorldBusinessProfit(client, { worldId, businessId: context.businessId,
         ownerAgentId: agent.agentId, actionId: key, worldTime: nowWorld });
@@ -1160,6 +1216,7 @@ async function recordInitiativeOutcome(client, { worldId, agent, activity, resul
 }
 
 async function recordEconomicBelief(client, { worldId, agentId, businessId, worldMinutes, evidence }) {
+  if (await readGenesisCurrencyActivation(client, worldId)) return;
   if (!businessId) return;
   const result = await client.query(`SELECT business.founder_agent_id AS founder,
       business.status,account.id AS account_id,
@@ -1300,9 +1357,10 @@ async function completeActivity(client, worldId, agent, runtime, now, scene, onA
         needs = { energy: 15, food: 70, social: 2, happiness: 4, knowledge: 0 };
         result.meal = { spentUnits: meal.spentUnits, balanceUnits: meal.balanceUnits };
       } catch (error) {
-        if (error.message !== 'INSUFFICIENT_INTERNAL_UNITS') throw error;
+        if (!['INSUFFICIENT_INTERNAL_UNITS','LEGACY_INTERNAL_TOKEN_ECONOMY_RETIRED'].includes(error.message)) throw error;
         needs = { energy: 10, food: 45, social: 3, happiness: 2, knowledge: 0 };
-        result.meal = { free: true, reason: 'internal_units_unavailable' };
+        result.meal = { free: true, reason: error.message === 'LEGACY_INTERNAL_TOKEN_ECONOMY_RETIRED'
+          ? 'legacy_internal_economy_historical_only' : 'internal_units_unavailable' };
       }
     } else needs = { energy: 10, food: 45, social: 3, happiness: 2, knowledge: 0 };
   } else if (activity === 'socialize') {
@@ -1333,6 +1391,7 @@ async function completeActivity(client, worldId, agent, runtime, now, scene, onA
     'organization_found','organization_join','organization_reject','organization_leave','organization_invite',
     'organization_contribute','information_share','information_accept','information_ignore','information_doubt',
     'business_found','business_service','business_apply','business_withdraw','business_leave','business_hire','business_reject','business_work',
+    'business_token_price','business_token_wage','business_wage_accept',
     'business_invest','business_price','business_distribute','business_close','business_skill_practice','business_seek_cofounder',
     'business_market_observe','business_reopen',
     'agreement_propose','agreement_respond','commitment_resolve','organization_propose','organization_vote'].includes(activity)) {
@@ -1344,7 +1403,7 @@ async function completeActivity(client, worldId, agent, runtime, now, scene, onA
       needs = { energy: activity === 'project_contribute' ? -6 : -2, food: -1,
         social: activity === 'information_share' || activity === 'organization_found' ? 1 : 0,
         happiness: initiative.detail?.completed ? 3 : 1, knowledge: 0 };
-      if (activity === 'business_service' && initiative.detail?.benefit) {
+      if (activity === 'business_service' && initiative.detail?.status === 'fulfilled' && initiative.detail?.benefit) {
         for (const key of ['energy','food','social','happiness','knowledge']) {
           needs[key] = (Number(needs[key]) || 0) + (Number(initiative.detail.benefit[key]) || 0);
         }
@@ -1534,8 +1593,14 @@ async function completeActivity(client, worldId, agent, runtime, now, scene, onA
       }
       else if (initiativeAction === 'business_seek_cofounder') summary = `Invited ${result.initiative?.partnerName || 'a trusted collaborator'} to explore a ${result.initiative?.serviceType || 'service'} partnership.`;
       else if (initiativeAction === 'business_service') summary = `Paid ${result.initiative?.priceUsdc || 'simulated USDC'} for ${result.initiative?.serviceName || 'a service'}; the service changed personal needs and funded its provider.`;
+      else if (initiativeAction === 'business_token_price') summary = `Published an explicit ${result.initiative?.symbol || 'Genesis Token'} service price of ${result.initiative?.priceHuman || result.initiative?.priceRaw || 'an unavailable amount'}; no historical USDC quote was converted.`;
+      else if (initiativeAction === 'business_token_wage') summary = `Published an explicit ${result.initiative?.symbol || 'Genesis Token'} wage of ${result.initiative?.wageHuman || result.initiative?.wageRaw || 'an unavailable amount'}; no historical USDC wage was converted.`;
+      else if (initiativeAction === 'business_wage_accept') summary = `Accepted an explicitly published ${result.initiative?.symbol || 'Genesis Token'} wage; each shift requires employer wallet authorization and Arc confirmation.`;
+      else if (initiativeAction === 'business_service' && result.initiative?.status === 'pending_settlement') summary = `Requested ${result.initiative?.serviceName || 'a service'} for ${result.initiative?.amountRaw || 'an unavailable amount'} raw Genesis Token units; benefit delivery waits for Arc confirmation.`;
       else if (initiativeAction === 'business_work') summary = `Produced a ${result.initiative?.serviceType || 'service'} unit for ${businessName}${result.initiative?.wageUsdc ? ` and received a funded ${result.initiative.wageUsdc} shift wage` : ''}.`;
-      else if (initiativeAction === 'business_invest') summary = `Invested ${result.initiative?.amountUsdc || 'simulated USDC'} in ${businessName} for an ownership share.`;
+      else if (initiativeAction === 'business_invest') summary = result.initiative?.amountRaw
+        ? `Proposed a ${result.initiative.ownershipShare} business equity share for ${result.initiative.amountRaw} raw ${result.initiative.tokenId} units; equity waits for founder acceptance and Arc confirmation.`
+        : `Invested ${result.initiative?.amountUsdc || 'simulated USDC'} in ${businessName} for an ownership share.`;
       else if (initiativeAction === 'business_close') summary = `Closed ${businessName} after its finances no longer supported continuing.`;
       else if (initiativeAction === 'business_apply') summary = `Applied for a funded role at ${businessName}.`;
       else if (initiativeAction === 'business_withdraw') summary = `Withdrew a pending application at ${businessName}.`;
@@ -1550,6 +1615,9 @@ async function completeActivity(client, worldId, agent, runtime, now, scene, onA
         businessId,
         worldMinutes: runtime.world_minutes, evidence: { action: initiativeAction,
           amountUsdc: result.initiative?.priceUsdc || result.initiative?.amountUsdc || null,
+          amountRaw: result.initiative?.amountRaw || null,
+          tokenId: result.initiative?.tokenId || null,
+          settlementStatus: result.initiative?.settlementStatus || null,
           benefit: result.initiative?.benefit || null, wealth: agent.usdc,
           serviceType: result.initiative?.serviceType || null, status: result.initiative?.status || null } });
     } else if (initiativeAction.startsWith('information_')) {
@@ -1572,7 +1640,8 @@ async function completeActivity(client, worldId, agent, runtime, now, scene, onA
           || business?.metadata?.serviceType || null,
         initiative: result.initiative || {}, outcome: result.opportunity?.status || 'success' },
       sourceEventId: completionEventId });
-    if (['business_work','business_service'].includes(initiativeAction) && result.initiative?.businessId) {
+    if ((initiativeAction === 'business_work' || (initiativeAction === 'business_service'
+        && result.initiative?.status === 'fulfilled')) && result.initiative?.businessId) {
       const businessId = result.initiative.businessId;
       const work = initiativeAction === 'business_work';
       const summary = work
@@ -1727,7 +1796,22 @@ async function readEngineSnapshot(pool, worldId) {
     pool.query(`SELECT id,name,scene_type AS "sceneType",status FROM world_scenes WHERE world_id=$1 ORDER BY created_at,id`, [worldId])
   ]);
   const runtime = (await pool.query('SELECT tick_count,world_minutes,last_tick_at,typesafe_next_at FROM world_runtime_state WHERE world_id=$1', [worldId])).rows[0];
-  return { name: world.rows[0]?.name || 'Synterra', members: members.rows, scenes: scenes.rows, runtime };
+  const genesisCurrency = await readGenesisCurrencyActivation(pool, worldId);
+  const tokenWallets = genesisCurrency
+    ? await readGenesisTokenWalletSnapshots(pool, { worldId }) : null;
+  const walletByOwner = new Map((tokenWallets?.wallets || []).map((wallet) =>
+    [`${wallet.ownerType}:${wallet.ownerId}`, wallet]));
+  const currentMembers = genesisCurrency ? members.rows.map((member) => {
+    const wallet = walletByOwner.get(`agent:${member.agentId}`) || null;
+    const { usdc: _historicalUsdc, ...resident } = member;
+    return { ...resident,
+      memories: markPreGenesisEconomicMemories(resident.memories, genesisCurrency.worldMinute),
+      genesisTokenWallet: wallet,
+      genesisTokenSpendableRaw: wallet?.spendableRaw ?? null,
+      genesisTokenObservedAt: wallet?.observedAt ?? null };
+  }) : members.rows;
+  return { name: world.rows[0]?.name || 'Synterra', members: currentMembers, scenes: scenes.rows, runtime,
+    genesisCurrencyActive: Boolean(genesisCurrency), genesisCurrency };
 }
 
 async function runStrategicTypeSafe(pool, worldId, chooseWithTypeSafe, runtimeState) {
@@ -1736,7 +1820,11 @@ async function runStrategicTypeSafe(pool, worldId, chooseWithTypeSafe, runtimeSt
   const index = stableInt(`${worldId}:${snapshot.runtime.tick_count}:typesafe`) % snapshot.members.length;
   const resident = snapshot.members[index];
   const goalCandidates = [
-    { id: 'BUILD_WEALTH', legacyGoal: 'wealth', action: 'work', goal: 'Build simulated savings through useful work and business activity.', description: 'Build savings through existing work and business opportunities.' },
+    { id: 'BUILD_WEALTH', legacyGoal: 'wealth', action: 'work', goal: snapshot.genesisCurrencyActive
+      ? 'Consider useful work, explicit Genesis Token business terms, and wallet-authorized settlement; token ownership follows Arc.'
+      : 'Build simulated savings through useful work and business activity.', description: snapshot.genesisCurrencyActive
+      ? 'Build economic capacity through Agent choices and chain-confirmed Genesis Token activity.'
+      : 'Build savings through existing work and business opportunities.' },
     { id: 'MASTER_RESEARCH', legacyGoal: 'learn', action: 'learn', goal: 'Grow research skill through study and observation.', description: 'Study in the library or observatory.' },
     { id: 'MASTER_ENGINEERING', legacyGoal: 'learn', action: 'work', goal: 'Grow engineering skill through data-center and workshop shifts.', description: 'Work at an existing workshop or data center.' },
     { id: 'BUILD_RELATIONSHIPS', legacyGoal: 'community', action: 'socialize', goal: 'Build meaningful familiarity with co-located residents.', description: 'Meet available residents at a cafe or garden.' },
@@ -1755,7 +1843,7 @@ async function runStrategicTypeSafe(pool, worldId, chooseWithTypeSafe, runtimeSt
   const traits = safeJson(resident.traits);
   const observation = {
     self: { agentId: resident.agentId, energy: resident.energy, food: resident.food, social: resident.social,
-      location: resident.location, internalTokenUnits: '0' },
+      location: resident.location, ...(snapshot.genesisCurrencyActive ? {} : { internalTokenUnits: '0' }) },
     members: snapshot.members.map((member) => ({ id: member.agentId, name: member.name, location: member.location })),
     scenes: snapshot.scenes,
       mind: { archetype: resident.archetype || 'observer', traits, currentGoal: resident.currentGoal,
@@ -1766,7 +1854,16 @@ async function runStrategicTypeSafe(pool, worldId, chooseWithTypeSafe, runtimeSt
         ambition: resident.ambition, skills: resident.skills, modifiers: resident.personalityModifiers,
         riskModifier: resident.riskModifier
       } },
-    economic: { internalUsdcBalance: resident.usdc }
+    economic: snapshot.genesisCurrencyActive
+      ? { currency: { tokenId: snapshot.genesisCurrency.tokenId,
+          tokenAddress: snapshot.genesisCurrency.tokenAddress, symbol: snapshot.genesisCurrency.symbol,
+          decimals: Number(snapshot.genesisCurrency.decimals), chainId: Number(snapshot.genesisCurrency.chainId),
+          authority: 'arc_chain' }, balanceRaw: resident.genesisTokenWallet?.balanceRaw ?? null,
+        spendableRaw: resident.genesisTokenSpendableRaw, reservedRaw: resident.genesisTokenWallet?.reservedRaw ?? null,
+        observedBlock: resident.genesisTokenWallet?.observedBlock ?? null,
+        observedAt: resident.genesisTokenObservedAt, source: resident.genesisTokenWallet?.balanceSource || 'unavailable',
+        legacySimulatedEconomy: 'historical_only', assetAuthority: 'arc_chain_observation_only' }
+      : { internalUsdcBalance: resident.usdc }
   };
   const selection = await chooseWithTypeSafe(observation, goalCandidates, runtimeState, []);
   const selectedGoal = selection.decision?.id;
@@ -1920,8 +2017,32 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
   let civilizationReasoningDeadline = 0;
   let civilizationChoiceInFlight = null;
 
+  const currencyReasoningFailure = (outcome, reasonCode) => ({ currencyReviewDiagnostic: {
+    outcome, reasonCode, provider: 'typesafe', model: null, confidence: null
+  } });
+  const currencyReasoningError = (error) => {
+    const name = String(error?.name || '').toLowerCase();
+    const code = String(error?.code || '').toUpperCase();
+    const status = Number(error?.status);
+    if (name.includes('timeout') || name === 'aborterror'
+        || ['ETIMEDOUT', 'ESOCKETTIMEDOUT', 'ABORT_ERR'].includes(code)) {
+      return currencyReasoningFailure('provider_timeout', 'provider_request_timeout');
+    }
+    if (name === 'apiconnectionerror' || ['ECONNREFUSED', 'ECONNRESET', 'ENETUNREACH', 'ENOTFOUND', 'EAI_AGAIN'].includes(code)
+        || status === 429 || status >= 500) {
+      return currencyReasoningFailure('provider_unavailable', 'provider_connection_unavailable');
+    }
+    return currencyReasoningFailure('provider_error', 'provider_request_error');
+  };
+
   const chooseCivilizationOptionBounded = async (request) => {
-    if (!chooseCivilizationOption || Date.now() >= civilizationReasoningDeadline || civilizationChoiceInFlight) return null;
+    const currencyReview = request?.choiceType === 'currency_genesis';
+    if (!chooseCivilizationOption) return currencyReview
+      ? currencyReasoningFailure('provider_unavailable', 'provider_callback_unavailable') : null;
+    if (Date.now() >= civilizationReasoningDeadline) return currencyReview
+      ? currencyReasoningFailure('provider_timeout', 'reasoning_deadline_elapsed') : null;
+    if (civilizationChoiceInFlight) return currencyReview
+      ? currencyReasoningFailure('no_valid_decision', 'prior_request_still_in_flight') : null;
     const timeoutMs = Math.max(1, Math.min(CIVILIZATION_REASONING_TIMEOUT_MS,
       civilizationReasoningDeadline - Date.now()));
     const operation = Promise.resolve().then(() => chooseCivilizationOption(request, runtimeState));
@@ -1935,8 +2056,13 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
         { tickFailure: false, phase: diagnostics.lastTickPhase });
       if (result.timedOut) reportError(new Error(`Optional TypeSafe civilization reasoning exceeded ${timeoutMs}ms.`),
         'typesafe_civilization_timeout', { tickFailure: false, phase: diagnostics.lastTickPhase });
+      if (currencyReview && result.timedOut) return currencyReasoningFailure('provider_timeout', 'reasoning_timeout');
+      if (currencyReview && result.error) return currencyReasoningError(result.error);
       return result.value;
-    } catch (error) { reportError(error, 'typesafe_civilization_selection', { tickFailure: false }); return null; }
+    } catch (error) {
+      reportError(error, 'typesafe_civilization_selection', { tickFailure: false });
+      return currencyReview ? currencyReasoningError(error) : null;
+    }
   };
 
   const chooseWorldV7ReflectionBounded = async (request) => {
@@ -2234,6 +2360,20 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
             relationships: Array.isArray(row.relationships) ? row.relationships : [] };
           const initiativeData = initiativeState?.byAgent.get(agent.agentId) || {};
           Object.assign(agent, initiativeData);
+          if (agent.genesisCurrencyActive) {
+            // Historical paper balances are retained in PostgreSQL, but they
+            // cannot influence post-Genesis choice, wealth or the active wallet.
+            delete agent.usdc;
+            delete agent.usdcBalance;
+            agent.internal_units = '0';
+            agent.planned_paid_meal = false;
+            agent.genesisTokenSpendableRaw = agent.genesisTokenWallet?.spendableRaw ?? null;
+            agent.genesisTokenObservedAt = agent.genesisTokenWallet?.observedAt ?? null;
+            agent.recentMemories = markPreGenesisEconomicMemories(agent.recentMemories,
+              agent.genesisCurrency.worldMinute);
+            agent.beliefs = (agent.beliefs || []).filter((belief) => !(belief.subjectType === 'business'
+              && ['business_outcome','service_experience'].includes(belief.beliefKey)));
+          }
           if (agent.status === 'idle') {
             let nextCivilizationAt = agent.nextCivilizationReviewWorldMinutes;
             if (nextCivilizationAt === null || nextCivilizationAt === undefined) {
@@ -2417,6 +2557,10 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
               businessContext = { ...initiativeContext, ...marketView,
                 residentsAtLocation, demand: marketView.demand };
             }
+            if (agent.genesisCurrencyActive) businessContext = { ...businessContext,
+              genesisCurrencyActive: true, genesisCurrency: agent.genesisCurrency,
+              genesisWallets: initiativeState?.economy?.genesisWallets || {},
+              genesisInvestments: initiativeState?.economy?.genesisInvestments || [] };
             const businessCandidates = strategicDue ? buildBusinessCandidates(agent, businessContext) : [];
             const initiativeCandidates = strategicDue
               ? [...buildWorldInitiativeCandidates(agent, initiativeContext), ...businessCandidates, ...capabilityCandidates] : [];
@@ -2565,14 +2709,22 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
               const economicOutcome = businessBeliefs.length ? businessBeliefs.reduce((sum, belief) =>
                 sum + Number(belief.estimate || 0) * Number(belief.confidence || 0), 0) / businessBeliefs.length : 0;
               flyObservation = { self: { agentId: agent.agentId, energy: agent.energy, food: agent.food, social: agent.social,
-                  riskTolerance: agent.riskTolerance, usdc: agent.usdc, knowledge: agent.knowledge },
+                  riskTolerance: agent.riskTolerance, knowledge: agent.knowledge,
+                  ...(agent.genesisCurrencyActive ? { genesisToken: { tokenId: agent.genesisCurrency.tokenId,
+                    symbol: agent.genesisCurrency.symbol, spendableRaw: agent.genesisTokenSpendableRaw,
+                    observedAt: agent.genesisTokenObservedAt, authority: 'arc_chain' } } : { usdc: agent.usdc }) },
                 mind: { archetype: agent.archetype || 'observer', traits: { ...safeJson(agent.traits),
                     curiosity: agent.curiosity, craft: finite(agent.skills?.engineering) / 100 },
                   actionsTaken: agent.actions_taken, memories: agent.recentMemories,
                   goals: agent.goals, beliefs: agent.beliefs, relationships: agent.relationships,
                   skills: agent.skills, economic: { outcome: economicOutcome,
                     marketOpportunity: marketBeliefs.reduce((sum, belief) => sum + Math.max(0, Number(belief.estimate) || 0), 0)
-                      / Math.max(1, marketBeliefs.length), capital: agent.usdc,
+                      / Math.max(1, marketBeliefs.length),
+                    ...(agent.genesisCurrencyActive ? { currency: { tokenId: agent.genesisCurrency.tokenId,
+                      tokenAddress: agent.genesisCurrency.tokenAddress, symbol: agent.genesisCurrency.symbol,
+                      decimals: Number(agent.genesisCurrency.decimals), spendableRaw: agent.genesisTokenSpendableRaw,
+                      observedBlock: agent.genesisTokenWallet?.observedBlock ?? null,
+                      authority: 'arc_chain' } } : { capital: agent.usdc }),
                     recentExperience: agent.recentMemories.filter((memory) => memory.memoryType === 'business'
                       || memory.memoryType === 'economic').length },
                   personality: { ...agent.personalityModifiers, sociability: agent.sociability, curiosity: agent.curiosity,
@@ -2681,7 +2833,8 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
               'organizationId','organizationProposal','inviteeAgentId','shareId','informationProposal','contributionType',
               'businessProposal','cofounderProposal','preparationSkill','preparationServiceType',
               'marketObservationServiceType','reopenProposal',
-              'businessId','serviceId','jobId','applicationId','maxPriceUsdc','amountUsdc','fundingSource',
+              'businessId','serviceId','jobId','applicationId','employmentId','maxPriceUsdc','maxPriceRaw',
+              'priceRaw','wageRaw','amountUsdc','fundingSource',
               'direction','contributionAmountUsdc','employmentId','pricingContext','counterpartyAgentId','agreementType',
               'contractAgreementId',
               'agreementTerms','agreementId','counterTerms','expiresInWorldMinutes','parentAgreementId','commitmentId','outcome',

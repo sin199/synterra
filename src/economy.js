@@ -1,3 +1,5 @@
+import { isGenesisCurrencyActive } from './genesis-economy.js';
+
 export const DEFAULT_MEAL_COST_UNITS = '2';
 const UNIT_SCALE = 100_000_000n;
 const MAX_CONFIGURED_UNITS = 1_000_000n * UNIT_SCALE;
@@ -14,7 +16,6 @@ export function parsePositiveUnitAmount(value, fallback = DEFAULT_MEAL_COST_UNIT
   }
   return `${whole}.${fraction.padEnd(8, '0')}`;
 }
-
 export const MEAL_COST_UNITS = parsePositiveUnitAmount(process.env.WORLD_MEAL_COST_UNITS);
 
 function scaledNonNegativeAmount(value) {
@@ -31,6 +32,9 @@ export function canAffordUnits(balance, cost = MEAL_COST_UNITS) {
 }
 
 export async function chargeMeal(client, { worldId, agentId, actionId }) {
+  if (await isGenesisCurrencyActive(client, worldId)) {
+    throw Object.assign(new Error('LEGACY_INTERNAL_TOKEN_ECONOMY_RETIRED'), { statusCode: 409 });
+  }
   const balanceResult = await client.query(`SELECT COALESCE(sum(amount),0)::numeric AS units,
       COALESCE(sum(amount),0)::numeric >= $3::numeric AS can_spend
     FROM token_ledger WHERE world_id=$1 AND agent_id=$2`, [worldId, agentId, MEAL_COST_UNITS]);

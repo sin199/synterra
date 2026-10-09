@@ -8,21 +8,24 @@ function incompatible(detail) {
   return error;
 }
 
-// Object-level requirements mirror 0003; these checks never grant privileges.
+// Object-level requirements mirror the numbered migrations; these checks never grant privileges.
 const issuanceWrites = {
   'INSERT,UPDATE': ['arc_currency_genesis_requirements', 'arc_token_pilot_capabilities',
     'arc_token_issuance_intents', 'arc_token_issuance_responses', 'arc_token_issuance_issuer_candidates',
     'arc_agent_tokens', 'arc_agent_token_responses', 'arc_mainnet_pilot_cost_reservations',
     'arc_infrastructure_nonce_cursors', 'arc_infrastructure_nonce_reservations'],
-  INSERT: ['arc_token_issuance_decisions', 'arc_agent_token_uses'],
+  INSERT: ['arc_token_issuance_decisions', 'arc_agent_token_uses', 'world_infrastructure_usage_events'],
   UPDATE: ['arc_mainnet_pilot_budget']
 };
 
 const coreWrites = {
   'INSERT,UPDATE': ['world_runtime_state', 'world_agent_states', 'world_social_profiles',
-    'world_agent_goals', 'world_agent_self_models', 'world_agent_decision_policies', 'world_epochs', 'agent_memories'],
+    'world_agent_goals', 'world_agent_self_models', 'world_agent_decision_policies', 'world_epochs', 'agent_memories',
+    'world_genesis_token_balance_snapshots', 'world_business_service_token_terms', 'world_business_job_token_terms',
+    'arc_genesis_token_settlement_outbox', 'world_genesis_token_business_orders'],
   INSERT: ['world_events', 'world_history', 'world_decision_traces', 'world_v7_events',
-    'world_capability_events', 'world_agent_self_model_history'],
+    'world_capability_events', 'world_agent_self_model_history', 'world_genesis_currency_activations',
+    'world_infrastructure_usage_events'],
   DELETE: ['agent_memories', 'world_decision_traces']
 };
 
@@ -36,11 +39,18 @@ export async function prepareStartupSchema(pool, { rootDirectory, mode = 'apply'
 
   const migrations = await readWorldMigrationPlan(rootDirectory);
   const requiredMigrations = ['0001_arc_mainnet.sql', '0002_world_environment.sql',
-    '0002_arc_agent_token_issuance.sql', '0003_arc_agent_token_issuance_runtime_privileges.sql'];
+    '0002_arc_agent_token_issuance.sql', '0003_arc_agent_token_issuance_runtime_privileges.sql',
+    '0004_genesis_token_economy.sql'];
   for (const name of requiredMigrations) {
     if (!migrations.some((migration) => migration.name === name)) throw incompatible(`missing migration source ${name}`);
   }
   const contract = JSON.parse(await readFile(path.join(rootDirectory, 'src/runtime-schema-contract.json'), 'utf8'));
+  for (const [table, expected] of Object.entries(contract)) {
+    if (!expected || !expected.columns || !expected.constraints
+        || !Array.isArray(expected.notNullColumns) || !expected.uniqueIndexes) {
+      throw incompatible(`invalid runtime schema contract for ${table}`);
+    }
+  }
   // Read source names only. No SQL from schema.sql or a migration is executed in validate mode.
   const schema = await readFile(path.join(rootDirectory, 'schema.sql'), 'utf8');
   const tables = [...new Set([...schema.matchAll(/CREATE TABLE IF NOT EXISTS ([a-z_][a-z0-9_]*)/g)]

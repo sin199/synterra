@@ -125,6 +125,18 @@ function shown(value, suffix = '') {
   return `${Number.isFinite(number) && String(value).trim() !== '' ? number.toLocaleString('en-US', { maximumFractionDigits: 2 }) : value}${suffix}`;
 }
 
+function formatTokenRaw(raw, decimals) {
+  if (raw === undefined || raw === null || !/^\d+$/.test(String(raw))) return 'unavailable';
+  const places = Number(decimals);
+  if (!Number.isInteger(places) || places < 0 || places > 36) return 'unavailable';
+  const value = BigInt(raw);
+  if (!places) return value.toString();
+  const scale = 10n ** BigInt(places);
+  const whole = value / scale;
+  const fraction = (value % scale).toString().padStart(places, '0').replace(/0+$/, '');
+  return fraction ? `${whole}.${fraction}` : whole.toString();
+}
+
 function setText(element, value) {
   if (element) element.textContent = value;
 }
@@ -373,10 +385,11 @@ function renderAgentPanel(agent, detail = selectedResidentDetail) {
   card.append(facts);
 
   const economy = detail?.economy;
+  const genesisCurrency = economy?.currency;
   const economicSection = document.createElement('section');
   economicSection.className = 'agent-social-section';
   const economicHeading = document.createElement('h4');
-  economicHeading.textContent = 'Simulated economy & ownership';
+  economicHeading.textContent = genesisCurrency ? 'Genesis token economy & ownership' : 'Simulated economy & ownership';
   const economicList = document.createElement('ul');
   economicList.className = 'agent-memory-list';
   if (!economy) {
@@ -385,7 +398,23 @@ function renderAgentPanel(agent, detail = selectedResidentDetail) {
     item.textContent = 'Loading economic ledger…';
     economicList.append(item);
   } else {
-    const entries = [
+    const entries = genesisCurrency ? [
+      `Token ${genesisCurrency.symbol} · Arc chain ${genesisCurrency.chainId} · ownership authority: Arc`,
+      ...(economy.balances || []).map((asset) => asset.balanceRaw === null
+        ? `${asset.symbol} wallet balance unavailable · active assets remain chain-authoritative`
+        : `${formatTokenRaw(asset.balanceRaw, asset.decimals)} ${asset.symbol} · spendable ${formatTokenRaw(asset.spendableRaw, asset.decimals)} · Arc snapshot block ${asset.observedBlock || 'unavailable'}`),
+      ...(economy.employment || []).map((job) => job.wageTokenId === genesisCurrency.tokenId && job.wageRaw
+        ? `Current employment ${job.businessName} · ${job.role} · ${formatTokenRaw(job.wageRaw, genesisCurrency.decimals)} ${genesisCurrency.symbol}/shift`
+          + (job.pendingTokenWageRaw ? ` · owner offered ${formatTokenRaw(job.pendingTokenWageRaw, genesisCurrency.decimals)} ${genesisCurrency.symbol}; awaiting resident choice` : '')
+        : `Current employment ${job.businessName} · ${job.role} · wage authority unavailable`),
+      ...(economy.legacyEmployment || []).map((job) => job.pendingTokenWageRaw
+        ? `Historical employment record ${job.businessName} · ${job.role} · old USDC wage is historical; owner offered ${formatTokenRaw(job.pendingTokenWageRaw, genesisCurrency.decimals)} ${genesisCurrency.symbol}, awaiting resident choice`
+        : `Historical employment record ${job.businessName} · ${job.role} · old USDC wage is historical; awaiting owner-set TOKEN wage`),
+      ...(economy.ownership || []).map((holding) => `Arc-confirmed business equity · ${holding.name} · ${Math.round(Number(holding.share) * 10000) / 100}%`),
+      ...(economy.pendingObligations || []).map((obligation) => `Pending Arc settlement · business equity at ${obligation.businessName} · no equity authority until confirmation`),
+      ...(economy.recentTransactions || []).slice(0, 5).map((tx) => `Arc settlement ${tx.status} · ${formatTokenRaw(tx.amountRaw, genesisCurrency.decimals)} ${genesisCurrency.symbol} · ${tx.transactionHash || 'transaction not finalized'}`),
+      'Pre-genesis simulated balances, paper positions, and USDC records are preserved as historical records only.'
+    ] : [
       `Simulated net worth $${Number(economy.netWorthUsd || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
       `Balances ${(economy.balances || []).map((row) => `${row.asset} ${row.balance}`).join(' · ') || 'No economic accounts yet'}`,
       ...(economy.employment || []).map((job) => `Employed ${job.businessName} · ${job.role} · ${job.wageUsdc} USDC/shift`),
@@ -774,6 +803,8 @@ function renderWorldEvolution() {
   const evolution = latestMapData?.worldEvolution;
   if (!evolution) return;
   const dashboard = evolution.dashboard || {};
+  const economy = evolution.economy || {};
+  const genesisEconomy = economy.era === 'genesis_token';
   const recovery = evolution.economy?.recovery || {};
   const v6Lifecycle = evolution.v6Lifecycle || {};
   const arc = evolution.arcMainnet || {};
@@ -787,14 +818,20 @@ function renderWorldEvolution() {
     ['Active projects', displayCount(dashboard.activeProjects)], ['Organizations', displayCount(dashboard.organizations)],
     ['Open opportunities', displayCount(dashboard.activeOpportunities)], ['Completed projects', displayCount(dashboard.completedProjects)],
     ['World age', `${displayCount(dashboard.worldAgeDays)} days`],
-    ['Simulated wealth', `$${Number(dashboard.totalSimulatedWealthUsd || 0).toLocaleString('en-US', { maximumFractionDigits: 2 })}`],
-    ['Internal units (net)', Number(dashboard.totalInternalUnits || 0).toLocaleString('en-US', { maximumFractionDigits: 2 })],
-    ['Resident USDC in circulation', `${Number(evolution.economy?.dashboard?.usdc_circulation || 0).toLocaleString('en-US', { maximumFractionDigits: 2 })} USDC`],
-    ['Active businesses', displayCount(evolution.economy?.dashboard?.active_businesses)],
-    ['Employment', displayCount(evolution.economy?.dashboard?.employment_count)],
-    ['Business revenue (total)', `${Number(evolution.economy?.dashboard?.business_revenue || 0).toLocaleString('en-US', { maximumFractionDigits: 2 })} USDC`],
-    ['Business P&L', `${Number(evolution.economy?.dashboard?.business_profit_loss || 0).toLocaleString('en-US', { maximumFractionDigits: 2 })} USDC`],
-    ['Simulated investment', `${Number(evolution.economy?.dashboard?.investment_volume || 0).toLocaleString('en-US', { maximumFractionDigits: 2 })} USDC`],
+    ...(genesisEconomy ? [
+      ['Economic era', `${economy.currency?.symbol || 'Genesis Token'} · Arc-authoritative balances`],
+      ['Wallet snapshots', displayCount((economy.wallets || []).filter((wallet) => wallet.balanceSource === 'arc_chain_snapshot').length)],
+      ['Legacy simulated economy', 'Historical records only']
+    ] : [
+      ['Simulated wealth', `$${Number(dashboard.totalSimulatedWealthUsd || 0).toLocaleString('en-US', { maximumFractionDigits: 2 })}`],
+      ['Internal units (net)', Number(dashboard.totalInternalUnits || 0).toLocaleString('en-US', { maximumFractionDigits: 2 })],
+      ['Resident USDC in circulation', `${Number(economy.dashboard?.usdc_circulation || 0).toLocaleString('en-US', { maximumFractionDigits: 2 })} USDC`],
+      ['Active businesses', displayCount(economy.dashboard?.active_businesses)],
+      ['Employment', displayCount(economy.dashboard?.employment_count)],
+      ['Business revenue (total)', `${Number(economy.dashboard?.business_revenue || 0).toLocaleString('en-US', { maximumFractionDigits: 2 })} USDC`],
+      ['Business P&L', `${Number(economy.dashboard?.business_profit_loss || 0).toLocaleString('en-US', { maximumFractionDigits: 2 })} USDC`],
+      ['Simulated investment', `${Number(economy.dashboard?.investment_volume || 0).toLocaleString('en-US', { maximumFractionDigits: 2 })} USDC`]
+    ]),
     ['Active supply (stock units)', displayCount(recovery.activeSupply)],
     ['Persistent unmet demand', displayCount(recovery.persistentUnmetDemand)],
     ['Recovery candidates (7d)', displayCount(recovery.recoveryCandidates)],
@@ -1128,10 +1165,20 @@ function renderWorldEvolution() {
     capability_deprecated: 'Deprecated capability', capability_revision_created: 'Created revision' };
   renderEvolutionList(capabilityEventList, capabilityWorld.recentEvents || [], 'No innovation events yet.', (item) =>
     `${capabilityEventLabels[item.eventType] || item.eventType} · world minute ${displayCount(item.worldMinute)}${item.details?.name ? ` · ${item.details.name}` : ''}`);
-  renderEvolutionList(businessList, evolution.economy?.businesses, 'Residents have not founded any businesses yet.', (item) => {
-    const services = (item.services || []).map((service) => `${service.name} · ${service.stockUnits} in stock`).join('; ');
+  renderEvolutionList(businessList, economy.businesses, 'Residents have not founded any businesses yet.', (item) => {
+    const services = (item.services || []).map((service) => `${service.name} · ${service.stockUnits} in stock`
+      + (genesisEconomy ? ` · ${service.tokenId === economy.currency?.tokenId && service.tokenPriceHuman
+        ? `${service.tokenPriceHuman} ${service.tokenPriceSymbol}` : 'unpriced in Genesis Token'}` : '')).join('; ');
+    const jobs = (item.jobs || []).map((job) => `${job.role} · ${job.tokenId === economy.currency?.tokenId && job.wageHuman
+      ? `${job.wageHuman} ${job.wageSymbol}` : genesisEconomy ? 'TOKEN wage not published' : `${shown(job.wageUsdc)} USDC`}`).join('; ');
     const workers = (item.workers || []).length;
-    const activeAgreements = (item.agreements || []).filter((agreement) => agreement.status === 'active').length;
+    const activeAgreements = (item.agreements || []).filter((agreement) => agreement.status === 'active'
+      && (!genesisEconomy || agreement.legacySimulatedEconomy !== 'historical_only')).length;
+    const historicalWorkers = (item.historicalEmployment || []).length;
+    if (genesisEconomy) return `${item.status || 'unknown'} · ${workers} Token-wage workers`
+      + `${historicalWorkers ? ` · ${historicalWorkers} historical employment records awaiting Token terms` : ''}`
+      + ` · ${activeAgreements} current agreements`
+      + `${services ? ` · ${services}` : ''}${jobs ? ` · ${jobs}` : ''}`;
     return `${item.status || 'unknown'} · cash ${shown(item.cashBalance, ' USDC')} · revenue ${shown(item.revenue)} · P&L ${shown(item.profitLoss)} · ${workers} employees · ${activeAgreements} active agreements${services ? ` · ${services}` : ''}`;
   });
   const serviceLabels = { research_service: 'Research services', engineering_service: 'Engineering services', social_service: 'Social services',

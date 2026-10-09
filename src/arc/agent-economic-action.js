@@ -49,6 +49,11 @@ export async function enqueueArcAgentEconomicAction(client, input) {
   if (!Number.isSafeInteger(Number(input.worldMinute)) || Number(input.worldMinute) < 0) {
     throw new TypeError('worldMinute must be a non-negative safe integer.');
   }
+  const genesisActivation = await client.query(`SELECT 1 FROM world_genesis_currency_activations
+    WHERE world_id=$1`, [worldId]);
+  if (genesisActivation.rowCount) {
+    return { outbox: null, created: false, skipped: true, reason: 'GENESIS_CURRENCY_ACTIVE' };
+  }
   const simulatedAmountUsdc = amountString(input.simulatedAmountUsdc);
   const actionFamily = ARC_AGENT_SERVICE_ACTION_FAMILY;
   const reason = `Autonomous resident service purchase ${String(input.orderId || input.worldActionId).slice(0, 120)}.`;

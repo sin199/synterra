@@ -508,6 +508,17 @@ export class ArcAgentTokenIssuanceWorker {
     const gasUsed = BigInt(receipt.gasUsed).toString();
     const effectiveGasPrice = BigInt(receipt.effectiveGasPrice).toString();
     return withTransaction(this.#pool, async (client) => {
+      let genesisAssignment = null;
+      if (event.capabilityGeneration === 1) {
+        const assignment = await client.query(`SELECT issuer_agent_id,selection_source
+          FROM world_genesis_issuer_assignments WHERE world_id=$1 AND capability_generation=1 FOR SHARE`, [this.#worldId]);
+        genesisAssignment = assignment.rows[0] || null;
+        if (!genesisAssignment || genesisAssignment.issuer_agent_id !== row.issuer_agent_id
+            || genesisAssignment.selection_source !== row.issuer_selection_source
+            || genesisAssignment.selection_source !== 'creator_genesis_assignment') {
+          throw coded('CURRENCY_GENESIS_ISSUER_PROVENANCE_MISMATCH');
+        }
+      }
       const insertion = await client.query(`INSERT INTO arc_agent_tokens(world_id,intent_id,capability_generation,
           creation_sequence,chain_id,token_address,name,symbol,decimals,initial_supply_raw,reserve_supply_raw,
           issuer_agent_id,issuer_identity_id,issuer_wallet,transaction_sender,specification_hash,transaction_hash,
@@ -564,6 +575,35 @@ export class ArcAgentTokenIssuanceWorker {
             throw coded('CURRENCY_GENESIS_RECONCILIATION_STATE_MISMATCH');
           }
         }
+        const activation = await client.query(`INSERT INTO world_genesis_currency_activations(world_id,
+            capability_generation,token_id,chain_id,issuer_agent_id,issuer_selection_source,transaction_hash,
+            block_number,world_minute,creator_allocation_raw)
+          VALUES($1,1,$2,$3,$4,'creator_genesis_assignment',$5,$6,$7,0)
+          ON CONFLICT(world_id) DO NOTHING RETURNING token_id`,
+        [this.#worldId, token.id, ARC_MAINNET_CHAIN_ID, row.issuer_agent_id, receiptHash, blockNumber, event.worldMinute]);
+        if (!activation.rowCount) {
+          const existingActivation = await client.query(`SELECT token_id,issuer_agent_id,issuer_selection_source,
+              transaction_hash,block_number::text AS block_number,creator_allocation_raw::text AS creator_allocation_raw
+            FROM world_genesis_currency_activations WHERE world_id=$1`, [this.#worldId]);
+          const savedActivation = existingActivation.rows[0];
+          if (!savedActivation || savedActivation.token_id !== token.id
+              || savedActivation.issuer_agent_id !== row.issuer_agent_id
+              || savedActivation.issuer_selection_source !== 'creator_genesis_assignment'
+              || savedActivation.transaction_hash.toLowerCase() !== receiptHash
+              || String(savedActivation.block_number) !== blockNumber
+              || String(savedActivation.creator_allocation_raw) !== '0') {
+            throw coded('GENESIS_CURRENCY_ACTIVATION_IDEMPOTENCY_CONFLICT');
+          }
+        }
+        await writeWorldHistory(client, { worldId: this.#worldId,
+          eventKey: `genesis-currency-activated:${token.id}`, eventType: 'genesis_currency_activated',
+          actorAgentId: null, entityType: 'genesis_currency', entityId: token.id,
+          worldTime: event.worldMinute, title: 'GENESIS_CURRENCY_ACTIVATED',
+          detail: 'The Agent-authored Genesis Token was confirmed on Arc Mainnet, its issuance was reconciled, and the world economy crossed into the token era.',
+          metadata: { semanticEvent: 'GENESIS_CURRENCY_ACTIVATED', tokenId: token.id,
+            tokenAddress: event.tokenAddress, chainId: ARC_MAINNET_CHAIN_ID, transactionHash: receiptHash,
+            blockNumber, specificationHash: row.specification_hash, issuerAgentId: row.issuer_agent_id,
+            issuerSelectionSource: genesisAssignment.selection_source, creatorAllocationRaw: '0' } });
       }
       await markArcInfrastructureNonce(client, { operationType: 'token_creation',
         operationId: String(row.id), status: 'reconciled', transactionHash: receiptHash });

@@ -1,4 +1,4 @@
-import { choice, TypeSafeClient } from '@typesafe-ai/sdk';
+import { APIConnectionError, APIError, APITimeoutError, choice, TypeSafeClient } from '@typesafe-ai/sdk';
 import { saveState } from './client.js';
 import { skillProfile, WORLD_SKILLS } from './skills.js';
 import { safeInboxForTypeSafe } from './messaging.js';
@@ -12,6 +12,27 @@ const INPUT_PRICE_PER_TOKEN_USD = 0.042 / 1_000_000;
 const MAX_REQUEST_RESERVATION_TOKENS = 32_000;
 const MAX_STATE_BYTES = 24_000;
 let client;
+
+function currencyReviewFailure(request, outcome, reasonCode, { model = MODEL, confidence = null,
+  providerAttempted = false, inputTokens = null, estimatedCostUsd = null } = {}) {
+  if (request?.choiceType !== 'currency_genesis') return null;
+  return { currencyReviewDiagnostic: { outcome, reasonCode, provider: 'typesafe', model,
+    confidence: Number.isFinite(confidence) ? confidence : null, providerAttempted,
+    inputTokens: Number.isSafeInteger(inputTokens) && inputTokens >= 0 ? inputTokens : null,
+    estimatedCostUsd: Number.isFinite(estimatedCostUsd) && estimatedCostUsd >= 0 ? estimatedCostUsd : null } };
+}
+
+function currencyReviewProviderError(error) {
+  if (error instanceof APITimeoutError || /timeout/i.test(String(error?.name || ''))
+      || ['ETIMEDOUT', 'ESOCKETTIMEDOUT', 'ABORT_ERR'].includes(String(error?.code || '').toUpperCase())) {
+    return { outcome: 'provider_timeout', reasonCode: 'provider_request_timeout' };
+  }
+  if (error instanceof APIConnectionError || (error instanceof APIError
+      && (error.status === 429 || error.status >= 500))) {
+    return { outcome: 'provider_unavailable', reasonCode: 'provider_connection_unavailable' };
+  }
+  return { outcome: 'provider_error', reasonCode: 'provider_request_error' };
+}
 
 function monthKey() {
   return new Date().toISOString().slice(0, 7);
@@ -131,8 +152,10 @@ export async function chooseWithTypeSafe(observation, candidates, runtimeState, 
 // civilization options. TypeSafe selects an offered option; it never emits or
 // executes code, and resident-written proposal text is evidence, not authority.
 export async function chooseCivilizationOption(request, runtimeState) {
-  if (!process.env.TYPESAFE_API_KEY) return null;
-  if (!request || !Array.isArray(request.options) || request.options.length < 2) return null;
+  if (!process.env.TYPESAFE_API_KEY) return currencyReviewFailure(request, 'provider_unavailable', 'missing_api_key');
+  if (!request || !Array.isArray(request.options) || request.options.length < 2) {
+    return currencyReviewFailure(request, 'no_valid_decision', 'insufficient_review_options');
+  }
   const state = {
     world: { worldId: request.worldId, worldMinute: request.worldMinute, decisionType: request.choiceType },
     resident: {
@@ -148,13 +171,17 @@ export async function chooseCivilizationOption(request, runtimeState) {
     options: request.options.map(({ id, label, description, specification }) => ({ id, label, description,
       ...(specification ? { declarativeSpecification: specification } : {}) }))
   };
-  if (Buffer.byteLength(JSON.stringify(state), 'utf8') > MAX_STATE_BYTES) return null;
+  if (Buffer.byteLength(JSON.stringify(state), 'utf8') > MAX_STATE_BYTES) {
+    return currencyReviewFailure(request, 'no_valid_decision', 'review_input_too_large');
+  }
   const reservation = await startReservation(runtimeState);
-  if (!reservation) return null;
+  if (!reservation) return currencyReviewFailure(request, 'provider_unavailable', 'monthly_budget_reached');
+  let providerRequestStarted = false;
   try {
     client ||= new TypeSafeClient();
     const criteria = Object.fromEntries(request.options.map((option) => [String(option.id),
       { label: String(option.label || option.id), description: String(option.description || '').slice(0, 600) }]));
+    providerRequestStarted = true;
     const response = await client.systemOne({
       model: MODEL,
       state,
@@ -167,13 +194,26 @@ export async function chooseCivilizationOption(request, runtimeState) {
     }, { retry: { maxRetries: 0 }, timeout: 10_000 });
     const usage = await settleReservation(runtimeState, reservation, response?.usage?.input_tokens);
     const answer = response?.answers?.civilization_choice;
-    const selected = request.options.find((option) => String(option.id) === answer?.choice);
+    if (!answer || typeof answer !== 'object' || typeof answer.choice !== 'string') {
+      return currencyReviewFailure(request, 'malformed_output', 'choice_answer_missing',
+        { model: response?.model || MODEL, ...usage, providerAttempted: true });
+    }
+    const selected = request.options.find((option) => String(option.id) === answer.choice);
+    if (!selected) return currencyReviewFailure(request, 'invalid_choice', 'choice_not_offered',
+      { model: response?.model || MODEL, ...usage, providerAttempted: true });
     const confidence = Number(answer?.confidence);
-    if (!selected || !Number.isFinite(confidence) || confidence < MIN_CONFIDENCE) return null;
-    return { choice: selected, confidence, ...usage, model: response?.model || MODEL };
-  } catch {
+    if (!Number.isFinite(confidence)) return currencyReviewFailure(request, 'malformed_output',
+      'confidence_missing_or_invalid', { model: response?.model || MODEL, ...usage, providerAttempted: true });
+    if (confidence < MIN_CONFIDENCE) return currencyReviewFailure(request, 'low_confidence',
+      'confidence_below_existing_threshold', { model: response?.model || MODEL, confidence, ...usage,
+        providerAttempted: true });
+    return { choice: selected, confidence, ...usage, model: response?.model || MODEL, provider: 'typesafe',
+      providerAttempted: true };
+  } catch (error) {
     await settleReservation(runtimeState, reservation, null);
-    return null;
+    const diagnostic = currencyReviewProviderError(error);
+    return currencyReviewFailure(request, diagnostic.outcome, diagnostic.reasonCode,
+      { providerAttempted: providerRequestStarted });
   }
 }
 

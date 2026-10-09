@@ -411,7 +411,8 @@ export function buildWorldInitiativeCandidates(agent, context = {}) {
   return options;
 }
 
-export function environmentOpportunityIdeas({ residents = [], scenes = [], worldMinutes = 0, projects = [], opportunities = [] } = {}) {
+export function environmentOpportunityIdeas({ residents = [], scenes = [], worldMinutes = 0, projects = [],
+  opportunities = [], genesisCurrencyActive = false } = {}) {
   const result = [];
   const activeProjects = new Set(projects.filter((project) => ['recruiting','proposed','active'].includes(project.status))
     .map((project) => project.project_type));
@@ -421,7 +422,8 @@ export function environmentOpportunityIdeas({ residents = [], scenes = [], world
     + opportunities.filter((item) => ['open','active'].includes(item.status)
       && ['RESEARCH','LEARNING'].includes(item.opportunity_type)).length;
   const researchShortage = researchDemand >= 2 && researchSupply < researchDemand;
-  const incomeDemand = residents.filter((resident) => Number(resident.usdc || 0) < 100).length;
+  const incomeDemand = genesisCurrencyActive ? 0
+    : residents.filter((resident) => Number(resident.usdc || 0) < 100).length;
   const incomeSupply = opportunities.filter((item) => ['open','active'].includes(item.status)
     && ['WORK','INCOME'].includes(item.opportunity_type)).length;
   const incomeShortage = incomeDemand >= 2 && incomeSupply < incomeDemand;

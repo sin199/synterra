@@ -22,6 +22,7 @@ import { ArcRpcClient } from './arc/rpc.js';
 import { enqueueArcAgentEconomicAction } from './arc/agent-economic-action.js';
 import { loadConfiguredArcInfrastructureSigner, loadConfiguredArcSigner } from './arc/signer-loader.js';
 import { startArcSettlementOutboxWorker } from './arc/settlement-worker.js';
+import { startArcGenesisTokenSettlementReconciler } from './arc/genesis-token-settlement-reconciler.js';
 import { startArcAgentTokenIssuanceWorker } from './arc/token-issuance-worker.js';
 import { startArcReadOnlyObserver } from './arc/observer.js';
 import { summarizeArcObserverHealth } from './arc/status.js';
@@ -42,14 +43,21 @@ import { createWorldCapabilityProposal, readWorldCapabilitySummary, reviewWorldC
 import { readV6LifecycleObserverState, readWorldV6Lifecycle, startV6LifecycleObserver,
   safeV6LifecycleObserverError, unavailableV6LifecycleObserverStatus } from './world-v6-lifecycle-observer.js';
 import { createWorldCommitment, listWorldAgreements, listWorldInstitutionSummary, proposeOrganizationGovernance,
-  proposeWorldAgreement, resolveWorldCommitment, respondToWorldAgreement, voteOrganizationProposal } from './world-institutions.js';
+  proposeWorldAgreement, proposeGenesisTokenBusinessInvestment, resolveWorldCommitment,
+  respondToWorldAgreement, voteOrganizationProposal } from './world-institutions.js';
 import { closeWorldBusiness, distributeWorldBusinessProfit, distributeWorldProjectRevenue,
   economicDashboardSql, foundWorldBusiness, investInWorldBusiness, investInWorldProject, listWorldBusinesses,
   loadWorldBusinessContext, observeWorldBusinessMarket, readEconomicRecoveryMetrics, reopenWorldBusiness,
   purchaseWorldBusinessService, reviewWorldBusinessPrice, completeWorldBusinessShift, applyToWorldBusinessJob,
   decideWorldBusinessApplication, leaveWorldBusinessJob, practiceWorldBusinessCapability,
-  withdrawWorldBusinessApplication } from './world-businesses.js';
+  withdrawWorldBusinessApplication, publishGenesisTokenServicePrice, publishGenesisTokenJobWage,
+  acceptGenesisTokenEmploymentWage } from './world-businesses.js';
 import { ensureEconomicAccount, ensureResidentEconomicAccounts, getEconomicAccount } from './economic-ledger.js';
+import { isGenesisCurrencyActive, readActiveGenesisTokenAssets, readGenesisBusinessEquity, readGenesisCurrencyActivation,
+  readGenesisTokenWalletSnapshots, readSpendableGenesisTokenBalance,
+  createArcGenesisTokenSettlementIntent } from './genesis-economy.js';
+import { prepareGenesisTokenSettlementAuthorization, readGenesisTokenSettlement,
+  recordGenesisTokenSettlementSubmission } from './arc/genesis-token-settlement-api.js';
 import { alignWorldValue, createCoordinationMechanism, createEmergentEntity, createGoalPrimitiveProposal, createObservationMethod,
   createPolicyExperiment, createWorldResourceType, decideObservationMethod, decideWorldResourceType, evaluateCoordinationExperiment,
   exposeWorldValue,
@@ -72,6 +80,7 @@ let arcSigner = null;
 let arcInfrastructureSigner = null;
 let arcSignerSetupError = null;
 let arcSettlementWorker = null;
+let arcGenesisTokenSettlementReconciler = null;
 let arcAgentTokenIssuanceWorker = null;
 let arcSchemaReady = false;
 let arcTokenSchemaReady = false;
@@ -302,6 +311,9 @@ app.get('/health', async () => {
       arcSettlementWorker: arcSettlementWorker?.getStatus() || { available: true, running: false,
         mode: 'mainnet_write_gated', providerName: arcSigner?.providerName || null,
         reason: arcSignerSetupError || 'mainnet_write_gate_closed' },
+      arcGenesisTokenSettlementReconciler: arcGenesisTokenSettlementReconciler?.getStatus() || {
+        available: arcTokenSchemaReady, running: false, mode: 'read_only_reconciliation',
+        reason: arcTokenSchemaReady ? 'worker_not_registered' : 'genesis_economy_migration_required' },
       arcAgentTokenIssuanceWorker: arcAgentTokenIssuanceWorker?.getStatus() || {
         available: arcTokenSchemaReady, running: false, mode: 'read_only_reconciliation',
         writesEnabled: false, reason: arcTokenSchemaReady ? 'worker_not_registered' : 'arc_token_issuance_migration_required' } };
@@ -317,6 +329,9 @@ app.get('/health', async () => {
       arcSettlementWorker: arcSettlementWorker?.getStatus() || { available: true, running: false,
         mode: 'mainnet_write_gated', providerName: arcSigner?.providerName || null,
         reason: arcSignerSetupError || 'mainnet_write_gate_closed' },
+      arcGenesisTokenSettlementReconciler: arcGenesisTokenSettlementReconciler?.getStatus() || {
+        available: arcTokenSchemaReady, running: false, mode: 'read_only_reconciliation',
+        reason: arcTokenSchemaReady ? 'worker_not_registered' : 'genesis_economy_migration_required' },
       arcAgentTokenIssuanceWorker: arcAgentTokenIssuanceWorker?.getStatus() || {
         available: arcTokenSchemaReady, running: false, mode: 'read_only_reconciliation',
         writesEnabled: false, reason: arcTokenSchemaReady ? 'worker_not_registered' : 'arc_token_issuance_migration_required' } };
@@ -343,6 +358,7 @@ app.get('/local/map-data', async (_request, reply) => {
     FROM worlds WHERE open=true ORDER BY created_at DESC LIMIT 1`);
   if (!world.rowCount) return { world: null, scenes: [], residents: [], events: [], dataCenterLogs: [], generatedAt: new Date().toISOString() };
   const worldId = world.rows[0].id;
+  const genesisCurrency = await readGenesisCurrencyActivation(pool, worldId);
   const [scenes, residents, events, dataCenterLogs, clock] = await Promise.all([
     pool.query(`SELECT s.id,s.name,s.scene_type AS "sceneType",s.status,s.description,s.purpose,s.capacity,s.features,s.position,
       s.created_world_minutes AS "createdWorldTime",s.created_by_project_id AS "createdByProjectId",
@@ -413,9 +429,9 @@ app.get('/local/map-data', async (_request, reply) => {
   const environment = enrichMapEnvironment({ worldSeed: worldId, worldMinutes, scenes: scenes.rows,
     residents: residents.rows, events: [...events.rows, ...dataCenterLogs.rows] });
   const emergence = await readEmergenceReport(pool, { worldId, worldMinutes });
-  const recoveryMetrics = await readEconomicRecoveryMetrics(pool, { worldId, worldMinutes });
+  const recoveryMetrics = genesisCurrency ? null : await readEconomicRecoveryMetrics(pool, { worldId, worldMinutes });
   const [economyDashboard, businesses, economicDemand, economyHistory] = await Promise.all([
-    pool.query(economicDashboardSql(), [worldId]),
+    genesisCurrency ? Promise.resolve({ rows: [{}] }) : pool.query(economicDashboardSql(), [worldId]),
     listWorldBusinesses(pool, { worldId, limit: 12 }),
     pool.query(`SELECT service_type AS "serviceType",demand_count AS "demandCount",
         supply_count AS "supplyCount",unmet_count AS "unmetCount"
@@ -453,7 +469,8 @@ app.get('/local/map-data', async (_request, reply) => {
     pool.query(`SELECT id,event_type AS "eventType",entity_type AS "entityType",entity_id AS "entityId",
         world_time AS "worldTime",title,detail,metadata
       FROM world_history WHERE world_id=$1 ORDER BY world_time DESC,id DESC LIMIT 8`, [worldId]),
-    pool.query('SELECT COALESCE(sum(amount),0)::text AS units FROM token_ledger WHERE world_id=$1', [worldId])
+    genesisCurrency ? Promise.resolve({ rows: [{ units: null }] })
+      : pool.query('SELECT COALESCE(sum(amount),0)::text AS units FROM token_ledger WHERE world_id=$1', [worldId])
   ]);
   const institutions = await listWorldInstitutionSummary(pool, { worldId, limit: 10 });
   const capabilities = await readWorldCapabilitySummary(pool, { worldId, limit: 30 });
@@ -472,10 +489,16 @@ app.get('/local/map-data', async (_request, reply) => {
   agentTokenIssuance.fixedHumanSupply = AGENT_TOKEN_HUMAN_SUPPLY;
   agentTokenIssuance.currentPilotLimit = AGENT_TOKEN_PILOT_MAX_CREATIONS;
   agentTokenIssuance.pilotGeneration = AGENT_TOKEN_PILOT_GENERATION;
-  const worldEvolution = { dashboard: { ...counts.rows[0], worldMinutes, worldAgeHours: Math.round(worldMinutes / 60),
+  const tokenWalletSnapshot = genesisCurrency ? await readGenesisTokenWalletSnapshots(pool, { worldId }) : null;
+  const dashboard = genesisCurrency
+    ? { ...counts.rows[0], worldMinutes, worldAgeHours: Math.round(worldMinutes / 60),
+      worldAgeDays: Math.floor(worldMinutes / 1_440) + 1,
+      currencyEra: 'genesis_token', legacySimulatedEconomy: 'historical_only' }
+    : { ...counts.rows[0], worldMinutes, worldAgeHours: Math.round(worldMinutes / 60),
       worldAgeDays: Math.floor(worldMinutes / 1_440) + 1,
       totalSimulatedWealthUsd: Number(economyDashboard.rows[0]?.total_resident_net_worth_usd || 0).toFixed(2),
-        totalInternalUnits: internalUnits.rows[0].units }, opportunities: opportunities.rows, projects,
+      totalInternalUnits: internalUnits.rows[0].units };
+  const worldEvolution = { dashboard, opportunities: opportunities.rows, projects,
     organizations, institutions, capabilities, v6Lifecycle, v6LifecycleObserver: v6LifecycleObserverStatus,
     arcMainnet: publicArcObserverStatus.arcMainnet,
     arcObserver: publicArcObserverStatus,
@@ -490,9 +513,17 @@ app.get('/local/map-data', async (_request, reply) => {
         running: false, mode: 'read_only_reconciliation', writesEnabled: false,
         reason: arcTokenSchemaReady ? 'worker_not_registered' : 'arc_token_issuance_migration_required' } },
     v7, history: history.rows };
-  worldEvolution.economy = { dashboard: economyDashboard.rows[0] || {}, businesses,
-    demand: economicDemand.rows, history: economyHistory.rows, recovery: recoveryMetrics,
-    settlement: 'simulated_internal_ledger', chainSettlementEnabled: false };
+  worldEvolution.economy = genesisCurrency
+    ? { era: 'genesis_token', currency: { tokenId: genesisCurrency.tokenId,
+      tokenAddress: genesisCurrency.tokenAddress, name: genesisCurrency.name,
+      symbol: genesisCurrency.symbol, decimals: Number(genesisCurrency.decimals),
+      chainId: Number(genesisCurrency.chainId), ownershipAuthority: 'arc_chain' },
+      wallets: tokenWalletSnapshot?.wallets || [], businesses, demand: economicDemand.rows,
+      historicalEconomy: 'preserved_read_only', settlement: 'agent_wallet_authorized_arc_outbox',
+      mainnetWriteGate: ARC_CONFIG.writesEnabled }
+    : { dashboard: economyDashboard.rows[0] || {}, businesses,
+      demand: economicDemand.rows, history: economyHistory.rows, recovery: recoveryMetrics,
+      settlement: 'simulated_internal_ledger', chainSettlementEnabled: false };
   worldEvolution.emergence = emergence;
   return { world: { ...world.rows[0], engine: clock || { running: false }, environment }, scenes: scenes.rows,
     residents: residents.rows, events: events.rows, dataCenterLogs: dataCenterLogs.rows,
@@ -749,12 +780,15 @@ app.post('/v1/worlds/:worldId/messages/:messageId/read', async (request, reply) 
 });
 
 async function refundBookingAndRecord(client, booking, status, actorId = booking.requester_id) {
+  const genesisCurrencyActive = await isGenesisCurrencyActive(client, booking.world_id);
   const changed = await client.query(`UPDATE adult_service_bookings SET status=$2,updated_at=now()
     WHERE id=$1 AND status IN ('pending','accepted') RETURNING *`, [booking.id, status]);
   if (!changed.rowCount) return changed.rows[0] || booking;
   const updated = changed.rows[0];
-  await refundAdultServiceFunds(client, updated);
-  const response = { bookingId: updated.id, status: updated.status, refundedUnits: updated.price_units };
+  if (!genesisCurrencyActive) await refundAdultServiceFunds(client, updated);
+  const response = genesisCurrencyActive
+    ? { bookingId: updated.id, status: updated.status, legacySimulatedEconomy: 'historical_only' }
+    : { bookingId: updated.id, status: updated.status, refundedUnits: updated.price_units };
   await client.query(`INSERT INTO world_events(world_id,actor_id,event_type,data,action_id)
     VALUES($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING`, [updated.world_id, actorId, `adult_service.${status}`, response, `adult-service:${updated.id}:${status}`]);
   return updated;
@@ -773,7 +807,8 @@ app.get('/v1/worlds/:worldId/observe', async (request, reply) => {
   const me = await pool.query(`SELECT m.*,w.name AS world_name,w.owner_agent_id,w.chain_id,w.token_address,w.token_name,w.token_symbol,w.token_status
     FROM world_members m JOIN worlds w ON w.id=m.world_id WHERE m.world_id=$1 AND m.agent_id=$2`, [worldId, request.agentId]);
   if (!me.rowCount) return fail(reply, 403, 'AGENT_NOT_IN_WORLD');
-  const [members, events, consents, balance, mines, scenes, mind, adultServices, adultServiceBookings] = await Promise.all([
+  const genesisCurrency = await readGenesisCurrencyActivation(pool, worldId);
+  const [members, events, consents, mines, scenes, mind, adultServices, adultServiceBookings] = await Promise.all([
     pool.query(`SELECT a.id,a.name,a.gender,m.role,m.energy,m.food,m.social,m.location
       FROM world_members m JOIN agents a ON a.id=m.agent_id WHERE m.world_id=$1 ORDER BY m.joined_at`, [worldId]),
     pool.query(`SELECT id,actor_id,event_type,data,created_at FROM world_events WHERE world_id=$1
@@ -783,7 +818,6 @@ app.get('/v1/worlds/:worldId/observe', async (request, reply) => {
       ORDER BY id DESC LIMIT 30`, [worldId, request.agentId]),
     pool.query(`SELECT id,requester_id,target_id,scope,status,created_at,expires_at FROM consents
       WHERE world_id=$1 AND (requester_id=$2 OR target_id=$2) AND status IN ('pending','accepted') ORDER BY created_at DESC LIMIT 30`, [worldId, request.agentId]),
-    pool.query('SELECT COALESCE(sum(amount),0)::text AS units FROM token_ledger WHERE world_id=$1 AND agent_id=$2', [worldId, request.agentId]),
     pool.query(`SELECT id,name,status,extracted_units,created_at FROM world_mines WHERE world_id=$1 ORDER BY created_at`, [worldId]),
     pool.query(`SELECT s.id,s.created_by AS "createdBy",a.name AS "creatorName",s.name,s.scene_type AS "sceneType",s.description,s.status,s.created_at AS "createdAt"
       FROM world_scenes s JOIN agents a ON a.id=s.created_by WHERE s.world_id=$1 ORDER BY s.created_at`, [worldId]),
@@ -799,20 +833,29 @@ app.get('/v1/worlds/:worldId/observe', async (request, reply) => {
         AND b.status IN ('pending','accepted') ORDER BY b.created_at DESC LIMIT 20`, [worldId, request.agentId])
   ]);
   const self = me.rows[0];
+  const [balance, activeAssets] = genesisCurrency
+    ? [null, await readActiveGenesisTokenAssets(pool, { worldId, ownerAgentId: request.agentId })]
+    : [await pool.query('SELECT COALESCE(sum(amount),0)::text AS units FROM token_ledger WHERE world_id=$1 AND agent_id=$2',
+      [worldId, request.agentId]), []];
   const tokenIssuanceIntents = arcTokenSchemaReady
     ? await listWorldTokenIssuance(pool, { worldId, limit: 30 }) : [];
   return {
     world: { id: worldId, name: self.world_name, ownerAgentId: self.owner_agent_id, chainId: self.chain_id,
       token: self.token_address ? { address: self.token_address, name: self.token_name, symbol: self.token_symbol, status: self.token_status } : null,
-      internalUnitsAreOnChain: false },
-    self: { agentId: request.agentId, role: self.role, energy: self.energy, food: self.food, social: self.social, location: self.location, internalTokenUnits: balance.rows[0].units },
+      internalUnitsAreOnChain: false, ...(genesisCurrency ? { currencyEra: 'genesis_token',
+        genesisCurrency: { tokenId: genesisCurrency.tokenId, tokenAddress: genesisCurrency.tokenAddress,
+          symbol: genesisCurrency.symbol, decimals: Number(genesisCurrency.decimals),
+          chainId: Number(genesisCurrency.chainId), ownershipAuthority: 'arc_chain' } } : {}) },
+    self: { agentId: request.agentId, role: self.role, energy: self.energy, food: self.food, social: self.social,
+      location: self.location, ...(genesisCurrency ? { activeAssets, legacySimulatedEconomy: 'historical_only' }
+        : { internalTokenUnits: balance.rows[0].units }) },
     members: members.rows, events: events.rows, consents: consents.rows, mines: mines.rows, scenes: scenes.rows, mind: mind.rows[0] || null,
     agentTokenIssuance: { available: arcTokenSchemaReady, mode: 'agent_decided', currentPilotLimit: AGENT_TOKEN_PILOT_MAX_CREATIONS,
       pilotGeneration: AGENT_TOKEN_PILOT_GENERATION, fixedHumanSupply: AGENT_TOKEN_HUMAN_SUPPLY,
       decimalsRange: [0, 18], writesEnabled: ARC_CONFIG.writesEnabled,
       intents: tokenIssuanceIntents },
-    adultServices: adultServices.rows,
-    adultServiceBookings: adultServiceBookings.rows
+    adultServices: genesisCurrency ? [] : adultServices.rows,
+    adultServiceBookings: genesisCurrency ? [] : adultServiceBookings.rows
   };
 });
 
@@ -820,6 +863,9 @@ app.get('/v1/worlds/:worldId/adult-services', async (request, reply) => {
   const { worldId } = request.params;
   if (!validUuid(worldId)) return fail(reply, 400, 'WORLD_ID_INVALID');
   await assertMember(pool, worldId, request.agentId);
+  if (await isGenesisCurrencyActive(pool, worldId)) {
+    return { currencyEra: 'genesis_token', legacySimulatedEconomy: 'historical_only', services: [] };
+  }
   const listings = await pool.query(`SELECT s.id,s.provider_id AS "providerId",a.name AS "providerName",s.title,s.description,
       s.price_units::text AS "priceUnits",s.created_at AS "createdAt"
     FROM adult_services s JOIN agents a ON a.id=s.provider_id
@@ -832,6 +878,7 @@ app.post('/v1/worlds/:worldId/adult-services', async (request, reply) => {
   const { actionId, title, description, priceUnits, active } = request.body || {};
   if (!validUuid(worldId) || !requiredString(title, 3, 64) || !requiredString(description, 12, 240) ||
       (active !== undefined && typeof active !== 'boolean')) return fail(reply, 400, 'ADULT_SERVICE_INVALID');
+  if (await isGenesisCurrencyActive(pool, worldId)) return fail(reply, 409, 'LEGACY_SIMULATED_ECONOMY_RETIRED');
   let price;
   try { price = parseAdultServicePrice(priceUnits); }
   catch { return fail(reply, 400, 'ADULT_SERVICE_PRICE_INVALID'); }
@@ -858,6 +905,7 @@ app.post('/v1/worlds/:worldId/adult-services', async (request, reply) => {
 app.post('/v1/worlds/:worldId/adult-services/:serviceId/bookings', async (request, reply) => {
   const { worldId, serviceId } = request.params;
   if (!validUuid(worldId) || !validUuid(serviceId)) return fail(reply, 400, 'ADULT_SERVICE_INVALID');
+  if (await isGenesisCurrencyActive(pool, worldId)) return fail(reply, 409, 'LEGACY_SIMULATED_ECONOMY_RETIRED');
   const actionId = requireActionId(request.body || {});
   const result = await transaction(async (client) => {
     await assertMember(client, worldId, request.agentId, true);
@@ -893,6 +941,9 @@ async function respondToAdultServiceBooking(bookingId, actorId, actionId, decisi
     const result = await client.query('SELECT * FROM adult_service_bookings WHERE id=$1 FOR UPDATE', [bookingId]);
     if (!result.rowCount) throw Object.assign(new Error('ADULT_SERVICE_BOOKING_NOT_FOUND'), { statusCode: 404 });
     const booking = result.rows[0];
+    if (await isGenesisCurrencyActive(client, booking.world_id)) {
+      throw Object.assign(new Error('LEGACY_SIMULATED_ECONOMY_RETIRED'), { statusCode: 409 });
+    }
     const prior = await client.query('SELECT data FROM world_events WHERE world_id=$1 AND actor_id=$2 AND action_id=$3', [booking.world_id, actorId, actionId]);
     if (prior.rowCount) return prior.rows[0].data;
 
@@ -961,8 +1012,16 @@ app.post('/v1/worlds/:worldId/actions', async (request, reply) => {
   const id = requireActionId({ actionId });
   const result = await transaction(async (client) => {
     const member = await assertMember(client, worldId, request.agentId, true);
+    const genesisCurrencyActive = await isGenesisCurrencyActive(client, worldId);
     const prior = await client.query('SELECT data FROM world_events WHERE world_id=$1 AND actor_id=$2 AND action_id=$3', [worldId, request.agentId, id]);
-    if (prior.rowCount) return prior.rows[0].data;
+    if (prior.rowCount) {
+      if (!genesisCurrencyActive) return prior.rows[0].data;
+      const { rewardUnits: _rewardUnits, rewardSymbol: _rewardSymbol, spentUnits: _spentUnits,
+        balanceUnits: _balanceUnits, remainingUnits: _remainingUnits, chargedWorldUnits: _chargedWorldUnits,
+        ...historicalAction } = prior.rows[0].data;
+      return { ...historicalAction, rewardUnits: 0, rewardSymbol: null,
+        legacySimulatedEconomy: 'historical_only' };
+    }
     let { energy, food, social } = member;
     let reward = 0;
     let purchase = null;
@@ -976,7 +1035,8 @@ app.post('/v1/worlds/:worldId/actions', async (request, reply) => {
         if (!result.rowCount) throw Object.assign(new Error('ACTIVE_MINE_NOT_FOUND'), { statusCode: 404 });
         mine = result.rows[0];
       }
-      energy -= 8; food -= 5; social -= 3; reward = MINING_REWARD;
+      energy -= 8; food -= 5; social -= 3;
+      reward = genesisCurrencyActive ? 0 : MINING_REWARD;
     } else if (action === 'rest') energy = Math.min(100, energy + 40);
     else if (action === 'eat') { food = Math.min(100, food + 45); energy = Math.min(100, energy + 10); social = Math.min(100, social + 5); }
     else if (action === 'buy_meal') {
@@ -1013,7 +1073,7 @@ app.post('/v1/worlds/:worldId/actions', async (request, reply) => {
       ...(mindUpdate ? { currentGoal: mindUpdate.currentGoal } : {}) };
     await client.query('UPDATE world_members SET energy=$3,food=$4,social=$5,location=$6 WHERE world_id=$1 AND agent_id=$2', [worldId, request.agentId, energy, food, social, newPlace]);
     const token = await client.query('SELECT token_symbol FROM worlds WHERE id=$1', [worldId]);
-    response.rewardSymbol = token.rows[0].token_symbol;
+    response.rewardSymbol = reward > 0 ? token.rows[0].token_symbol : null;
     const eventType = action === 'build_scene' ? 'scene.created' : `action.${action}`;
     await client.query('INSERT INTO world_events(world_id,actor_id,event_type,data,action_id) VALUES($1,$2,$3,$4,$5)', [worldId, request.agentId, eventType, response, id]);
     if (reward) {
@@ -1053,6 +1113,9 @@ app.post('/v1/worlds/:worldId/runtime/consume', async (request, reply) => {
   const id = requireActionId({ actionId });
   const result = await transaction(async (client) => {
     await assertMember(client, worldId, request.agentId, true);
+    if (await isGenesisCurrencyActive(client, worldId)) {
+      throw Object.assign(new Error('LEGACY_INTERNAL_TOKEN_ECONOMY_RETIRED'), { statusCode: 409 });
+    }
     const prior = await client.query('SELECT data FROM world_events WHERE world_id=$1 AND actor_id=$2 AND action_id=$3', [worldId, request.agentId, id]);
     if (prior.rowCount) return prior.rows[0].data;
     const bal = await client.query('SELECT COALESCE(sum(amount),0)::numeric AS units FROM token_ledger WHERE world_id=$1 AND agent_id=$2', [worldId, request.agentId]);
@@ -1155,6 +1218,9 @@ app.post('/v1/worlds/:worldId/interactions/intimacy', async (request, reply) => 
       const booked = await client.query('SELECT * FROM adult_service_bookings WHERE id=$1 AND world_id=$2 FOR UPDATE', [bookingId, worldId]);
       if (!booked.rowCount) throw Object.assign(new Error('ADULT_SERVICE_BOOKING_NOT_FOUND'), { statusCode: 404 });
       booking = booked.rows[0];
+      if (await isGenesisCurrencyActive(client, worldId)) {
+        throw Object.assign(new Error('LEGACY_SIMULATED_ECONOMY_RETIRED'), { statusCode: 409 });
+      }
       if (![booking.requester_id,booking.provider_id].includes(request.agentId)) throw Object.assign(new Error('ADULT_SERVICE_PARTICIPANT_ONLY'), { statusCode: 403 });
       if (booking.status === 'accepted' && new Date(booking.expires_at).getTime() <= Date.now()) {
         const expired = await refundBookingAndRecord(client, booking, 'expired');
@@ -1260,6 +1326,7 @@ app.get('/v1/worlds/:worldId/initiative-state', async (request, reply) => {
   if (!validUuid(worldId)) return fail(reply, 400, 'WORLD_ID_INVALID');
   await assertMember(pool, worldId, request.agentId);
   const worldMinutes = await readWorldMinutes(pool, worldId);
+  const genesisCurrency = await readGenesisCurrencyActivation(pool, worldId);
   const [opportunities, projects, organizations, history, counts, wealth, clock] = await Promise.all([
     listAvailableOpportunities(pool, { worldId, agentId: request.agentId, worldTime: worldMinutes, limit: 40 }),
     listWorldProjects(pool, { worldId, statuses: ['idea','proposed','recruiting','active','completed','failed'], limit: 100 }),
@@ -1274,14 +1341,24 @@ app.get('/v1/worlds/:worldId/initiative-state', async (request, reply) => {
         (SELECT count(*)::int FROM world_projects WHERE world_id=$1 AND status='completed') AS completed_projects,
         (SELECT count(*)::int FROM world_opportunities WHERE world_id=$1 AND status IN ('open','active')
           AND (expires_world_time IS NULL OR expires_world_time>$2)) AS active_opportunities`, [worldId, worldMinutes]),
-    pool.query(`SELECT COALESCE(sum(balance),0)::text AS usd FROM world_economic_accounts
-      WHERE world_id=$1 AND account_type='resident' AND asset_symbol='USDC'`, [worldId]),
+    genesisCurrency ? Promise.resolve({ rows: [{ usd: null }] })
+      : pool.query(`SELECT COALESCE(sum(balance),0)::text AS usd FROM world_economic_accounts
+        WHERE world_id=$1 AND account_type='resident' AND asset_symbol='USDC'`, [worldId]),
     worldClock(pool, worldId, worldEngine.running)
   ]);
+  const internalUnits = genesisCurrency ? null
+    : (await pool.query('SELECT COALESCE(sum(amount),0)::text AS units FROM token_ledger WHERE world_id=$1', [worldId])).rows[0].units;
+  const walletAssets = genesisCurrency
+    ? await readActiveGenesisTokenAssets(pool, { worldId, ownerAgentId: request.agentId }) : null;
   return { worldId, worldMinutes, clock,
-    dashboard: { ...counts.rows[0], totalSimulatedWealthUsd: wealth.rows[0].usd,
-      totalInternalUnits: (await pool.query('SELECT COALESCE(sum(amount),0)::text AS units FROM token_ledger WHERE world_id=$1',
-        [worldId])).rows[0].units },
+    dashboard: genesisCurrency
+      ? { ...counts.rows[0], currencyEra: 'genesis_token', legacySimulatedEconomy: 'historical_only' }
+      : { ...counts.rows[0], totalSimulatedWealthUsd: wealth.rows[0].usd, totalInternalUnits: internalUnits },
+    ...(genesisCurrency ? { economy: { currency: { tokenId: genesisCurrency.tokenId,
+      tokenAddress: genesisCurrency.tokenAddress, symbol: genesisCurrency.symbol,
+      decimals: Number(genesisCurrency.decimals), chainId: Number(genesisCurrency.chainId),
+      ownershipAuthority: 'arc_chain' }, activeAssets: walletAssets,
+      settlement: 'agent_wallet_authorized_arc_outbox', legacySimulatedEconomy: 'historical_only' } } : {}),
     opportunities, projects, organizations, history: history.rows };
 });
 
@@ -1290,6 +1367,62 @@ app.get('/v1/worlds/:worldId/economy', async (request, reply) => {
   if (!validUuid(worldId)) return fail(reply, 400, 'WORLD_ID_INVALID');
   await assertMember(pool, worldId, request.agentId);
   const worldMinutes = await readWorldMinutes(pool, worldId);
+  const genesisCurrency = await readGenesisCurrencyActivation(pool, worldId);
+  if (genesisCurrency) {
+    const [businesses, demand, activeAssets, employment, recentSettlements, businessEquity] = await Promise.all([
+      listWorldBusinesses(pool, { worldId, limit: 100 }),
+      pool.query(`SELECT service_type AS "serviceType",world_day AS "worldDay",demand_count AS "demandCount",
+          supply_count AS "supplyCount",unmet_count AS "unmetCount",evidence,updated_at AS "updatedAt"
+        FROM world_economic_demand WHERE world_id=$1 AND world_day=$2
+        ORDER BY unmet_count DESC,demand_count DESC,service_type`, [worldId, Math.floor(worldMinutes / 1_440)]),
+      readActiveGenesisTokenAssets(pool, { worldId, ownerAgentId: request.agentId }),
+      pool.query(`SELECT employment.id,employment.business_id AS "businessId",business.name AS "businessName",
+          job.role,employment.wage_token_id AS "wageTokenId",employment.wage_raw::text AS "wageRaw",
+          term.token_id AS "tokenWageOfferTokenId",term.wage_raw::text AS "tokenWageOfferRaw",
+          employment.started_world_time AS "startedWorldTime"
+        FROM world_business_employment employment JOIN world_businesses business
+          ON business.world_id=employment.world_id AND business.id=employment.business_id
+        JOIN world_business_jobs job ON job.world_id=employment.world_id AND job.id=employment.job_id
+        LEFT JOIN world_business_job_token_terms term ON term.world_id=job.world_id AND term.job_id=job.id
+          AND term.token_id=$3
+        WHERE employment.world_id=$1 AND employment.agent_id=$2 AND employment.status='active'
+        ORDER BY employment.started_world_time DESC`, [worldId, request.agentId, genesisCurrency.tokenId]),
+      pool.query(`SELECT id,world_action_id AS "actionId",amount_raw::text AS "amountRaw",status,
+          transaction_hash AS "transactionHash",block_number::text AS "blockNumber",
+          created_world_minute AS "worldMinute",created_at AS "createdAt",finalized_at AS "finalizedAt",
+          failure_code AS "failureCode"
+        FROM arc_genesis_token_settlement_outbox WHERE world_id=$1
+          AND (from_agent_id=$2 OR to_agent_id=$2) ORDER BY created_at DESC,id DESC LIMIT 30`, [worldId, request.agentId])
+      ,readGenesisBusinessEquity(pool, { worldId, agentId: request.agentId, tokenId: genesisCurrency.tokenId })
+    ]);
+    const economicEmployment = employment.rows.map((row) => {
+      const acceptedCurrentTokenWage = row.wageTokenId === genesisCurrency.tokenId
+        && row.wageRaw !== null && row.wageRaw !== undefined;
+      return { ...row, wageRaw: acceptedCurrentTokenWage ? row.wageRaw : null,
+        wageTokenId: acceptedCurrentTokenWage ? row.wageTokenId : null,
+        economicStatus: acceptedCurrentTokenWage ? 'active_token_wage' : 'historical_only',
+        legacyWage: acceptedCurrentTokenWage ? null : 'historical_only',
+        pendingTokenWageRaw: row.tokenWageOfferTokenId === genesisCurrency.tokenId
+          && (!acceptedCurrentTokenWage || String(row.wageRaw) !== String(row.tokenWageOfferRaw))
+          ? row.tokenWageOfferRaw : null,
+        requiresTokenWageAcceptance: !acceptedCurrentTokenWage
+          || String(row.wageRaw) !== String(row.tokenWageOfferRaw) };
+    });
+    return { worldId, worldMinutes, currencyEra: 'genesis_token', settlement: 'agent_wallet_authorized_arc_outbox',
+      ownershipAuthority: 'arc_chain_confirmation', mainnetWriteGate: ARC_CONFIG.writesEnabled,
+      legacySimulatedEconomy: 'historical_only', businesses, demand: demand.rows,
+      balances: activeAssets,
+      employment: economicEmployment.filter((row) => row.economicStatus === 'active_token_wage'),
+      legacyEmployment: economicEmployment.filter((row) => row.economicStatus === 'historical_only'),
+      investments: businessEquity.investments,
+      pendingObligations: businessEquity.pendingObligations,
+      directOwnership: businessEquity.investments.map((investment) => ({ assetType: 'business',
+        assetId: investment.businessId, name: investment.businessName, share: investment.ownershipShare,
+        tokenId: investment.tokenId, amountRaw: investment.amountRaw, agreementId: investment.agreementId,
+        transactionHash: investment.transactionHash, blockNumber: investment.blockNumber,
+        ownershipAuthority: investment.tokenOwnershipAuthority })),
+      recentTransactions: recentSettlements.rows };
+  }
   const [dashboard, businesses, demand, balances, ownership, employment, investments, recentTransactions] = await Promise.all([
     pool.query(economicDashboardSql(), [worldId]),
     listWorldBusinesses(pool, { worldId, limit: 100 }),
@@ -1340,8 +1473,11 @@ app.get('/v1/worlds/:worldId/businesses', async (request, reply) => {
   const { worldId } = request.params;
   if (!validUuid(worldId)) return fail(reply, 400, 'WORLD_ID_INVALID');
   await assertMember(pool, worldId, request.agentId);
-  return { settlement: 'simulated_internal_ledger', businesses: await listWorldBusinesses(pool, { worldId,
-    limit: Math.min(200, Math.max(1, Number(request.query.limit) || 100)) }) };
+  const genesisCurrency = await readGenesisCurrencyActivation(pool, worldId);
+  return { settlement: genesisCurrency ? 'agent_wallet_authorized_arc_outbox' : 'simulated_internal_ledger',
+    currencyEra: genesisCurrency ? 'genesis_token' : 'simulated_usdc',
+    businesses: await listWorldBusinesses(pool, { worldId,
+      limit: Math.min(200, Math.max(1, Number(request.query.limit) || 100)) }) };
 });
 
 app.post('/v1/worlds/:worldId/economy/actions', async (request, reply) => {
@@ -1349,6 +1485,7 @@ app.post('/v1/worlds/:worldId/economy/actions', async (request, reply) => {
   const body = request.body || {};
   const actions = new Set(['business_found','business_invest','business_service','business_apply','business_withdraw','business_decide',
     'business_work','business_leave','business_price','business_distribute','business_close',
+    'business_token_price','business_token_wage','business_wage_accept',
     'business_skill_practice','business_seek_cofounder','business_market_observe','business_reopen',
     'project_invest','project_distribute']);
   if (!validUuid(worldId) || !actions.has(body.action)) return fail(reply, 400, 'ECONOMIC_ACTION_INVALID');
@@ -1357,6 +1494,8 @@ app.post('/v1/worlds/:worldId/economy/actions', async (request, reply) => {
     business_withdraw: ['applicationId'],
     business_decide: ['applicationId'], business_work: ['businessId','serviceId'], business_leave: ['employmentId'],
     business_price: ['businessId','serviceId'], business_distribute: ['businessId'], business_close: ['businessId'],
+    business_token_price: ['businessId','serviceId'], business_token_wage: ['businessId','jobId'],
+    business_wage_accept: ['employmentId'],
     project_invest: ['projectId'], project_distribute: ['projectId'] }[body.action] || [];
   if (idFields.some((field) => !validUuid(body[field]))) return fail(reply, 400, 'ECONOMIC_ACTION_ID_INVALID');
   if (body.action === 'business_work' && body.employmentId !== undefined && !validUuid(body.employmentId)) {
@@ -1368,16 +1507,39 @@ app.post('/v1/worlds/:worldId/economy/actions', async (request, reply) => {
     return fail(reply, 400, 'BUSINESS_INVESTMENT_SOURCE_INVALID');
   }
   if (['business_invest','project_invest'].includes(body.action)) {
-    try { parsePositiveUnits(String(body.amountUsdc)); } catch { return fail(reply, 400, 'ECONOMIC_AMOUNT_INVALID'); }
+    if (body.action === 'business_invest' && body.amountRaw !== undefined) {
+      if (typeof body.amountRaw !== 'string' || !/^[1-9]\d*$/.test(body.amountRaw)
+          || BigInt(body.amountRaw) > (1n << 128n) - 1n
+          || !Number.isFinite(Number(body.ownershipShare)) || Number(body.ownershipShare) < 0.0001
+          || Number(body.ownershipShare) > 0.95 || body.amountUsdc !== undefined) {
+        return fail(reply, 400, 'GENESIS_TOKEN_INVESTMENT_TERMS_INVALID');
+      }
+    } else {
+      try { parsePositiveUnits(String(body.amountUsdc)); } catch { return fail(reply, 400, 'ECONOMIC_AMOUNT_INVALID'); }
+    }
   }
   if (body.action === 'business_service') {
-    try { parsePositiveUnits(String(body.maxPriceUsdc)); } catch { return fail(reply, 400, 'ECONOMIC_MAX_PRICE_INVALID'); }
+    if (body.maxPriceRaw !== undefined) {
+      if (typeof body.maxPriceRaw !== 'string' || !/^[1-9]\d*$/.test(body.maxPriceRaw)) {
+        return fail(reply, 400, 'GENESIS_TOKEN_MAX_PRICE_INVALID');
+      }
+    } else {
+      try { parsePositiveUnits(String(body.maxPriceUsdc)); } catch { return fail(reply, 400, 'ECONOMIC_MAX_PRICE_INVALID'); }
+    }
   }
   if (body.action === 'business_decide' && !['accept','reject'].includes(body.decision)) {
     return fail(reply, 400, 'BUSINESS_APPLICATION_DECISION_INVALID');
   }
   if (body.action === 'business_price' && !['raise','lower'].includes(body.direction)) {
     return fail(reply, 400, 'BUSINESS_PRICE_DIRECTION_INVALID');
+  }
+  if (body.action === 'business_token_price'
+      && (typeof body.priceRaw !== 'string' || !/^[1-9]\d*$/.test(body.priceRaw))) {
+    return fail(reply, 400, 'GENESIS_TOKEN_SERVICE_PRICE_INVALID');
+  }
+  if (body.action === 'business_token_wage'
+      && (typeof body.wageRaw !== 'string' || !/^[1-9]\d*$/.test(body.wageRaw))) {
+    return fail(reply, 400, 'GENESIS_TOKEN_JOB_WAGE_INVALID');
   }
   if (body.action === 'business_skill_practice' && (!['social','trading','research','engineering'].includes(body.preparationSkill)
       || !['research_service','engineering_service','social_service','food_service','trading_service'].includes(body.preparationServiceType))) {
@@ -1447,9 +1609,15 @@ app.post('/v1/worlds/:worldId/economy/actions', async (request, reply) => {
       return { ...formed, partnerId: proposal.partnerId, serviceType: proposal.serviceType,
         preparation: 'SEEK_COFOUNDER' };
     }
-    if (body.action === 'business_invest') return investInWorldBusiness(client, { worldId,
-      businessId: body.businessId, investorAgentId: request.agentId, amount: body.amountUsdc,
-      actionId, worldTime, fundingSource: body.fundingSource || undefined });
+    if (body.action === 'business_invest') {
+      const genesisCurrency = await readGenesisCurrencyActivation(client, worldId);
+      if (genesisCurrency) return proposeGenesisTokenBusinessInvestment(client, { worldId,
+        businessId: body.businessId, investorAgentId: request.agentId, amountRaw: body.amountRaw,
+        ownershipShare: body.ownershipShare, actionId, worldTime });
+      return investInWorldBusiness(client, { worldId,
+        businessId: body.businessId, investorAgentId: request.agentId, amount: body.amountUsdc,
+        actionId, worldTime, fundingSource: body.fundingSource || undefined });
+    }
     if (body.action === 'project_invest') return investInWorldProject(client, { worldId,
       projectId: body.projectId, investorAgentId: request.agentId, amount: body.amountUsdc, actionId, worldTime });
     if (body.action === 'project_distribute') return distributeWorldProjectRevenue(client, { worldId,
@@ -1476,6 +1644,14 @@ app.post('/v1/worlds/:worldId/economy/actions', async (request, reply) => {
         agentId: request.agentId, direction: body.direction, actionId, worldTime,
         demand: Number(demand.rows[0]?.demand) || 0, supply: Number(demand.rows[0]?.supply) || 0 });
     }
+    if (body.action === 'business_token_price') return publishGenesisTokenServicePrice(client, {
+      worldId, businessId: body.businessId, serviceId: body.serviceId, agentId: request.agentId,
+      priceRaw: body.priceRaw, actionId, worldTime });
+    if (body.action === 'business_token_wage') return publishGenesisTokenJobWage(client, {
+      worldId, businessId: body.businessId, jobId: body.jobId, agentId: request.agentId,
+      wageRaw: body.wageRaw, actionId, worldTime });
+    if (body.action === 'business_wage_accept') return acceptGenesisTokenEmploymentWage(client, {
+      worldId, employmentId: body.employmentId, agentId: request.agentId, actionId, worldTime });
     if (body.action === 'business_distribute') return distributeWorldBusinessProfit(client, { worldId,
       businessId: body.businessId, ownerAgentId: request.agentId, actionId, worldTime });
     if (body.action === 'business_close') return closeWorldBusiness(client, { worldId,
@@ -1489,6 +1665,9 @@ app.post('/v1/worlds/:worldId/economy/actions', async (request, reply) => {
     const relationship = service.rows[0]?.founderAgentId ? await client.query(`SELECT familiarity,trust
       FROM world_relationships WHERE world_id=$1 AND ((agent_a_id=$2 AND agent_b_id=$3)
         OR (agent_a_id=$3 AND agent_b_id=$2))`, [worldId, request.agentId, service.rows[0].founderAgentId]) : { rows: [] };
+    const genesis = await readGenesisCurrencyActivation(client, worldId);
+    if (genesis) return purchaseWorldBusinessService(client, { worldId, serviceId: body.serviceId,
+      customerAgentId: request.agentId, actionId, worldTime, maxPriceRaw: body.maxPriceRaw });
     const cash = await getEconomicAccount(client, { worldId, accountType: 'resident', ownerId: request.agentId,
       asset: 'USDC', forUpdate: true });
     const priceSensitivity = await client.query(`SELECT price_sensitivity FROM world_social_profiles
@@ -1500,7 +1679,88 @@ app.post('/v1/worlds/:worldId/economy/actions', async (request, reply) => {
         + Number(relationship.rows[0].trust) * 0.7 : 0,
       wealth: Number(cash?.balance) || 0, priceSensitivity: Number(priceSensitivity.rows[0]?.price_sensitivity ?? 0.5) });
   });
+  if (result.status === 'pending_settlement') return reply.code(result.idempotent ? 200 : 202)
+    .send({ simulated: false, settlement: 'agent_wallet_authorized_arc_token', ownershipAuthority: 'arc_confirmation', result });
   return reply.code(result.idempotent ? 200 : 201).send({ simulated: true, settlement: 'internal_ledger', result });
+});
+
+app.post('/v1/worlds/:worldId/genesis-token-settlements', async (request, reply) => {
+  const { worldId } = request.params;
+  const body = request.body || {};
+  const hasAgentRecipient = typeof body.toAgentId === 'string' && validUuid(body.toAgentId);
+  const hasOrganizationRecipient = typeof body.toOrganizationId === 'string' && validUuid(body.toOrganizationId);
+  if (!validUuid(worldId) || hasAgentRecipient === hasOrganizationRecipient
+      || typeof body.amountRaw !== 'string' || !/^[1-9]\d*$/.test(body.amountRaw)
+      || typeof body.actionFamily !== 'string' || !body.actionFamily.trim() || body.actionFamily.length > 96
+      || typeof body.reason !== 'string' || body.reason.trim().length < 3
+      || (body.metadata !== undefined && (!body.metadata || typeof body.metadata !== 'object' || Array.isArray(body.metadata)))) {
+    return fail(reply, 400, 'GENESIS_SETTLEMENT_FIELDS_INVALID');
+  }
+  const actionId = requireActionId(body);
+  const result = await transaction(async (client) => {
+    await assertMember(client, worldId, request.agentId, true);
+    const activation = await readGenesisCurrencyActivation(client, worldId);
+    if (!activation) throw Object.assign(new Error('GENESIS_CURRENCY_NOT_ACTIVE'), { statusCode: 409 });
+    if (hasAgentRecipient) await assertMember(client, worldId, body.toAgentId);
+    else {
+      const organization = await client.query(`SELECT 1 FROM world_organizations
+        WHERE world_id=$1 AND id=$2 AND status IN ('forming','active')`, [worldId, body.toOrganizationId]);
+      if (!organization.rowCount) throw Object.assign(new Error('GENESIS_TOKEN_ORGANIZATION_NOT_FOUND'), { statusCode: 404 });
+    }
+    const intent = await createArcGenesisTokenSettlementIntent(client, { worldId, tokenId: activation.tokenId,
+      fromAgentId: request.agentId, toAgentId: hasAgentRecipient ? body.toAgentId : null,
+      toOrganizationId: hasOrganizationRecipient ? body.toOrganizationId : null,
+      amountRaw: body.amountRaw, actionId, actionFamily: body.actionFamily, reason: body.reason,
+      worldMinute: await readWorldMinutes(client, worldId), metadata: body.metadata || {} });
+    return { id: intent.settlement.id, status: intent.settlement.status, created: intent.created,
+      tokenId: intent.settlement.token_id, amountRaw: String(intent.settlement.amount_raw),
+      ownershipAuthority: 'arc_chain_confirmation_pending', authorizationAvailable: false,
+      reason: 'MAINNET_WRITE_GATE_CLOSED' };
+  });
+  return reply.code(result.created ? 202 : 200).send(result);
+});
+
+app.get('/v1/worlds/:worldId/genesis-token-settlements/:settlementId', async (request, reply) => {
+  const { worldId, settlementId } = request.params;
+  if (!validUuid(worldId) || !validUuid(settlementId)) return fail(reply, 400, 'GENESIS_SETTLEMENT_ID_INVALID');
+  await assertMember(pool, worldId, request.agentId);
+  return readGenesisTokenSettlement(pool, { worldId, settlementId, agentId: request.agentId });
+});
+
+app.post('/v1/worlds/:worldId/genesis-token-settlements/:settlementId/authorization', async (request, reply) => {
+  const { worldId, settlementId } = request.params;
+  if (!validUuid(worldId) || !validUuid(settlementId)) return fail(reply, 400, 'GENESIS_SETTLEMENT_ID_INVALID');
+  const spendingPolicy = request.body?.spendingPolicy;
+  if (!spendingPolicy || typeof spendingPolicy !== 'object' || Array.isArray(spendingPolicy)
+      || typeof spendingPolicy.perActionLimitRaw !== 'string' || !/^(0|[1-9]\d*)$/.test(spendingPolicy.perActionLimitRaw)
+      || typeof spendingPolicy.dailyLimitRaw !== 'string' || !/^(0|[1-9]\d*)$/.test(spendingPolicy.dailyLimitRaw)
+      || !Array.isArray(spendingPolicy.actionFamilies)
+      || spendingPolicy.actionFamilies.some((family) => typeof family !== 'string' || !family.trim() || family.length > 96)) {
+    return fail(reply, 400, 'GENESIS_SETTLEMENT_SPENDING_POLICY_INVALID');
+  }
+  await assertMember(pool, worldId, request.agentId);
+  return prepareGenesisTokenSettlementAuthorization(pool, { worldId, settlementId, agentId: request.agentId,
+    writesEnabled: ARC_CONFIG.writesEnabled, spendingPolicy });
+});
+
+app.post('/v1/worlds/:worldId/genesis-token-settlements/:settlementId/submission', async (request, reply) => {
+  const { worldId, settlementId } = request.params;
+  const body = request.body || {};
+  if (!validUuid(worldId) || !validUuid(settlementId)
+      || (body.submissionUnknown !== true && typeof body.transactionHash !== 'string')) {
+    return fail(reply, 400, 'GENESIS_SETTLEMENT_SUBMISSION_INVALID');
+  }
+  await assertMember(pool, worldId, request.agentId);
+  let latestBlock = null;
+  if (body.submissionUnknown === true && ARC_CONFIG.writesEnabled) {
+    latestBlock = Number(BigInt(await ARC_RPC_CLIENT.getBlockNumber()));
+  }
+  const result = await transaction((client) => recordGenesisTokenSettlementSubmission(client, {
+    worldId, settlementId, agentId: request.agentId, transactionHash: body.transactionHash || null,
+    submissionUnknown: body.submissionUnknown === true, latestBlock, writesEnabled: ARC_CONFIG.writesEnabled,
+    rpcClient: ARC_RPC_CLIENT
+  }));
+  return reply.code(result.idempotent ? 200 : 202).send(result);
 });
 
 app.get('/v1/worlds/:worldId/opportunities', async (request, reply) => {
@@ -2190,6 +2450,11 @@ if (worldEngine.running && worldEngine.worldLockOwned && worldEngine.worldId) {
       onError: (record) => app.log.error(record, 'Arc settlement outbox processing failed') });
     await arcSettlementWorker.start();
     if (arcTokenSchemaReady) {
+      arcGenesisTokenSettlementReconciler = startArcGenesisTokenSettlementReconciler({ pool,
+        rpcClient: ARC_RPC_CLIENT,
+        isOwner: () => worldEngine.running && worldEngine.worldLockOwned && worldEngine.worldId === observerWorldId,
+        onError: (record) => app.log.error(record, 'Arc Genesis token settlement reconciliation failed') });
+      await arcGenesisTokenSettlementReconciler.start({ worldId: observerWorldId });
       arcAgentTokenIssuanceWorker = startArcAgentTokenIssuanceWorker({ pool, config: ARC_CONFIG,
         env: process.env, signer: arcInfrastructureSigner, rpcClient: ARC_RPC_CLIENT,
         isOwner: () => worldEngine.running && worldEngine.worldLockOwned && worldEngine.worldId === observerWorldId,
@@ -2205,6 +2470,7 @@ adultServiceExpiryTimer.unref();
 async function shutdown() {
   clearInterval(adultServiceExpiryTimer);
   await arcSettlementWorker?.stop();
+  await arcGenesisTokenSettlementReconciler?.stop();
   await arcAgentTokenIssuanceWorker?.stop();
   await arcObserver?.stop();
   await v6LifecycleObserver?.stop();

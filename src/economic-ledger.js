@@ -1,4 +1,5 @@
 import { parsePositiveUnits, formatUnits } from './units.js';
+import { assertLegacySimulatedEconomyAvailable, isGenesisCurrencyActive } from './genesis-economy.js';
 
 const ASSETS = new Set(['USDC']);
 const ACCOUNT_TYPES = new Set(['resident', 'organization', 'business', 'project', 'system']);
@@ -17,6 +18,7 @@ function accountKey(type, ownerId, explicitKey) {
 
 export async function ensureEconomicAccount(client, { worldId, accountType, ownerId = null, key = null,
   asset = 'USDC', initialBalance = '0.00000000' }) {
+  await assertLegacySimulatedEconomyAvailable(client, worldId);
   if (!ACCOUNT_TYPES.has(accountType) || !ASSETS.has(asset)) throw ledgerError('ECONOMIC_ACCOUNT_INVALID', 400);
   const normalizedKey = accountKey(accountType, ownerId, key);
   const inserted = await client.query(`INSERT INTO world_economic_accounts(world_id,account_type,account_key,owner_id,asset_symbol,balance)
@@ -33,10 +35,12 @@ export async function ensureEconomicAccount(client, { worldId, accountType, owne
 
 export async function ensureResidentEconomicAccounts(client, { worldId, agentId, worldTime = 0 }) {
   void worldTime;
+  if (await isGenesisCurrencyActive(client, worldId)) return;
   await ensureEconomicAccount(client, { worldId, accountType: 'resident', ownerId: agentId, asset: 'USDC' });
 }
 
 export async function getEconomicAccount(client, { worldId, accountType, ownerId = null, key = null, asset = 'USDC', forUpdate = false }) {
+  if (await isGenesisCurrencyActive(client, worldId)) return null;
   const normalizedKey = accountKey(accountType, ownerId, key);
   const result = await client.query(`SELECT id,world_id,account_type AS "accountType",account_key AS key,
       owner_id AS "ownerId",asset_symbol AS asset,balance::text AS balance
@@ -47,6 +51,7 @@ export async function getEconomicAccount(client, { worldId, accountType, ownerId
 
 export async function postEconomicTransfer(client, { worldId, sourceAccountId, destinationAccountId, asset = 'USDC', amount,
   transactionType, reason, worldTime = 0, actionId, referenceId = null, metadata = {} }) {
+  await assertLegacySimulatedEconomyAvailable(client, worldId);
   if (!ASSETS.has(asset) || !transactionType || typeof reason !== 'string' || reason.trim().length < 3
       || typeof actionId !== 'string' || actionId.length < 1 || actionId.length > 180) {
     throw ledgerError('ECONOMIC_TRANSFER_INVALID', 400);

@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { ensureEconomicAccount, ensureResidentEconomicAccounts, transferBetweenAccounts } from './economic-ledger.js';
 import { parsePositiveUnits } from './units.js';
 import { actionIdentifier, boundedNumber, jsonObject, requireWorldMember, requiredText, worldError, writeWorldHistory } from './world-domain.js';
+import { isGenesisCurrencyActive } from './genesis-economy.js';
 import { contributeOrganizationEffort } from './world-organizations.js';
 import { contributeToProject } from './world-projects.js';
 import { capabilityGraphDepth, recordWorldCapabilityDependencies } from './world-v7.js';
@@ -1317,7 +1318,8 @@ export async function listWorldCapabilityUses(client, { worldId, limit = 100 }) 
       ON experiment.world_id=capability.world_id AND experiment.capability_id=capability.id AND experiment.status='running'
     WHERE capability.world_id=$1 AND (capability.status='active' OR (capability.status='experimental' AND experiment.status='running'))
     ORDER BY capability.status='active' DESC,capability.name,capability.id LIMIT $2`, [worldId, Math.min(500, Math.max(1, limit))]);
-  return result.rows;
+  if (!await isGenesisCurrencyActive(client, worldId)) return result.rows;
+  return result.rows.filter((row) => !jsonValue(row.specification).costs?.some((cost) => cost.resource === 'simulated_usdc'));
 }
 
 function residentWithinCapabilityScope(agent, scope, context = {}) {
@@ -1496,6 +1498,10 @@ export async function performWorldCapabilityUse(client, { worldId, agentId, part
     return { ...row, idempotent: true };
   }
   const spec = validateCapabilitySpecification(jsonValue(capability.specification));
+  if (await isGenesisCurrencyActive(client, worldId)
+      && spec.costs.some((cost) => cost.resource === 'simulated_usdc')) {
+    throw capabilityError('LEGACY_SIMULATED_ECONOMY_RETIRED', 409);
+  }
   const experiment = capability.runningExperimentId ? {
     id: capability.runningExperimentId,
     participantAgentIds: capability.participantAgentIds

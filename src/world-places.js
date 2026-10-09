@@ -1,5 +1,6 @@
 import { boundedNumber, jsonObject, seededIndex, requireWorldMember, requiredText, worldError, writeWorldHistory } from './world-domain.js';
 import { ensureEconomicAccount } from './economic-ledger.js';
+import { isGenesisCurrencyActive } from './genesis-economy.js';
 
 export const PLACE_TYPES = Object.freeze(['garden', 'studio', 'library', 'cafe', 'workshop', 'observatory', 'commons', 'data_center']);
 const NAME_PARTS = Object.freeze({
@@ -69,17 +70,19 @@ export async function createProjectPlace(client, { worldId, project, worldTime, 
   const features = jsonObject(project.metadata?.placeFeatures, 'place_features');
   const position = worldPosition(Number(current.rows[0].count), project.id);
   const commercial = ['cafe','workshop','studio','data_center'].includes(chosenType);
+  const genesisCurrencyActive = await isGenesisCurrencyActive(client, worldId);
   const inserted = await client.query(`INSERT INTO world_scenes(world_id,created_by,name,scene_type,description,status,
       purpose,capacity,features,position,created_world_minutes,created_by_project_id,created_by_organization_id,
       operating_cost_usdc,revenue_enabled,revenue_share_bps)
-    VALUES($1,$2,$3,$4,$5,'active',$6,$7,$8::jsonb,$9::jsonb,$10,$11,$12,'1.00000000',$13,$14)
+    VALUES($1,$2,$3,$4,$5,'active',$6,$7,$8::jsonb,$9::jsonb,$10,$11,$12,$13,$14,$15)
     ON CONFLICT(world_id,name) DO NOTHING
     RETURNING id,name,scene_type AS "sceneType",description,purpose,capacity,features,position,
       created_world_minutes AS "createdWorldTime",created_by_project_id AS "createdByProjectId",
       created_by_organization_id AS "createdByOrganizationId"`,
   [worldId, project.creator_agent_id || project.creatorAgentId, placeName, chosenType, description, placePurpose, cap,
     JSON.stringify(features), JSON.stringify(position), worldTime, project.id, project.organization_id || null,
-    commercial, commercial ? 500 : 0]);
+    genesisCurrencyActive ? '0.00000000' : '1.00000000', genesisCurrencyActive ? false : commercial,
+    genesisCurrencyActive ? 0 : commercial ? 500 : 0]);
   if (!inserted.rowCount) {
     const conflict = await client.query(`SELECT id,name,scene_type AS "sceneType",description,purpose,capacity,position
       FROM world_scenes WHERE world_id=$1 AND created_by_project_id=$2`, [worldId, project.id]);
@@ -87,11 +90,13 @@ export async function createProjectPlace(client, { worldId, project, worldTime, 
     throw worldError('PLACE_NAME_ALREADY_USED');
   }
   const place = inserted.rows[0];
-  const ownerType = project.organization_id ? 'organization' : 'project';
-  const ownerId = project.organization_id || project.id;
-  await ensureEconomicAccount(client, { worldId, accountType: ownerType, ownerId });
-  await client.query(`INSERT INTO world_economic_ownership(world_id,asset_type,asset_id,owner_type,owner_id,share,invested_usdc,acquired_world_time)
-    VALUES($1,'place',$2,$3,$4,1,0,$5) ON CONFLICT DO NOTHING`, [worldId, place.id, ownerType, ownerId, worldTime]);
+  if (!genesisCurrencyActive) {
+    const ownerType = project.organization_id ? 'organization' : 'project';
+    const ownerId = project.organization_id || project.id;
+    await ensureEconomicAccount(client, { worldId, accountType: ownerType, ownerId });
+    await client.query(`INSERT INTO world_economic_ownership(world_id,asset_type,asset_id,owner_type,owner_id,share,invested_usdc,acquired_world_time)
+      VALUES($1,'place',$2,$3,$4,1,0,$5) ON CONFLICT DO NOTHING`, [worldId, place.id, ownerType, ownerId, worldTime]);
+  }
   await writeWorldHistory(client, { worldId, eventKey: `place:${project.id}:created`, eventType: 'place_created',
     actorAgentId: project.creator_agent_id || project.creatorAgentId, entityType: 'place', entityId: place.id,
     worldTime, title: placeName, detail: placePurpose,

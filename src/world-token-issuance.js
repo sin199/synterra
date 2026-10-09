@@ -6,6 +6,7 @@ import { inspectAgentTokenSpecification, AGENT_TOKEN_PILOT_GENERATION, AGENT_TOK
 import { createWorldExtensionRequest } from './world-v7.js';
 import { authorAgentCurrencyProposal } from './agent-runtime/currency-genesis-authoring.js';
 import { currencyGenesisInfrastructureFacts } from './arc/currency-genesis-context.js';
+import { recordInfrastructureUsageEvent } from './infrastructure-metering.js';
 
 const SPEC_FIELDS = ['name','symbol','meaning','purpose','rationale','decimals','distribution','reserveAmount',
   'unallocatedSupplyHandling','ownershipModel','authorityModel'];
@@ -228,6 +229,16 @@ export async function createWorldTokenIssuanceIntent(client, { worldId, agentId,
   const saved = await saveIntent(client, { worldId, proposerAgentId: agentId, issuerAgentId,
     specification: cleanSpecification, actionId: idempotencyKey, worldMinute, capabilityGeneration,
     decisionPath, authoring });
+  if (capabilityGeneration === 1 && !saved.row.issuer_agent_id) {
+    const assignment = await creatorGenesisIssuerAssignment(client, worldId, capabilityGeneration);
+    if (assignment) {
+      const assigned = await client.query(`UPDATE arc_token_issuance_intents SET issuer_agent_id=$3,
+          issuer_selection_source=$4,updated_at=now()
+        WHERE world_id=$1 AND id=$2 AND status IN ('incomplete','proposed') RETURNING *`,
+      [worldId, saved.row.id, assignment.issuerAgentId, assignment.selectionSource]);
+      if (assigned.rowCount) saved.row = assigned.rows[0];
+    }
+  }
   if (!saved.idempotent) {
     const eventType = saved.row.status === 'extension_requested' ? 'token_issuance_extension_requested'
       : saved.row.status === 'proposed' ? 'token_issuance_proposed' : 'token_issuance_incomplete';
@@ -325,6 +336,12 @@ export async function nominateWorldTokenIssuer(client, { worldId, agentId, inten
   const action = actionIdentifier(actionId);
   const intent = await readIntent(client, worldId, intentId, true);
   if (!['incomplete','proposed','deferred'].includes(intent.status)) throw worldError('TOKEN_ISSUANCE_NOT_NOMINATABLE', 409);
+  if (Number(intent.capability_generation) === 1) {
+    const assignment = await creatorGenesisIssuerAssignment(client, worldId, 1);
+    if (assignment && candidateAgentId !== assignment.issuerAgentId) {
+      throw worldError('TOKEN_ISSUER_CREATOR_ASSIGNMENT_REQUIRED', 409);
+    }
+  }
   const prior = await client.query(`SELECT candidate_agent_id,nomination_reason FROM arc_token_issuance_issuer_candidates
     WHERE world_id=$1 AND nominated_by_agent_id=$2 AND action_id=$3`, [worldId, agentId, action]);
   if (prior.rowCount) {
@@ -358,6 +375,12 @@ export async function decideWorldTokenIssuerCandidate(client, { worldId, agentId
   await requireWorldMember(client, worldId, agentId);
   if (!['accept','reject','defer'].includes(decision)) throw worldError('TOKEN_ISSUER_CANDIDATE_DECISION_INVALID', 400);
   const intent = await readIntent(client, worldId, intentId, true);
+  if (Number(intent.capability_generation) === 1) {
+    const assignment = await creatorGenesisIssuerAssignment(client, worldId, 1);
+    if (assignment && candidateAgentId !== assignment.issuerAgentId) {
+      throw worldError('TOKEN_ISSUER_CREATOR_ASSIGNMENT_REQUIRED', 409);
+    }
+  }
   const action = actionIdentifier(actionId);
   const text = rationale === null ? null : requiredText(rationale, 1, 1000, 'token_issuer_candidate_rationale');
   const prior = await client.query(`SELECT intent_id,decision,rationale FROM arc_token_issuance_decisions
@@ -412,24 +435,92 @@ export async function decideWorldTokenIssuerCandidate(client, { worldId, agentId
   return { intentId, candidateAgentId: agentId, decision, issuerSelected: decision === 'accept', idempotent: false };
 }
 
+async function creatorGenesisIssuerAssignment(client, worldId, capabilityGeneration = 1) {
+  const result = await client.query(`SELECT issuer_agent_id AS "issuerAgentId",selection_source AS "selectionSource"
+    FROM world_genesis_issuer_assignments WHERE world_id=$1 AND capability_generation=$2`,
+  [worldId, capabilityGeneration]);
+  return result.rows[0] || null;
+}
+
 async function verifyDistributionRecipients(client, worldId, distribution) {
+  const unsupported = [];
   for (const recipient of distribution) {
     if (recipient.recipientType === 'agent') {
       const wallet = await client.query(`SELECT address FROM arc_agent_wallets WHERE world_id=$1 AND agent_id=$2
         AND chain_id=5042 AND status='active'`, [worldId, recipient.recipientId]);
       if (!wallet.rowCount || wallet.rows[0].address.toLowerCase() !== recipient.recipientAddress) {
-        throw worldError('TOKEN_DISTRIBUTION_AGENT_WALLET_MISMATCH', 409);
+        unsupported.push({ recipientType: 'agent', recipientId: recipient.recipientId,
+          reason: wallet.rowCount ? 'wallet_address_mismatch' : 'verified_agent_wallet_unavailable' });
       }
     } else if (recipient.recipientType === 'organization') {
-      const organization = await client.query(`SELECT 1 FROM world_organizations WHERE world_id=$1 AND id=$2`,
-        [worldId, recipient.recipientId]);
-      if (!organization.rowCount) throw worldError('TOKEN_DISTRIBUTION_ORGANIZATION_NOT_FOUND', 404);
-    }
+      const wallet = await client.query(`SELECT address FROM arc_organization_wallets WHERE world_id=$1
+        AND organization_id=$2 AND chain_id=5042 AND status='active'`, [worldId, recipient.recipientId]);
+      if (!wallet.rowCount || wallet.rows[0].address.toLowerCase() !== recipient.recipientAddress.toLowerCase()) {
+        unsupported.push({ recipientType: 'organization', recipientId: recipient.recipientId,
+          reason: wallet.rowCount ? 'wallet_address_mismatch' : 'verified_organization_wallet_unavailable' });
+      }
+    } else unsupported.push({ recipientType: recipient.recipientType, recipientId: recipient.recipientId,
+      reason: 'generation_1_external_recipient_unsupported' });
   }
+  return unsupported;
 }
 
 function currencyReviewActionId({ worldId, agentId, worldMinute, action }) {
   return `currency-${createHash('sha256').update(`${worldId}:${agentId}:${worldMinute}:${action}`).digest('hex').slice(0, 40)}`;
+}
+
+export function currencyReviewErrorOutcome(error) {
+  const name = String(error?.name || '').toLowerCase();
+  const code = String(error?.code || '').toUpperCase();
+  const status = Number(error?.status);
+  if (name.includes('timeout') || name === 'aborterror'
+      || ['ETIMEDOUT', 'ESOCKETTIMEDOUT', 'ABORT_ERR'].includes(code)) {
+    return { outcome: 'provider_timeout', reasonCode: 'provider_request_timeout' };
+  }
+  if (name === 'apiconnectionerror' || ['ECONNREFUSED', 'ECONNRESET', 'ENETUNREACH', 'ENOTFOUND', 'EAI_AGAIN'].includes(code)
+      || status === 429 || status >= 500) {
+    return { outcome: 'provider_unavailable', reasonCode: 'provider_connection_unavailable' };
+  }
+  return { outcome: 'provider_error', reasonCode: 'provider_request_error' };
+}
+
+function currencyReviewChoiceOutcome(choiceId) {
+  if (choiceId === 'no_action') return 'explicit_no_action';
+  if (choiceId === 'propose_currency') return 'explicit_propose';
+  if (choiceId.startsWith('response:')) return 'explicit_response';
+  return 'other';
+}
+
+export async function recordCurrencyReviewOutcome(client, { worldId, agent, worldMinute, requirement,
+  outcome, reasonCode, provider = 'typesafe', model = null, confidence = null, selectedActionId = null,
+  providerAttempted = false, inputTokens = null }) {
+  const reviewId = currencyReviewActionId({ worldId, agentId: agent.agentId, worldMinute, action: 'review-outcome' });
+  const safeLabel = (value, fallback = null) => typeof value === 'string' && value.length
+    ? value.replace(/[^A-Za-z0-9._:/-]/g, '_').slice(0, 120) : fallback;
+  const outcomes = new Set(['explicit_no_action','explicit_propose','explicit_response','provider_unavailable',
+    'provider_timeout','provider_error','malformed_output','invalid_choice','low_confidence','no_valid_decision',
+    'skipped_not_due','other']);
+  const safeOutcome = outcomes.has(outcome) ? outcome : 'other';
+  await client.query(`INSERT INTO world_v7_events(world_id,actor_agent_id,event_type,entity_type,entity_id,
+      world_minute,details,action_id) VALUES($1,$2,'currency_genesis.review_outcome','currency_genesis_review',$3,$4,$5::jsonb,$6)
+    ON CONFLICT(world_id,actor_agent_id,action_id) DO NOTHING`,
+  [worldId, agent.agentId, worldId, worldMinute, JSON.stringify({ reviewId,
+    actionId: selectedActionId, provider: safeLabel(provider, 'unknown'), model: safeLabel(model),
+    outcome: safeOutcome, reasonCode: safeLabel(reasonCode, 'unspecified'),
+    confidence: Number.isFinite(confidence) ? confidence : null,
+    providerAttempted: providerAttempted === true,
+    inputTokens: Number.isSafeInteger(inputTokens) && inputTokens >= 0 ? inputTokens : null,
+    requirementStatus: requirement?.status || null }), reviewId]);
+  if (providerAttempted === true) {
+    const validInputTokens = Number.isSafeInteger(inputTokens) && inputTokens > 0 ? inputTokens : null;
+    await recordInfrastructureUsageEvent(client, { worldId, attributionType: 'agent', agentId: agent.agentId,
+      actionId: `${reviewId}:usage`, resourceCategory: 'ai_inference', provider: safeLabel(provider, 'unknown'),
+      model: safeLabel(model), worldMinute, quantityRaw: validInputTokens === null ? '1' : String(validInputTokens),
+      unit: validInputTokens === null ? 'provider_request_attempt' : 'provider_input_token',
+      costStatus: 'unpriced', metadata: { reviewId, outcome: safeOutcome,
+        reasonCode: safeLabel(reasonCode, 'unspecified'), confidence: Number.isFinite(confidence) ? confidence : null,
+        inputTokens: validInputTokens } });
+  }
 }
 
 async function recordCurrencyReviewChoice(client, { worldId, agent, worldMinute, selected, options, requirement }) {
@@ -467,21 +558,25 @@ async function recordCurrencyReviewChoice(client, { worldId, agent, worldMinute,
 }
 
 async function currencyAuthoringInput(client, { worldId, agent, worldMinute, requirement, intent = null }) {
-  const [history, recipients, economicEvidence] = await Promise.all([
-    client.query(`SELECT history.event_type AS type,actor.name AS agent,
+  const history = await client.query(`SELECT history.event_type AS type,actor.name AS agent,
         history.metadata->>'decision' AS decision,history.title AS summary,history.world_time AS "worldMinute"
       FROM world_history history LEFT JOIN agents actor ON actor.id=history.actor_agent_id
       WHERE history.world_id=$1 AND (history.entity_type='agent_token_issuance'
         OR history.event_type LIKE 'currency_genesis_%')
-      ORDER BY history.world_time DESC,history.id DESC LIMIT 16`, [worldId]),
-    client.query(`SELECT 'agent' AS type,member.agent_id AS id,agent.name,wallet.address
+      ORDER BY history.world_time DESC,history.id DESC LIMIT 16`, [worldId]);
+  const recipients = await client.query(`SELECT 'agent' AS type,member.agent_id AS id,agent.name,wallet.address
       FROM world_members member JOIN agents agent ON agent.id=member.agent_id
       JOIN arc_agent_wallets wallet ON wallet.world_id=member.world_id AND wallet.agent_id=member.agent_id
         AND wallet.chain_id=5042 AND wallet.status='active'
-      WHERE member.world_id=$1 ORDER BY member.joined_at,member.agent_id LIMIT 32`, [worldId]),
-    client.query(`SELECT service_type,world_day,unmet_count FROM world_economic_demand
-      WHERE world_id=$1 AND unmet_count>0 ORDER BY world_day DESC,service_type LIMIT 8`, [worldId])
-  ]);
+      WHERE member.world_id=$1
+      UNION ALL
+      SELECT 'organization' AS type,organization.id,organization.name,wallet.address
+      FROM world_organizations organization JOIN arc_organization_wallets wallet
+        ON wallet.world_id=organization.world_id AND wallet.organization_id=organization.id
+          AND wallet.chain_id=5042 AND wallet.status='active'
+      WHERE organization.world_id=$1 ORDER BY type,id LIMIT 32`, [worldId]);
+  const economicEvidence = await client.query(`SELECT service_type,world_day,unmet_count FROM world_economic_demand
+      WHERE world_id=$1 AND unmet_count>0 ORDER BY world_day DESC,service_type LIMIT 8`, [worldId]);
   let currentProposal = null;
   if (intent) {
     const proposer = await client.query('SELECT name FROM agents WHERE id=$1', [intent.proposer_agent_id]);
@@ -500,18 +595,63 @@ async function currencyAuthoringInput(client, { worldId, agent, worldMinute, req
   publicCurrencyHistory: history.rows, availableRecipients: recipients.rows, currentProposal };
 }
 
+export function classifyCurrencyReviewResult(result, options) {
+  if (!Array.isArray(options) || options.length < 2) return { selected: null, diagnostic: {
+    outcome: 'no_valid_decision', reasonCode: 'insufficient_review_options', provider: 'typesafe',
+    providerAttempted: false } };
+  if (result?.currencyReviewDiagnostic) {
+    const diagnostic = result.currencyReviewDiagnostic;
+    const failedOutcomes = new Set(['provider_unavailable','provider_timeout','provider_error','malformed_output',
+      'invalid_choice','low_confidence','no_valid_decision']);
+    if (failedOutcomes.has(diagnostic.outcome)) return { selected: null, diagnostic: {
+      ...diagnostic, providerAttempted: diagnostic.providerAttempted === true,
+      inputTokens: Number.isSafeInteger(diagnostic.inputTokens) && diagnostic.inputTokens >= 0
+        ? diagnostic.inputTokens : null } };
+    return { selected: null, diagnostic: { outcome: 'malformed_output',
+      reasonCode: 'invalid_diagnostic_result', provider: 'typesafe', model: null } };
+  }
+  if (result === null || result === undefined) return { selected: null, diagnostic: {
+    outcome: 'no_valid_decision', reasonCode: 'provider_returned_no_result', provider: 'typesafe',
+    providerAttempted: true } };
+  if (typeof result !== 'object' || Array.isArray(result)) return { selected: null, diagnostic: {
+    outcome: 'malformed_output', reasonCode: 'result_not_an_object', provider: 'typesafe', providerAttempted: true } };
+  const usageDiagnostic = { providerAttempted: result.providerAttempted !== false,
+    inputTokens: Number.isSafeInteger(result.inputTokens) && result.inputTokens >= 0 ? result.inputTokens : null };
+  const rawChoice = result.choice;
+  const id = rawChoice && typeof rawChoice === 'object' ? rawChoice.id : rawChoice ?? result.id;
+  if (typeof id !== 'string' || !id.length) return { selected: null, diagnostic: {
+    outcome: 'malformed_output', reasonCode: 'choice_missing', provider: result.provider || 'typesafe',
+    model: result.model || null, ...usageDiagnostic } };
+  const selected = options.find((option) => option.id === id);
+  const confidence = Number(result?.confidence);
+  if (!selected) return { selected: null, diagnostic: { outcome: 'invalid_choice',
+    reasonCode: 'choice_not_offered', provider: result.provider || 'typesafe', model: result.model || null,
+    ...usageDiagnostic } };
+  if (!Number.isFinite(confidence)) return { selected: null, diagnostic: { outcome: 'malformed_output',
+    reasonCode: 'confidence_missing_or_invalid', provider: result.provider || 'typesafe', model: result.model || null,
+    ...usageDiagnostic } };
+  if (confidence < 0.3) return { selected: null, diagnostic: { outcome: 'low_confidence',
+    reasonCode: 'confidence_below_existing_threshold', provider: result.provider || 'typesafe',
+    model: result.model || null, confidence, ...usageDiagnostic } };
+  return { selected: { ...selected, confidence, source: result?.model || 'typesafe' }, diagnostic: {
+    outcome: currencyReviewChoiceOutcome(id), reasonCode: 'offered_choice_selected',
+    provider: result.provider || 'typesafe', model: result.model || null, confidence, selectedActionId: id,
+    ...usageDiagnostic } };
+}
+
 async function chooseCurrencyReviewOption(chooseWithTypeSafe, { worldId, agent, worldMinute, requirement, state, options }) {
-  if (typeof chooseWithTypeSafe !== 'function' || options.length < 2) return null;
+  if (typeof chooseWithTypeSafe !== 'function') return { selected: null, diagnostic: {
+    outcome: 'provider_unavailable', reasonCode: 'provider_callback_unavailable', provider: 'typesafe',
+    providerAttempted: false } };
   try {
     const result = await chooseWithTypeSafe({ worldId, agentId: agent.agentId, agent, worldMinute,
       choiceType: 'currency_genesis', state: { ...state, requirement: 'CURRENCY_GENESIS_REQUIRED',
         requirementStatus: requirement.status }, options });
-    const id = result?.choice?.id || result?.choice || result?.id;
-    const selected = options.find((option) => option.id === id);
-    const confidence = Number(result?.confidence);
-    if (!selected || !Number.isFinite(confidence) || confidence < 0.3) return null;
-    return { ...selected, confidence, source: result?.model || 'typesafe' };
-  } catch { return null; }
+    return classifyCurrencyReviewResult(result, options);
+  } catch (error) {
+    return { selected: null, diagnostic: { ...currencyReviewErrorOutcome(error), provider: 'typesafe', model: null,
+      providerAttempted: true } };
+  }
 }
 
 async function canConfirmCurrencyIntent(client, { worldId, agentId, intent, worldMinute }) {
@@ -527,16 +667,26 @@ async function canConfirmCurrencyIntent(client, { worldId, agentId, intent, worl
       issuerAgentId: agentId, issuerIdentityId: wallet.rows[0].external_identity_id,
       issuerWallet: wallet.rows[0].address, worldMinute, generation });
     if (!spec.complete) return false;
-    await verifyDistributionRecipients(client, worldId, spec.distribution);
-    return true;
+    return (await verifyDistributionRecipients(client, worldId, spec.distribution)).length === 0;
   } catch { return false; }
 }
 
 export async function advanceWorldCurrencyGenesis(client, { worldId, agent, worldMinute,
-  chooseWithTypeSafe = null, authorProposal = authorAgentCurrencyProposal }) {
+  chooseWithTypeSafe = null, authorProposal = authorAgentCurrencyProposal, reviewDue = true }) {
+  if (!reviewDue) {
+    const existing = await client.query(`SELECT * FROM arc_currency_genesis_requirements WHERE world_id=$1`, [worldId]);
+    const requirement = existing.rows[0] || null;
+    await recordCurrencyReviewOutcome(client, { worldId, agent, worldMinute, requirement,
+      outcome: 'skipped_not_due', reasonCode: 'review_not_due', provider: null });
+    return { status: requirement?.status || null, decision: 'pending', reason: 'review_not_due' };
+  }
   const requirement = await ensureWorldCurrencyGenesisRequirement(client, { worldId, worldMinute });
   await recordRequirementAwareness(client, { worldId, agent, requirement, worldMinute });
-  if (requirement.status === 'SATISFIED') return { status: 'SATISFIED', decision: 'none' };
+  if (requirement.status === 'SATISFIED') {
+    await recordCurrencyReviewOutcome(client, { worldId, agent, worldMinute, requirement,
+      outcome: 'other', reasonCode: 'requirement_already_satisfied', provider: 'not_called' });
+    return { status: 'SATISFIED', decision: 'none' };
+  }
 
   const openRows = await client.query(`SELECT * FROM arc_token_issuance_intents
     WHERE world_id=$1 AND status IN ('incomplete','proposed','deferred')
@@ -595,7 +745,7 @@ export async function advanceWorldCurrencyGenesis(client, { worldId, agent, worl
   }
 
   const input = await currencyAuthoringInput(client, { worldId, agent, worldMinute, requirement, intent: currentIntent });
-  const selected = await chooseCurrencyReviewOption(chooseWithTypeSafe, { worldId, agent, worldMinute, requirement,
+  const review = await chooseCurrencyReviewOption(chooseWithTypeSafe, { worldId, agent, worldMinute, requirement,
     state: { worldFacts: input.worldFacts,
       residentGoal: agent.primaryGoal || agent.currentGoal || agent.goal || null,
       activeGoals: Array.isArray(agent.goals) ? agent.goals.slice(0, 8) : [],
@@ -605,8 +755,13 @@ export async function advanceWorldCurrencyGenesis(client, { worldId, agent, worl
         proposerAgentId: currentIntent.proposer_agent_id, issuerAgentId: currentIntent.issuer_agent_id,
         name: currentIntent.name, purpose: currentIntent.purpose, specification: agentTokenSpecificationFromIntentRow(currentIntent) } : null,
       proposalsAndResponses: input.publicCurrencyHistory }, options });
-  if (!selected) return { status: requirement.status, decision: 'pending', reason: 'cognition_abstained_or_unavailable' };
+  if (!review.selected) {
+    await recordCurrencyReviewOutcome(client, { worldId, agent, worldMinute, requirement, ...review.diagnostic });
+    return { status: requirement.status, decision: 'pending', reason: 'cognition_abstained_or_unavailable' };
+  }
+  const selected = review.selected;
   await recordCurrencyReviewChoice(client, { worldId, agent, worldMinute, selected, options, requirement });
+  await recordCurrencyReviewOutcome(client, { worldId, agent, worldMinute, requirement, ...review.diagnostic });
   if (selected.id === 'no_action') return { status: requirement.status, decision: 'no_action' };
 
   if (selected.id === 'propose_currency') {
@@ -690,6 +845,15 @@ export async function confirmWorldTokenIssuance(client, { worldId, agentId, inte
   const intent = await readIntent(client, worldId, intentId, true);
   const idempotencyKey = actionIdentifier(actionId);
   if (intent.issuer_agent_id !== agentId) throw worldError('TOKEN_SELECTED_ISSUER_REQUIRED', 403);
+  const genesisAssignment = Number(intent.capability_generation) === 1
+    ? await creatorGenesisIssuerAssignment(client, worldId, 1) : null;
+  if (Number(intent.capability_generation) === 1 && !genesisAssignment) {
+    throw worldError('TOKEN_ISSUER_ASSIGNMENT_NOT_FOUND', 409);
+  }
+  if (genesisAssignment && (genesisAssignment.issuerAgentId !== agentId
+      || intent.issuer_selection_source !== genesisAssignment.selectionSource)) {
+    throw worldError('TOKEN_ISSUER_CREATOR_ASSIGNMENT_REQUIRED', 409);
+  }
   const priorDecision = await client.query(`SELECT intent_id,decision FROM arc_token_issuance_decisions
     WHERE world_id=$1 AND agent_id=$2 AND action_id=$3`, [worldId, agentId, idempotencyKey]);
   if (priorDecision.rowCount) {
@@ -744,7 +908,37 @@ export async function confirmWorldTokenIssuance(client, { worldId, agentId, inte
     issuerIdentityId: wallet.external_identity_id, issuerWallet: wallet.address, worldMinute,
     generation: effectiveGeneration });
   if (!normalized.complete) throw worldError('TOKEN_ISSUANCE_INCOMPLETE', 409);
-  await verifyDistributionRecipients(client, worldId, normalized.distribution);
+  const unsupportedDistribution = await verifyDistributionRecipients(client, worldId, normalized.distribution);
+  if (unsupportedDistribution.length) {
+    const decisionInsert = await client.query(`INSERT INTO arc_token_issuance_decisions(world_id,intent_id,agent_id,decision,
+        rationale,world_minute,action_id) VALUES($1,$2,$3,'issuer_confirm',NULL,$4,$5)
+      ON CONFLICT(world_id,agent_id,action_id) DO NOTHING RETURNING id`, [worldId, intentId, agentId, worldMinute, idempotencyKey]);
+    if (!decisionInsert.rowCount) throw worldError('ACTION_ID_CONFLICT', 409);
+    const deferred = await client.query(`UPDATE arc_token_issuance_intents SET status='deferred',
+        issuer_selection_source=COALESCE(issuer_selection_source,$3),issuer_identity_id=$4,issuer_wallet=$5,
+        specification_hash=$6,initial_supply_raw=$7,reserve_amount_raw=$8,distribution=$9::jsonb,
+        issuer_confirmed_world_minute=$10,updated_world_minute=$10,updated_at=now(),
+        metadata=metadata||jsonb_build_object('executionStatus','deferred_unsupported_distribution',
+          'unsupportedDistribution',$11::jsonb)
+      WHERE world_id=$1 AND id=$2 AND status IN ('incomplete','proposed','deferred') RETURNING *`,
+    [worldId, intentId, genesisAssignment?.selectionSource || 'agent_nomination', normalized.issuerIdentityId.toString(),
+      normalized.issuerWallet, normalized.specificationHash, normalized.totalSupplyRaw.toString(), normalized.reserveRaw.toString(),
+      JSON.stringify(intent.distribution), worldMinute, JSON.stringify(unsupportedDistribution)]);
+    if (!deferred.rowCount) throw worldError('TOKEN_ISSUANCE_STATE_CHANGED', 409);
+    await recordIssuanceEvent(client, { worldId, agentId, intentId, eventType: 'token_issuance_deferred',
+      worldMinute, actionId: `${idempotencyKey}:unsupported-distribution`, details: {
+        reason: 'UNSUPPORTED_DISTRIBUTION_RECIPIENT', unsupportedDistribution,
+        distributionPreserved: true, creatorAllocationRaw: '0' } });
+    await writeWorldHistory(client, { worldId, eventKey: `token-issuance-unsupported-distribution:${intentId}:${idempotencyKey}`,
+      eventType: 'token_issuance_deferred', actorAgentId: agentId, entityType: 'agent_token_issuance',
+      entityId: intentId, worldTime: worldMinute, title: 'Genesis distribution deferred by current wallet capability',
+      detail: 'The issuer-confirmed distribution remains unchanged and deferred because Generation 1 currently executes only to verified world Agent or Organization wallets.',
+      metadata: { intentId, specificationHash: normalized.specificationHash, unsupportedDistribution,
+        issuerSelectionSource: genesisAssignment?.selectionSource || 'agent_nomination', creatorAllocationRaw: '0' } });
+    await refreshWorldCurrencyGenesisRequirement(client, { worldId, worldMinute });
+    return { intent: deferred.rows[0], deferred: true, reason: 'UNSUPPORTED_DISTRIBUTION_RECIPIENT',
+      unsupportedDistribution, distributionPreserved: true, readyForExecution: false };
+  }
 
   await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))',
     [`synterra-agent-token-capacity:${worldId}`]);
@@ -788,19 +982,22 @@ export async function confirmWorldTokenIssuance(client, { worldId, agentId, inte
   const saved = await client.query(`UPDATE arc_token_issuance_intents SET status='issuer_confirmed',
       capability_generation=$3,issuer_identity_id=$4,issuer_wallet=$5,specification_hash=$6,initial_supply_raw=$7,
       reserve_amount_raw=$8,distribution=$9::jsonb,issuer_confirmed_world_minute=$10,
+      issuer_selection_source=COALESCE(issuer_selection_source,$11),
       updated_world_minute=$10,updated_at=now()
     WHERE world_id=$1 AND id=$2 AND status IN ('incomplete','proposed','deferred') RETURNING *`, [worldId, intentId,
     effectiveGeneration, normalized.issuerIdentityId.toString(), normalized.issuerWallet, normalized.specificationHash,
     normalized.totalSupplyRaw.toString(), normalized.reserveRaw.toString(),
     JSON.stringify(normalized.distribution.map((recipient) => ({ recipientType: recipient.recipientType,
       recipientId: recipient.recipientId, recipientAddress: recipient.recipientAddress,
-      amountRaw: recipient.amountRaw.toString() }))), worldMinute]);
+      amountRaw: recipient.amountRaw.toString() }))), worldMinute,
+    genesisAssignment?.selectionSource || 'agent_nomination']);
   if (!saved.rowCount) {
     throw worldError('TOKEN_ISSUANCE_STATE_CHANGED', 409);
   }
   await recordIssuanceEvent(client, { worldId, agentId, intentId, eventType: 'token_issuance_issuer_confirmed',
     worldMinute, actionId: `${idempotencyKey}:confirmed`, details: { issuerAgentId: agentId,
       issuerIdentityId: normalized.issuerIdentityId.toString(), issuerWallet: normalized.issuerWallet,
+      issuerSelectionSource: genesisAssignment?.selectionSource || 'agent_nomination',
       specificationHash: normalized.specificationHash } });
   await writeWorldHistory(client, { worldId, eventKey: `token-issuance-issuer-confirmed:${intentId}`,
     eventType: 'token_issuance_issuer_confirmed', actorAgentId: agentId, entityType: 'agent_token_issuance',

@@ -22,6 +22,7 @@ test('meal purchase debits the configured amount and returns the remaining balan
   const client = {
     async query(sql, params) {
       calls.push({ sql, params });
+      if (sql.includes('FROM world_genesis_currency_activations')) return { rows: [] };
       if (sql.includes('AS can_spend')) return { rows: [{ can_spend: true }] };
       if (sql.includes('INSERT INTO token_ledger')) return { rows: [] };
       if (sql.includes('AS units')) return { rows: [{ units: '3.00000000' }] };
@@ -39,6 +40,7 @@ test('meal purchase rejects an insufficient balance before writing a debit', asy
   const client = {
     async query(sql) {
       calls.push(sql);
+      if (sql.includes('FROM world_genesis_currency_activations')) return { rows: [] };
       return { rows: [{ can_spend: false }] };
     }
   };
@@ -46,6 +48,6 @@ test('meal purchase rejects an insufficient balance before writing a debit', asy
     chargeMeal(client, { worldId: 'world-1', agentId: 'agent-1', actionId: 'action-2' }),
     (error) => error.message === 'INSUFFICIENT_INTERNAL_UNITS' && error.statusCode === 409
   );
-  assert.equal(calls.length, 1);
+  assert.equal(calls.length, 2);
   assert.ok(!calls.some((sql) => sql.includes('INSERT INTO token_ledger')));
 });

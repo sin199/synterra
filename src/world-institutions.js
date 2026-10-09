@@ -3,6 +3,8 @@ import { ensureEconomicAccount, getEconomicAccount, transferBetweenAccounts } fr
 import { actionIdentifier, boundedNumber, jsonObject, requireWorldMember, requiredText, worldError, writeWorldHistory } from './world-domain.js';
 import { decideOrganizationMembership } from './world-organizations.js';
 import { decideProjectMembership } from './world-projects.js';
+import { isGenesisCurrencyActive, readGenesisCurrencyActivation, formatGenesisTokenRaw,
+  createArcGenesisTokenSettlementIntent } from './genesis-economy.js';
 
 const AGREEMENT_TYPES = new Set(['employment','service','project_cooperation','investment','revenue_sharing',
   'resource_sharing','organization_membership','supplier_relationship','partnership']);
@@ -10,7 +12,7 @@ const TERM_KEYS = {
   employment: ['businessId','jobId','applicationId','employmentId','wageUsdc','role','durationShifts'],
   service: ['businessId','serviceId','customerAgentId','priceUsdc','units','deliveryDelayWorldMinutes'],
   project_cooperation: ['projectId','effortPoints','rewardShare'],
-  investment: ['businessId','amountUsdc','ownershipShare'],
+  investment: ['businessId','amountUsdc','amountRaw','tokenId','ownershipShare'],
   revenue_sharing: ['businessId','shareBps','recipientAgentId','capPerDayUsdc'],
   resource_sharing: ['resourceKey','amount','recipientAgentId'],
   organization_membership: ['organizationId','role'],
@@ -49,7 +51,7 @@ function normalizeTerms(type, value) {
   const input = jsonObject(value, 'agreement_terms');
   const terms = Object.fromEntries(Object.entries(input).filter(([key]) => TERM_KEYS[type].includes(key)));
   const idKeys = ['businessId','jobId','applicationId','employmentId','serviceId','projectId','recipientAgentId','customerAgentId',
-    'organizationId','sellerAgentId','buyerAgentId'];
+    'organizationId','sellerAgentId','buyerAgentId','tokenId'];
   for (const key of idKeys) if (terms[key] !== undefined && !UUID_RE.test(String(terms[key]))) {
     throw institutionError(`AGREEMENT_${key.toUpperCase()}_INVALID`, 400);
   }
@@ -57,6 +59,12 @@ function normalizeTerms(type, value) {
   for (const key of amountKeys) if (terms[key] !== undefined) terms[key] = normalizeAmount(terms[key], key,
     { min: key === 'amount' ? '0.00000001' : '0.01' });
   if (terms.ownershipShare !== undefined) terms.ownershipShare = boundedNumber(terms.ownershipShare, 0.0001, 0.95, 'ownership_share');
+  if (terms.amountRaw !== undefined) {
+    if (typeof terms.amountRaw !== 'string' || !/^[1-9]\d*$/.test(terms.amountRaw)
+        || BigInt(terms.amountRaw) > (1n << 128n) - 1n) {
+      throw institutionError('AGREEMENT_AMOUNT_RAW_INVALID', 400);
+    }
+  }
   if (terms.rewardShare !== undefined) terms.rewardShare = boundedNumber(terms.rewardShare, 0, 1, 'reward_share');
   if (terms.shareBps !== undefined) terms.shareBps = Math.trunc(boundedNumber(terms.shareBps, 1, 5000, 'share_bps'));
   if (terms.units !== undefined) terms.units = Math.trunc(boundedNumber(terms.units, 1, 10, 'units'));
@@ -71,7 +79,9 @@ function normalizeTerms(type, value) {
   }
   if (terms.gift !== undefined && typeof terms.gift !== 'boolean') throw institutionError('AGREEMENT_GIFT_INVALID', 400);
   if (type === 'employment' && !terms.employmentId) throw institutionError('EMPLOYMENT_ID_REQUIRED', 400);
-  if (type === 'investment' && (!terms.businessId || !terms.amountUsdc || !terms.ownershipShare)) {
+  if (type === 'investment' && (!terms.businessId || (!terms.amountUsdc && !terms.amountRaw) || !terms.ownershipShare
+      || (terms.amountRaw && (!terms.tokenId || terms.amountUsdc))
+      || (!terms.amountRaw && terms.tokenId))) {
     throw institutionError('INVESTMENT_TERMS_REQUIRED', 400);
   }
   if (type === 'partnership' && (!terms.businessId || !terms.sellerAgentId || !terms.buyerAgentId || !terms.ownershipShare)) {
@@ -190,6 +200,13 @@ export async function proposeWorldAgreement(client, { worldId, proposerAgentId, 
   const key = actionIdentifier(actionId);
   const kind = String(agreementType || '').toLowerCase();
   const normalized = normalizeTerms(kind, terms);
+  const genesisCurrency = await readGenesisCurrencyActivation(client, worldId);
+  if (genesisCurrency
+      && !(['project_cooperation','organization_membership'].includes(kind)
+        || (kind === 'resource_sharing' && normalized.resourceKey === 'effort')
+        || (kind === 'investment' && normalized.amountRaw && normalized.tokenId === genesisCurrency.tokenId))) {
+    throw institutionError('LEGACY_SIMULATED_ECONOMY_RETIRED', 409);
+  }
   const duration = Math.trunc(boundedNumber(expiresInWorldMinutes, 1, 43_200, 'agreement_expiry'));
   const repeated = await client.query(`SELECT * FROM world_agreements WHERE world_id=$1 AND proposer_agent_id=$2 AND action_id=$3`,
     [worldId, proposerAgentId, key]);
@@ -265,6 +282,29 @@ export async function proposeWorldAgreement(client, { worldId, proposerAgentId, 
       metadata: { agreementType: kind, counterpartyAgentId, expiresWorldTime: worldTime + duration } });
   }
   return agreement;
+}
+
+export async function proposeGenesisTokenBusinessInvestment(client, { worldId, investorAgentId, businessId,
+  amountRaw, ownershipShare, actionId, worldTime }) {
+  const activation = await readGenesisCurrencyActivation(client, worldId, { forUpdate: true });
+  if (!activation) throw institutionError('GENESIS_CURRENCY_NOT_ACTIVE');
+  const business = await client.query(`SELECT founder_agent_id AS "founderAgentId",status,name
+    FROM world_businesses WHERE world_id=$1 AND id=$2`, [worldId, businessId]);
+  if (!business.rowCount || business.rows[0].status !== 'active') throw institutionError('BUSINESS_NOT_ACTIVE', 404);
+  if (business.rows[0].founderAgentId === investorAgentId) throw institutionError('BUSINESS_OWNER_CANNOT_INVEST_IN_SELF', 400);
+  const rawText = typeof amountRaw === 'string' ? amountRaw : String(amountRaw ?? '');
+  if (!/^[1-9]\d*$/.test(rawText) || BigInt(rawText) > (1n << 128n) - 1n) {
+    throw institutionError('GENESIS_TOKEN_INVESTMENT_AMOUNT_INVALID', 400);
+  }
+  const share = boundedNumber(ownershipShare, 0.0001, 0.95, 'ownership_share');
+  const agreement = await proposeWorldAgreement(client, { worldId, proposerAgentId: investorAgentId,
+    counterpartyAgentId: business.rows[0].founderAgentId, agreementType: 'investment',
+    terms: { businessId, amountRaw: rawText, tokenId: activation.tokenId, ownershipShare: share },
+    actionId, worldTime, expiresInWorldMinutes: 4_320 });
+  return { agreementId: agreement.id, businessId, businessName: business.rows[0].name,
+    tokenId: activation.tokenId, amountRaw: rawText, ownershipShare: share,
+    status: agreement.status, settlement: 'awaiting_founder_acceptance_and_arc_confirmation',
+    tokenOwnershipAuthority: 'arc_chain_confirmation', idempotent: Boolean(agreement.idempotent) };
 }
 
 async function updateAgentReputation(client, { worldId, agentId, otherAgentId, dimension, delta, worldTime, outcome,
@@ -659,6 +699,42 @@ async function executeAgreement(client, agreement, worldTime) {
     return { lifecycle: 'active', agreementId: agreement.id, employmentId: terms.employmentId, wageUsdc: wage };
   }
   if (agreement.agreement_type === 'investment') {
+    const genesisCurrency = await readGenesisCurrencyActivation(client, agreement.world_id, { forUpdate: true });
+    if (genesisCurrency) {
+      if (!terms.amountRaw || terms.amountUsdc || terms.tokenId !== genesisCurrency.tokenId) {
+        throw institutionError('GENESIS_TOKEN_INVESTMENT_TERMS_INVALID', 409);
+      }
+      const business = await client.query(`SELECT id,founder_agent_id AS "founderAgentId",status
+        FROM world_businesses WHERE world_id=$1 AND id=$2 FOR UPDATE`, [agreement.world_id, terms.businessId]);
+      if (!business.rowCount || business.rows[0].status !== 'active') throw institutionError('BUSINESS_NOT_ACTIVE');
+      const founderAgentId = business.rows[0].founderAgentId;
+      if (![agreement.proposer_agent_id, agreement.counterparty_agent_id].includes(founderAgentId)) {
+        throw institutionError('BUSINESS_OWNER_MUST_BE_PARTY', 403);
+      }
+      const investorAgentId = agreement.proposer_agent_id === founderAgentId
+        ? agreement.counterparty_agent_id : agreement.proposer_agent_id;
+      const share = Number(terms.ownershipShare);
+      const reservedShares = await client.query(`SELECT COALESCE(sum((terms->>'ownershipShare')::numeric),0)::text AS shares
+        FROM world_agreements WHERE world_id=$1 AND agreement_type='investment' AND id<>$2
+          AND status IN ('active','completed') AND terms->>'businessId'=$3::text
+          AND terms->>'tokenId'=$4`, [agreement.world_id, agreement.id, terms.businessId, genesisCurrency.tokenId]);
+      if (Number(reservedShares.rows[0]?.shares || 0) + share > 1.0000001) {
+        throw institutionError('GENESIS_BUSINESS_EQUITY_EXCEEDS_100_PERCENT');
+      }
+      const settlement = await createArcGenesisTokenSettlementIntent(client, { worldId: agreement.world_id,
+        tokenId: genesisCurrency.tokenId, fromAgentId: investorAgentId, toAgentId: founderAgentId,
+        amountRaw: terms.amountRaw, actionId: `business-equity:${agreement.id}`,
+        actionFamily: 'business_equity_investment',
+        reason: `Genesis Token investment in business ${terms.businessId}.`, worldMinute,
+        metadata: { kind: 'business_equity_investment', agreementId: agreement.id,
+          businessId: terms.businessId, investorAgentId, founderAgentId,
+          ownershipShare: share, ownershipAuthority: 'arc_confirmed_business_agreement',
+          tokenOwnershipAuthority: 'arc_chain_confirmation' } });
+      return { lifecycle: 'active', agreementId: agreement.id, businessId: terms.businessId,
+        tokenId: genesisCurrency.tokenId, amountRaw: terms.amountRaw, ownershipShare: share,
+        settlementId: settlement.settlement.id, settlementStatus: settlement.settlement.status,
+        ownershipStatus: 'pending_arc_confirmation', tokenOwnershipAuthority: 'arc_chain_confirmation' };
+    }
     const business = await client.query(`SELECT id,founder_agent_id,status FROM world_businesses
       WHERE world_id=$1 AND id=$2 FOR UPDATE`, [agreement.world_id, terms.businessId]);
     if (!business.rowCount || business.rows[0].status !== 'active') throw institutionError('BUSINESS_NOT_ACTIVE');
@@ -836,6 +912,14 @@ export async function respondToWorldAgreement(client, { worldId, agreementId, ag
   const selected = await client.query(`SELECT * FROM world_agreements WHERE world_id=$1 AND id=$2 FOR UPDATE`, [worldId, agreementId]);
   if (!selected.rowCount) throw institutionError('AGREEMENT_NOT_FOUND', 404);
   const agreement = selected.rows[0];
+  const genesisCurrency = await readGenesisCurrencyActivation(client, worldId);
+  if (genesisCurrency
+      && !(['project_cooperation','organization_membership'].includes(agreement.agreement_type)
+        || (agreement.agreement_type === 'resource_sharing' && agreement.terms?.resourceKey === 'effort')
+        || (agreement.agreement_type === 'investment' && agreement.terms?.amountRaw
+          && agreement.terms?.tokenId === genesisCurrency.tokenId))) {
+    throw institutionError('LEGACY_SIMULATED_ECONOMY_RETIRED', 409);
+  }
   if (agreement.metadata?.responseActionId === key) return { ...agreement, idempotent: true };
   if (agreement.status !== 'proposed' || ![agreement.proposer_agent_id, agreement.counterparty_agent_id].includes(agentId)) {
     throw institutionError('AGREEMENT_RESPONSE_NOT_ALLOWED', 403);
@@ -979,6 +1063,7 @@ export async function resolveWorldCommitment(client, { worldId, commitmentId, ag
 }
 
 export async function recordEmploymentShift(client, { worldId, employmentId, workActionId, worldTime, businessId, agentId }) {
+  if (await isGenesisCurrencyActive(client, worldId)) return null;
   const selected = await client.query(`SELECT id,proposer_agent_id,counterparty_agent_id,terms FROM world_agreements
     WHERE world_id=$1 AND agreement_type='employment' AND status='active' AND terms->>'employmentId'=$2
     ORDER BY updated_world_time DESC LIMIT 1`, [worldId, employmentId]);
@@ -1023,6 +1108,7 @@ export async function recordEmploymentShift(client, { worldId, employmentId, wor
 
 export async function settleActiveRevenueShares(client, { worldId, businessId, businessRevenueUsdc, orderActionId,
   customerAgentId, worldTime }) {
+  if (await isGenesisCurrencyActive(client, worldId)) return [];
   const agreements = await client.query(`SELECT id,proposer_agent_id,counterparty_agent_id,terms
     FROM world_agreements WHERE world_id=$1 AND agreement_type='revenue_sharing' AND status='active'
       AND terms->>'businessId'=$2 ORDER BY created_world_time,id FOR UPDATE`, [worldId, businessId]);
@@ -1061,6 +1147,7 @@ export async function settleActiveRevenueShares(client, { worldId, businessId, b
 
 export async function activeServicePriceAgreement(client, { worldId, businessId, serviceId, customerAgentId, providerAgentId,
   worldTime, agreementId = null }) {
+  if (await isGenesisCurrencyActive(client, worldId)) return null;
   const result = await client.query(`SELECT agreement.id,agreement.agreement_type,agreement.terms
     FROM world_agreements agreement WHERE agreement.world_id=$1 AND agreement.status='active'
       AND agreement.agreement_type IN ('service','supplier_relationship')
@@ -1089,6 +1176,7 @@ export async function activeServicePriceAgreement(client, { worldId, businessId,
 
 export async function settleServiceDelivery(client, { worldId, agreementId, customerAgentId, providerAgentId,
   businessId, orderId, worldTime, actionId }) {
+  if (await isGenesisCurrencyActive(client, worldId)) return;
   if (!agreementId) return;
   const agreement = await client.query(`SELECT * FROM world_agreements WHERE world_id=$1 AND id=$2 FOR UPDATE`,
     [worldId, agreementId]);
@@ -1412,7 +1500,35 @@ function governanceVote(proposal, organization, cash, trust, reputation, skill) 
  * makes the final selection.
  */
 export async function planInstitutionalAction(client, { worldId, agent, worldTime }) {
+  // This planner's contract, investment, revenue-share, wage and treasury
+  // candidates are denominated in the retired simulated-USDC economy. Native
+  // Genesis Token business decisions use the explicit token-raw-unit candidates.
   const agentId = agent.agentId;
+  const genesisCurrency = await readGenesisCurrencyActivation(client, worldId);
+  if (genesisCurrency) {
+    const incoming = await client.query(`SELECT agreement.*,business.founder_agent_id AS "founderAgentId",
+        business.name AS "businessName"
+      FROM world_agreements agreement JOIN world_businesses business
+        ON business.world_id=agreement.world_id AND business.id=(agreement.terms->>'businessId')::uuid
+      WHERE agreement.world_id=$1 AND agreement.counterparty_agent_id=$2 AND agreement.agreement_type='investment'
+        AND agreement.status='proposed' AND agreement.terms->>'tokenId'=$3
+        AND (agreement.expires_world_time IS NULL OR agreement.expires_world_time>$4)
+      ORDER BY agreement.expires_world_time NULLS LAST,agreement.created_world_time,agreement.id LIMIT 1`,
+    [worldId, agentId, genesisCurrency.tokenId, worldTime]);
+    if (!incoming.rowCount || incoming.rows[0].founderAgentId !== agentId) return null;
+    const agreement = incoming.rows[0];
+    const relation = relationshipFor(agent, agreement.proposer_agent_id);
+    const amountHuman = formatGenesisTokenRaw(agreement.terms.amountRaw, genesisCurrency.decimals);
+    const share = Number(agreement.terms.ownershipShare);
+    return institutionCandidate(agent, 'agreement_respond', `${agreement.id}:genesis-investment-review`,
+      `Review whether to accept ${amountHuman} ${genesisCurrency.symbol} for ${share.toFixed(4)} of ${agreement.businessName}; acceptance waits for the investor wallet's Arc-confirmed transfer.`,
+      44 + Math.min(18, Math.max(-10, Number(relation.trust) || 0) * 0.25),
+      { agreementId: agreement.id, decision: 'accept',
+        institutionalTrace: { agreementId: agreement.id, agreementType: 'investment',
+          amountRaw: agreement.terms.amountRaw, tokenId: genesisCurrency.tokenId,
+          ownershipShare: share, relationshipTrust: Number(relation.trust) || 0,
+          pendingUntilArcConfirmation: true, tokenOwnershipAuthority: 'arc_chain_confirmation' } });
+  }
   const cash = await getEconomicAccount(client, { worldId, accountType: 'resident', ownerId: agentId });
   const reputationResult = await client.query(`SELECT reliability::text AS reliability,professional::text AS professional,
       financial::text AS financial,cooperation::text AS cooperation
@@ -1903,6 +2019,10 @@ export async function proposeOrganizationGovernance(client, { worldId, organizat
   if (!['rule_change','leadership_change','treasury_spend','project_approval','business_funding','member_change'].includes(type)) {
     throw institutionError('ORGANIZATION_PROPOSAL_TYPE_INVALID', 400);
   }
+  if (await isGenesisCurrencyActive(client, worldId)
+      && ['treasury_spend','business_funding'].includes(type)) {
+    throw institutionError('LEGACY_SIMULATED_ECONOMY_RETIRED', 409);
+  }
   const key = actionIdentifier(actionId);
   const normalized = normalizeOrganizationPayload(type, payload);
   const expires = worldTime + Math.trunc(boundedNumber(expiresInWorldMinutes, 1, 43_200, 'proposal_expiry'));
@@ -1942,6 +2062,7 @@ export async function proposeOrganizationGovernance(client, { worldId, organizat
 
 async function applyOrganizationProposal(client, proposal, organization, worldTime) {
   const payload = proposal.payload;
+  const genesisCurrencyActive = await isGenesisCurrencyActive(client, proposal.world_id);
   if (proposal.proposal_type === 'rule_change') {
     const rules = { ...(organization.governance_rules || {}), [payload.key]: payload.value };
     if (payload.key === 'governance_mode') {
@@ -2067,16 +2188,18 @@ async function applyOrganizationProposal(client, proposal, organization, worldTi
       WHERE world_id=$1 AND organization_id=$2 AND agent_id=$3 AND status='active' RETURNING agent_id`,
     [proposal.world_id, proposal.organization_id, payload.memberAgentId, worldTime]);
     if (!removed.rowCount) throw institutionError('ACTIVE_MEMBER_REQUIRED');
-    await client.query(`DELETE FROM world_economic_ownership WHERE world_id=$1 AND asset_type='organization' AND asset_id=$2
-      AND owner_type='resident' AND owner_id=$3`, [proposal.world_id, proposal.organization_id, payload.memberAgentId]);
-    const remainingMembers = await client.query(`SELECT agent_id FROM world_organization_members
-      WHERE world_id=$1 AND organization_id=$2 AND status='active' ORDER BY joined_world_time,agent_id`,
-    [proposal.world_id, proposal.organization_id]);
-    const share = remainingMembers.rowCount ? 1 / remainingMembers.rowCount : 0;
-    if (share > 0) await client.query(`UPDATE world_economic_ownership SET share=$3,updated_at=now()
-      WHERE world_id=$1 AND asset_type='organization' AND asset_id=$2 AND owner_type='resident'
-        AND owner_id=ANY($4::uuid[])`, [proposal.world_id, proposal.organization_id, share,
-      remainingMembers.rows.map((member) => member.agent_id)]);
+    if (!genesisCurrencyActive) {
+      await client.query(`DELETE FROM world_economic_ownership WHERE world_id=$1 AND asset_type='organization' AND asset_id=$2
+        AND owner_type='resident' AND owner_id=$3`, [proposal.world_id, proposal.organization_id, payload.memberAgentId]);
+      const remainingMembers = await client.query(`SELECT agent_id FROM world_organization_members
+        WHERE world_id=$1 AND organization_id=$2 AND status='active' ORDER BY joined_world_time,agent_id`,
+      [proposal.world_id, proposal.organization_id]);
+      const share = remainingMembers.rowCount ? 1 / remainingMembers.rowCount : 0;
+      if (share > 0) await client.query(`UPDATE world_economic_ownership SET share=$3,updated_at=now()
+        WHERE world_id=$1 AND asset_type='organization' AND asset_id=$2 AND owner_type='resident'
+          AND owner_id=ANY($4::uuid[])`, [proposal.world_id, proposal.organization_id, share,
+        remainingMembers.rows.map((member) => member.agent_id)]);
+    }
     return { status: 'executed', removedAgentId: payload.memberAgentId };
   }
   throw institutionError('ORGANIZATION_PROPOSAL_TYPE_UNSUPPORTED');

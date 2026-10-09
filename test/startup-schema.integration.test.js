@@ -97,12 +97,12 @@ test('startup schema apply/validate and fail-closed checks on isolated PostgreSQ
     await t.test('validate accepts legacy equivalent history constraint and preserves every business row and trigger', async () => {
       await pool.query('ALTER TABLE world_history DROP CONSTRAINT world_history_entity_type_check');
       await pool.query(`ALTER TABLE world_history ADD CONSTRAINT world_history_entity_type_check ${oldEquivalentHistoryConstraint}`);
-      const appUrl = new URL(databaseUrl); appUrl.username = 'synterra_app'; appUrl.password = '';
-      const appPool = new Pool({ connectionString: appUrl.href });
+      const appPool = new Pool({ connectionString: databaseUrl });
       const before = await snapshot(pool);
       const sql = [];
       const guardedPool = { async connect() {
         const client = await appPool.connect();
+        await client.query('SET ROLE synterra_app');
         return { release: () => client.release(), query: async (text, values) => {
           sql.push(text);
           assert.match(text.trim(), /^(SELECT|BEGIN .*READ ONLY|SET LOCAL statement_timeout|COMMIT|ROLLBACK)/);

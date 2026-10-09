@@ -4,6 +4,9 @@ import { ensureEconomicAccount, getEconomicAccount, postEconomicTransfer, transf
 import { activeServicePriceAgreement, createSystemEmploymentAgreement, recordAgreementExecutionStage,
   recordEmploymentShift, resolveBusinessAgreementsOnClosure, resolveEmploymentAgreementOnExit,
   settleActiveRevenueShares, settleServiceDelivery } from './world-institutions.js';
+import { createArcGenesisTokenSettlementIntent, formatGenesisTokenRaw,
+  isGenesisCurrencyActive, readGenesisBusinessEquity, readGenesisCurrencyActivation,
+  readSpendableGenesisTokenBalance } from './genesis-economy.js';
 
 const SERVICE_INFO = Object.freeze({
   research_service: { type: 'research', label: 'Research Notes', skill: 'research', base: '35.00000000',
@@ -56,6 +59,18 @@ function businessFailureType(business) {
   if (/owner_closed|voluntary|strategic/.test(reason)) return 'voluntary_exit';
   if (/maintenance|liquidity|capital|insolven|bankrupt/.test(reason)) return 'capital_failure';
   return 'operating_failure';
+}
+
+function genesisBusinessMetadata(metadata = {}) {
+  const currentContext = { ...metadata };
+  // Preserve operational identity and failure context, but keep pre-Genesis
+  // economic values and delegated simulated-economy controls out of cognition.
+  for (const key of Object.keys(currentContext)) {
+    if (/(?:usdc|simulated|cash|balance|revenue|profit|capital|valuation|wage|price|expense|investment|distribution)/i.test(key)
+        || ['accountId','controllerAgentIds','operatorAgentIds'].includes(key)) delete currentContext[key];
+  }
+  currentContext.legacySimulatedEconomy = 'historical_only';
+  return currentContext;
 }
 
 function retryCooldownMinutes(failureType) {
@@ -441,6 +456,17 @@ function isBusinessBeneficiary(agentId, business, ownership = []) {
 }
 
 async function readBusinessBeneficialShare(client, worldId, businessId, agentId) {
+  const activation = await readGenesisCurrencyActivation(client, worldId);
+  if (activation) {
+    const equity = await readGenesisBusinessEquity(client, { worldId, tokenId: activation.tokenId });
+    const investments = equity.investments.filter((item) => item.businessId === businessId);
+    const founder = investments[0]?.founderAgentId || (await client.query(`SELECT founder_agent_id AS "founderAgentId"
+      FROM world_businesses WHERE world_id=$1 AND id=$2`, [worldId, businessId])).rows[0]?.founderAgentId;
+    const externalShares = investments.reduce((sum, item) => sum + (Number(item.ownershipShare) || 0), 0);
+    if (founder === agentId) return Math.max(0, 1 - externalShares);
+    return investments.filter((item) => item.investorAgentId === agentId)
+      .reduce((sum, item) => sum + (Number(item.ownershipShare) || 0), 0);
+  }
   const beneficiary = await client.query(`WITH RECURSIVE owners(owner_type,owner_id,share,path) AS (
       SELECT owner_type,owner_id,share::numeric,ARRAY[owner_type||':'||owner_id::text]
       FROM world_economic_ownership WHERE world_id=$1 AND asset_type='business' AND asset_id=$2
@@ -808,7 +834,7 @@ export async function loadWorldBusinessContext(client, worldId, worldMinutes = 0
       WHERE service.world_id=$1 AND service.active=true AND business.status='active'
         AND (place.id IS NULL OR place.status='active')
       ORDER BY service.created_world_time,service.id`, [worldId]),
-    query(`SELECT job.*,business.founder_agent_id AS "founderAgentId",business.name AS "businessName",
+    query(`SELECT job.*,job.required_skill AS "requiredSkill",business.founder_agent_id AS "founderAgentId",business.name AS "businessName",
         business.status AS "businessStatus",account.balance::text AS "businessCash",
         COALESCE((SELECT count(*)::int FROM world_business_applications application
           WHERE application.job_id=job.id AND application.status='pending'),0) AS "pendingCount"
@@ -828,7 +854,7 @@ export async function loadWorldBusinessContext(client, worldId, worldMinutes = 0
         AND business_cash.account_key='business:'||business.id::text AND business_cash.asset_symbol='USDC'
       WHERE application.world_id=$1 ORDER BY application.created_world_time,application.id`, [worldId]),
     query(`SELECT employment.*,business.name AS "businessName",business.status AS "businessStatus",business.place_id AS "placeId",
-        business_cash.balance::text AS "businessCash",
+        business.founder_agent_id AS "founderAgentId",job.id AS "jobId",business_cash.balance::text AS "businessCash",
         place.name AS "placeName",job.required_skill AS "requiredSkill",job.role,
         service.id AS "serviceId",service.service_type AS "serviceType"
       FROM world_business_employment employment JOIN world_businesses business ON business.id=employment.business_id
@@ -897,10 +923,16 @@ export async function loadWorldBusinessContext(client, worldId, worldMinutes = 0
       FROM world_business_services service JOIN world_businesses business
         ON business.world_id=service.world_id AND business.id=service.business_id
       WHERE service.world_id=$1 ORDER BY service.created_world_time,service.id`, [worldId]),
-    query(`SELECT employment.agent_id AS "agentId",employment.business_id AS "businessId",job.role,
+    query(`SELECT employment.id,employment.agent_id AS "agentId",employment.business_id AS "businessId",
+        employment.status,employment.wage_usdc::text AS "wageUsdc",employment.wage_token_id AS "wageTokenId",
+        employment.wage_raw::text AS "wageRaw",business.founder_agent_id AS "founderAgentId",
+        business.name AS "businessName",business.status AS "businessStatus",business.place_id AS "placeId",
+        place.name AS "placeName",job.id AS "jobId",job.required_skill AS "requiredSkill",job.role,
         employment.started_world_time AS "startedWorldTime",employment.ended_world_time AS "endedWorldTime"
       FROM world_business_employment employment JOIN world_business_jobs job
         ON job.world_id=employment.world_id AND job.id=employment.job_id
+      JOIN world_businesses business ON business.world_id=employment.world_id AND business.id=employment.business_id
+      LEFT JOIN world_scenes place ON place.world_id=business.world_id AND place.id=business.place_id
       WHERE employment.world_id=$1 AND job.role ~* '(manager|operator|controller|director)'`, [worldId]),
     query(`SELECT agreement.id AS "agreementId",agreement.agreement_type AS "agreementType",
         agreement.status,agreement.updated_world_time AS "failedWorldTime",
@@ -928,16 +960,191 @@ export async function loadWorldBusinessContext(client, worldId, worldMinutes = 0
           > COALESCE(delivered.units,0)
       ORDER BY agreement.updated_world_time DESC,agreement.id`, [worldId, worldMinutes])
   ]);
-  const demand = deriveWorldEconomicDemand(residents, services.rows, worldMinutes);
+  const genesisCurrency = await readGenesisCurrencyActivation(client, worldId);
+  let businessRows = businesses.rows;
+  let serviceRows = services.rows;
+  let allServiceRows = allBusinessServices.rows;
+  let jobRows = jobs.rows;
+  let applicationRows = applications.rows;
+  let employmentRows = employment.rows;
+  let ownershipRows = ownership.rows;
+  let organizationRows = organizations.rows;
+  let projectRows = projects.rows;
+  let placeRows = places.rows;
+  let contractRows = contractDemand.rows;
+  let failedContractRows = failedContractDemand.rows;
+  let serviceRowsForDemand = serviceRows;
+  const genesisWallets = new Map();
+  let genesisInvestments = [];
+  if (genesisCurrency) {
+    const [serviceTerms, jobTerms, tokenWallets, tokenInvestments, tokenBusinessFlows] = await Promise.all([
+      query(`SELECT service_id AS "serviceId",token_id AS "tokenId",price_raw::text AS "priceRaw",
+          effective_world_minute AS "effectiveWorldMinute"
+        FROM world_business_service_token_terms WHERE world_id=$1 AND token_id=$2`, [worldId, genesisCurrency.tokenId]),
+      query(`SELECT job_id AS "jobId",token_id AS "tokenId",wage_raw::text AS "wageRaw",
+          effective_world_minute AS "effectiveWorldMinute"
+        FROM world_business_job_token_terms WHERE world_id=$1 AND token_id=$2`, [worldId, genesisCurrency.tokenId]),
+      query(`SELECT wallet.agent_id AS "agentId",wallet.address,wallet.account_type AS "walletAccountType",
+          snapshot.balance_raw::text AS "balanceRaw",
+          snapshot.block_number::text AS "blockNumber",snapshot.observed_at AS "observedAt",
+          COALESCE(reserved.amount_raw,0)::text AS "reservedRaw"
+        FROM arc_agent_wallets wallet
+        LEFT JOIN world_genesis_token_balance_snapshots snapshot ON snapshot.world_id=wallet.world_id
+          AND snapshot.token_id=$2 AND lower(snapshot.wallet_address)=lower(wallet.address)
+          AND snapshot.observed_at >= now()-interval '60 seconds'
+        LEFT JOIN LATERAL (SELECT sum(amount_raw) AS amount_raw FROM arc_genesis_token_settlement_outbox outbox
+          WHERE outbox.world_id=wallet.world_id AND outbox.token_id=$2
+            AND lower(outbox.from_address)=lower(wallet.address)
+            AND outbox.status IN ('prepared','submitting','submission_unknown','submitted')) reserved ON true
+        WHERE wallet.world_id=$1 AND wallet.chain_id=5042 AND wallet.status='active'`, [worldId, genesisCurrency.tokenId])
+      ,query(`SELECT agreement.id,agreement.status,agreement.proposer_agent_id AS "proposerAgentId",
+          agreement.counterparty_agent_id AS "counterpartyAgentId",agreement.terms,
+          agreement.metadata->'execution' AS execution,agreement.updated_world_time AS "updatedWorldTime",
+          business.id AS "businessId",business.name AS "businessName",business.founder_agent_id AS "founderAgentId"
+        FROM world_agreements agreement JOIN world_businesses business
+          ON business.world_id=agreement.world_id AND business.id=(agreement.terms->>'businessId')::uuid
+        WHERE agreement.world_id=$1 AND agreement.agreement_type='investment'
+          AND agreement.terms->>'tokenId'=$2 AND agreement.status IN ('proposed','active','completed')
+        ORDER BY agreement.created_world_time,agreement.id`, [worldId, genesisCurrency.tokenId]),
+      query(`SELECT business.id AS "businessId",
+          COALESCE(orders.amount_raw,0)::text AS "serviceRevenueRaw",
+          COALESCE(wages.amount_raw,0)::text AS "wageExpenseRaw",
+          COALESCE(distributions.amount_raw,0)::text AS "distributedRaw",
+          COALESCE(pending.count,0)::int AS "pendingDistributionCount"
+        FROM world_businesses business
+        LEFT JOIN LATERAL (SELECT sum(order_row.amount_raw) AS amount_raw
+          FROM world_genesis_token_business_orders order_row
+          WHERE order_row.world_id=business.world_id AND order_row.business_id=business.id
+            AND order_row.token_id=$2 AND order_row.status='fulfilled') orders ON true
+        LEFT JOIN LATERAL (SELECT sum(outbox.amount_raw) AS amount_raw
+          FROM arc_genesis_token_settlement_outbox outbox
+          WHERE outbox.world_id=business.world_id AND outbox.token_id=$2
+            AND outbox.action_family='business_shift_wage' AND outbox.from_agent_id=business.founder_agent_id
+            AND outbox.metadata->>'businessId'=business.id::text AND outbox.status='final') wages ON true
+        LEFT JOIN LATERAL (SELECT sum(outbox.amount_raw) AS amount_raw
+          FROM arc_genesis_token_settlement_outbox outbox
+          WHERE outbox.world_id=business.world_id AND outbox.token_id=$2
+            AND outbox.action_family='business_profit_distribution' AND outbox.metadata->>'businessId'=business.id::text
+            AND outbox.status IN ('prepared','submitting','submission_unknown','submitted','final')) distributions ON true
+        LEFT JOIN LATERAL (SELECT count(*) AS count
+          FROM arc_genesis_token_settlement_outbox outbox
+          WHERE outbox.world_id=business.world_id AND outbox.token_id=$2
+            AND outbox.action_family='business_profit_distribution' AND outbox.metadata->>'businessId'=business.id::text
+            AND outbox.status IN ('prepared','submitting','submission_unknown','submitted')) pending ON true
+        WHERE business.world_id=$1`, [worldId, genesisCurrency.tokenId])
+    ]);
+    genesisInvestments = tokenInvestments.rows.map((row) => ({ ...row,
+      amountRaw: String(row.terms?.amountRaw || '0'), ownershipShare: Number(row.terms?.ownershipShare) || 0,
+      tokenId: row.terms?.tokenId || null,
+      investorAgentId: row.proposerAgentId === row.founderAgentId ? row.counterpartyAgentId : row.proposerAgentId,
+      settlementStatus: row.execution?.settlementStatus || (row.status === 'completed' ? 'final' : 'pending') }));
+    const confirmedGenesisInvestments = genesisInvestments.filter((investment) => investment.status === 'completed'
+      && investment.execution?.ownershipStatus === 'arc_confirmed_business_equity');
+    const pendingGenesisInvestments = genesisInvestments.filter((investment) => investment.status === 'active'
+      && investment.execution?.settlementStatus !== 'final' && investment.execution?.settlementStatus !== 'failed');
+    const businessFlows = new Map(tokenBusinessFlows.rows.map((row) => [row.businessId, row]));
+    for (const wallet of tokenWallets.rows) {
+      const balance = wallet.balanceRaw === null ? null : BigInt(wallet.balanceRaw);
+      const reserved = BigInt(wallet.reservedRaw || '0');
+      const authorizationSupported = ['eoa','sca','msca'].includes(wallet.walletAccountType);
+      genesisWallets.set(wallet.agentId, { address: wallet.address, balanceRaw: balance?.toString() || null,
+        reservedRaw: reserved.toString(), authorizationSupported,
+        spendableRaw: balance === null || !authorizationSupported ? null
+          : (balance > reserved ? balance - reserved : 0n).toString(), blockNumber: wallet.blockNumber,
+        observedAt: wallet.observedAt });
+    }
+    const serviceTermById = new Map(serviceTerms.rows.map((row) => [row.serviceId, row]));
+    const jobTermById = new Map(jobTerms.rows.map((row) => [row.jobId, row]));
+    serviceRows = serviceRows.map((row) => {
+      const business = businessRows.find((item) => item.id === row.business_id);
+      const term = serviceTermById.get(row.id);
+      const ownerWallet = genesisWallets.get(row.founderAgentId || business?.founder_agent_id);
+      return { ...row, base_price_usdc: null, businessCash: null,
+        tokenPriceRaw: term?.priceRaw || null, tokenPriceTokenId: term?.tokenId || null,
+        tokenPriceEffectiveWorldMinute: Number(term?.effectiveWorldMinute || 0),
+        founderTokenSpendableRaw: ownerWallet?.spendableRaw || null,
+        founderTokenObservedAt: ownerWallet?.observedAt || null };
+    });
+    allServiceRows = allServiceRows.map((row) => ({ ...row, base_price_usdc: null,
+      tokenPriceRaw: serviceTermById.get(row.id)?.priceRaw || null,
+      tokenPriceTokenId: serviceTermById.get(row.id)?.tokenId || null,
+      tokenPriceEffectiveWorldMinute: Number(serviceTermById.get(row.id)?.effectiveWorldMinute || 0) }));
+    serviceRowsForDemand = serviceRows.filter((row) => row.tokenPriceRaw && row.businessStatus === 'active');
+    businessRows = businessRows.map((row) => {
+      const flow = businessFlows.get(row.id) || {};
+      const currentInvestments = confirmedGenesisInvestments.filter((investment) => investment.businessId === row.id);
+      const finalizedShares = currentInvestments.reduce((total, investment) => total + investment.ownershipShare, 0);
+      const currentOwners = [
+        { ownerType: 'resident', ownerId: row.founder_agent_id,
+          share: String(Math.max(0, 1 - finalizedShares)), ownershipAuthority: 'business_founder_record' },
+        ...currentInvestments.map((investment) => ({ ownerType: 'resident', ownerId: investment.investorAgentId,
+          share: String(investment.ownershipShare), tokenId: investment.tokenId, amountRaw: investment.amountRaw,
+          ownershipAuthority: 'arc_chain_confirmation', transactionHash: investment.execution?.transactionHash || null,
+          blockNumber: investment.execution?.blockNumber || null }))
+      ];
+      return { ...row, valuation_usdc: null, cash_balance: null, revenue: null, expenses: null,
+      metadata: genesisBusinessMetadata(row.metadata),
+      founderTokenSpendableRaw: genesisWallets.get(row.founder_agent_id)?.spendableRaw || null,
+      founderTokenObservedAt: genesisWallets.get(row.founder_agent_id)?.observedAt || null,
+      genesisServiceRevenueRaw: String(flow.serviceRevenueRaw || '0'),
+      genesisWageExpenseRaw: String(flow.wageExpenseRaw || '0'),
+      genesisDistributedRaw: String(flow.distributedRaw || '0'),
+      genesisPendingDistributionCount: Number(flow.pendingDistributionCount || 0),
+      genesisEquityInvestments: currentInvestments,
+      genesisPendingEquityObligations: pendingGenesisInvestments.filter((investment) => investment.businessId === row.id),
+      genesisEquityShare: Math.max(0, 1 - finalizedShares), owners: currentOwners };
+    });
+    jobRows = jobRows.map((row) => {
+      const term = jobTermById.get(row.id);
+      const ownerWallet = genesisWallets.get(row.founderAgentId);
+      return { ...row, wage_usdc: null, wage: null, businessCash: null,
+        tokenWageRaw: term?.wageRaw || null, tokenWageTokenId: term?.tokenId || null,
+        tokenWageEffectiveWorldMinute: Number(term?.effectiveWorldMinute || 0),
+        businessSpendableRaw: ownerWallet?.spendableRaw || null,
+        businessTokenObservedAt: ownerWallet?.observedAt || null };
+    });
+    applicationRows = applicationRows.map((row) => {
+      const term = jobTermById.get(row.job_id);
+      const ownerWallet = genesisWallets.get(row.founderAgentId);
+      return { ...row, wage: null, businessCash: null, tokenWageRaw: term?.wageRaw || null,
+        tokenWageTokenId: term?.tokenId || null, businessSpendableRaw: ownerWallet?.spendableRaw || null };
+    });
+    employmentRows = employmentRows.map((row) => {
+      const ownerWallet = genesisWallets.get(row.founderAgentId);
+      const acceptedCurrentTokenWage = row.wage_token_id === genesisCurrency.tokenId && row.wage_raw !== null
+        && row.wage_raw !== undefined && BigInt(row.wage_raw) > 0n;
+      const currentOffer = jobTermById.get(row.jobId);
+      return { ...row, wage_usdc: null, businessCash: null,
+        wageTokenId: row.wage_token_id || null, wageRaw: row.wage_raw?.toString() || null,
+        economicStatus: acceptedCurrentTokenWage ? 'active_token_wage' : 'historical_only',
+        legacySimulatedEconomy: acceptedCurrentTokenWage ? null : 'historical_only',
+        tokenWageRaw: currentOffer?.wageRaw || null, tokenWageTokenId: currentOffer?.tokenId || null,
+        requiresTokenWageAcceptance: !acceptedCurrentTokenWage || row.wage_raw?.toString() !== currentOffer?.wageRaw,
+        businessSpendableRaw: ownerWallet?.spendableRaw || null };
+    });
+    ownershipRows = businessRows.flatMap((business) => business.owners.map((owner) => ({
+      assetType: 'business', assetId: business.id, ...owner, investedUsdc: null
+    })));
+    organizationRows = organizationRows.map((row) => ({ ...row, cash_balance: null }));
+    projectRows = projectRows.map((row) => ({ ...row, cash_balance: null, realized_profit_usdc: null,
+      owners: [] }));
+    placeRows = placeRows.map((row) => ({ ...row, operating_cost_usdc: null, revenue_enabled: false }));
+    operatorHistory.rows = operatorHistory.rows.filter((row) => Number(row.startedWorldTime) >= Number(genesisCurrency.worldMinute)
+      && row.wageTokenId === genesisCurrency.tokenId && row.wageRaw !== null && row.wageRaw !== undefined);
+    contractRows = [];
+    failedContractRows = [];
+  }
+  const demand = deriveWorldEconomicDemand(residents, serviceRowsForDemand, worldMinutes);
   await persistWorldEconomicDemand(client, worldId, worldMinutes, demand);
   const residentSkills = Object.fromEntries(residents.map((resident) => [resident.agent_id || resident.agentId,
     resident.skills || {}]));
-  return { businesses: businesses.rows, services: services.rows, allBusinessServices: allBusinessServices.rows,
-    operatorHistory: operatorHistory.rows, jobs: jobs.rows,
-    applications: applications.rows, employment: employment.rows, ownership: ownership.rows, demand,
-    organizations: organizations.rows, projects: projects.rows, places: places.rows,
-    failedContractDemand: failedContractDemand.rows,
-    contractDemand: contractDemand.rows, residentSkills, worldMinutes };
+  return { businesses: businessRows, services: serviceRows, allBusinessServices: allServiceRows,
+    operatorHistory: operatorHistory.rows, jobs: jobRows,
+    applications: applicationRows, employment: employmentRows, ownership: ownershipRows, demand,
+    organizations: organizationRows, projects: projectRows, places: placeRows,
+    failedContractDemand: failedContractRows, contractDemand: contractRows, residentSkills, worldMinutes,
+    genesisCurrencyActive: Boolean(genesisCurrency), genesisCurrency,
+    genesisWallets: Object.fromEntries(genesisWallets), genesisInvestments };
 }
 
 async function persistWorldEconomicDemand(client, worldId, worldMinutes, rows) {
@@ -1019,6 +1226,7 @@ export async function observeWorldBusinessMarket(client, { worldId, agentId, ser
 }
 
 export function buildBusinessCandidates(agent, context = {}) {
+  if (context.genesisCurrencyActive) return buildGenesisBusinessCandidates(agent, context);
   const options = [];
   const cash = Number(agent.usdc || agent.usdcBalance || 0);
   const energy = Number(agent.energy) || 0;
@@ -1413,6 +1621,181 @@ export function buildBusinessCandidates(agent, context = {}) {
   return options.filter((item) => Number.isFinite(item.score)).sort((left, right) => right.score - left.score);
 }
 
+function genesisPriceChoices(currency) {
+  const decimals = Number(currency?.decimals);
+  let supply;
+  try { supply = BigInt(currency?.initialSupplyRaw); } catch { return []; }
+  if (!Number.isInteger(decimals) || decimals < 0 || decimals > 18 || supply <= 0n) return [];
+  const base = 10n ** BigInt(decimals);
+  const rawChoices = new Set();
+  for (const exponent of [-4, -3, -2, -1, 0, 1, 2]) {
+    const amount = exponent < 0 ? base / (10n ** BigInt(-exponent)) : base * (10n ** BigInt(exponent));
+    if (amount > 0n && amount <= supply) rawChoices.add(amount.toString());
+  }
+  return [...rawChoices].map((raw) => ({ raw, human: formatGenesisTokenRaw(raw, decimals) }));
+}
+
+function buildGenesisBusinessCandidates(agent, context) {
+  const options = [];
+  const memories = Array.isArray(agent.recentMemories) ? agent.recentMemories : [];
+  const agentId = agent.agentId || agent.agent_id;
+  const currency = context.genesisCurrency;
+  const choices = genesisPriceChoices(currency);
+  const spendable = (() => { try { return BigInt(agent.genesisTokenSpendableRaw || '0'); } catch { return 0n; } })();
+  const balancesFresh = Boolean(agent.genesisTokenObservedAt);
+  const energy = Number(agent.energy) || 0;
+  const food = Number(agent.food) || 0;
+  const skills = agent.skills || {};
+  const goal = String(agent.primaryGoal || agent.goal || '').toUpperCase();
+  const worldMinutes = Math.max(0, Math.trunc(Number(context.worldMinutes) || 0));
+  const agentEmployment = (context.employment || []).filter((item) => (item.agent_id || item.agentId) === agentId
+    && item.status === 'active');
+  const activeEmployment = agentEmployment.find((item) => item.wageTokenId === currency.tokenId
+    && item.wageRaw !== null && item.wageRaw !== undefined && BigInt(item.wageRaw) > 0n);
+  const pendingWageAcceptance = agentEmployment.find((item) => item.tokenWageTokenId === currency.tokenId
+    && item.tokenWageRaw && (!activeEmployment || item.id === activeEmployment.id)
+    && (item.wageTokenId !== currency.tokenId || String(item.wageRaw) !== String(item.tokenWageRaw)));
+  const owned = (context.businesses || []).filter((business) => business.founder_agent_id === agentId
+    || business.founderAgentId === agentId
+    || (business.owners || []).some((owner) => owner.ownerType === 'resident' && owner.ownerId === agentId
+      && Number(owner.share) >= 0.5));
+
+  for (const service of context.allBusinessServices || context.services || []) {
+    const business = owned.find((item) => item.id === (service.business_id || service.businessId));
+    if (!business || business.status !== 'active' || service.active === false || !choices.length) continue;
+    const lastPublished = Number(service.tokenPriceEffectiveWorldMinute || 0);
+    if (service.tokenPriceRaw && worldMinutes - lastPublished < 1_440) continue;
+    for (const choice of choices) options.push({
+      id: `genesis:service-price:${service.id}:${choice.raw}`,
+      action: 'business_token_price', targetLocation: service.placeName || agent.location,
+      goal: `Choose whether to publish ${choice.human} ${currency.symbol} as the explicit price for ${service.name}. This is a fresh TOKEN quote chosen by this owner; the previous USDC quote was not converted.`,
+      businessId: business.id, serviceId: service.id, priceRaw: choice.raw,
+      score: 25 + (goal.includes('WEALTH') || goal.includes('BUSINESS') ? 2 : 0)
+    });
+  }
+
+  for (const job of context.jobs || []) {
+    const business = owned.find((item) => item.id === (job.business_id || job.businessId));
+    if (!business || business.status !== 'active' || !['open','filled'].includes(job.status) || !choices.length) continue;
+    const lastPublished = Number(job.tokenWageEffectiveWorldMinute || 0);
+    if (job.tokenWageRaw && worldMinutes - lastPublished < 1_440) continue;
+    for (const choice of choices) options.push({
+      id: `genesis:job-wage:${job.id}:${choice.raw}`,
+      action: 'business_token_wage', targetLocation: agent.location,
+      goal: `Choose whether to publish ${choice.human} ${currency.symbol} as the explicit ${job.role} wage. This is a fresh TOKEN wage chosen by this owner; the previous USDC wage was not converted.`,
+      businessId: business.id, jobId: job.id, wageRaw: choice.raw,
+      score: 24 + (goal.includes('WEALTH') || goal.includes('BUSINESS') ? 2 : 0)
+    });
+  }
+
+  if (pendingWageAcceptance && energy >= 15 && food >= 8) {
+    options.push({ id: `genesis:accept-wage:${pendingWageAcceptance.id}`, action: 'business_wage_accept',
+      targetLocation: agent.location,
+      goal: `Decide whether to accept the expressly published ${formatGenesisTokenRaw(pendingWageAcceptance.tokenWageRaw, currency.decimals)} ${currency.symbol} wage at ${pendingWageAcceptance.businessName}.`,
+      employmentId: pendingWageAcceptance.id, score: 38 + (goal.includes('WEALTH') ? 4 : 0) });
+  }
+
+  // Pre-Genesis rows may remain status='active' as preserved history. Only an
+  // employment backed by an accepted Genesis Token wage has current economic
+  // authority and can block a new application.
+  if (!activeEmployment && energy >= 20 && food >= 12) for (const job of context.jobs || []) {
+    if (job.status !== 'open' || job.businessStatus !== 'active' || !job.tokenWageRaw
+        || job.tokenWageTokenId !== currency.tokenId || !job.businessSpendableRaw
+        || (context.applications || []).some((application) => (application.agent_id || application.agentId) === agentId
+          && application.job_id === job.id && application.status === 'pending')) continue;
+    if ((job.founderAgentId || job.founder_agent_id) === agentId) continue;
+    const skill = Number(skills[job.requiredSkill] || 0);
+    options.push({ id: `genesis:apply:${job.id}`, action: 'business_apply', targetLocation: job.placeName || agent.location,
+      goal: `Consider applying for ${job.role} at ${job.businessName}, which has an explicit ${currency.symbol} wage and recent owner-wallet balance evidence.`,
+      jobId: job.id, businessId: job.business_id || job.businessId,
+      score: 30 + Math.min(16, skill * 0.2) + (goal.includes('WEALTH') ? 5 : 0) });
+  }
+
+  for (const application of context.applications || []) {
+    const appAgentId = application.agent_id || application.agentId;
+    if (application.founderAgentId === agentId && application.status === 'pending'
+        && application.jobStatus === 'open' && application.tokenWageRaw
+        && application.tokenWageTokenId === currency.tokenId && application.businessSpendableRaw
+        && BigInt(application.businessSpendableRaw) >= BigInt(application.tokenWageRaw) * 8n) {
+      options.push({ id: `genesis:hire:${application.id}`, action: 'business_hire', targetLocation: agent.location,
+        goal: `Review ${application.agent_name || 'the resident'}'s application for ${application.role} with the published ${currency.symbol} wage and available wallet evidence.`,
+        applicationId: application.id, businessId: application.business_id,
+        score: 42 + Math.min(12, (Number(skills[application.requiredSkill]) || 0) * 0.1) });
+      options.push({ id: `genesis:reject:${application.id}`, action: 'business_reject', targetLocation: agent.location,
+        goal: `Decline ${application.agent_name || 'the resident'}'s application if the role or the business's current needs do not fit.`,
+        applicationId: application.id, businessId: application.business_id, score: 10 });
+    }
+    if (appAgentId === agentId && application.status === 'pending' && application.jobStatus === 'open') {
+      const age = Math.max(0, worldMinutes - Number(application.created_world_time || worldMinutes));
+      if (age >= 720) options.push({ id: `genesis:withdraw:${application.id}`, action: 'business_withdraw',
+        targetLocation: agent.location, goal: `Withdraw the pending application if you no longer want this role.`,
+        applicationId: application.id, businessId: application.business_id, score: 16 });
+    }
+  }
+
+  if (activeEmployment && activeEmployment.wageTokenId === currency.tokenId && activeEmployment.wageRaw
+      && energy >= 20 && food >= 12 && BigInt(activeEmployment.businessSpendableRaw || '0') >= BigInt(activeEmployment.wageRaw)) {
+    const service = (context.services || []).find((item) => item.business_id === activeEmployment.business_id
+      && item.active && item.tokenPriceRaw);
+    if (service && activeEmployment.businessStatus === 'active'
+        && Number(service.stock_units || 0) < 1_000_000) options.push({
+      id: `genesis:work:${activeEmployment.business_id}:${Math.floor(worldMinutes / 360)}`,
+      action: 'business_work', targetLocation: service.placeName || activeEmployment.placeName || agent.location,
+      goal: `Consider producing a service unit; the employer wallet can presently authorize the published ${currency.symbol} shift wage.`,
+      businessId: activeEmployment.business_id, serviceId: service.id, employmentId: activeEmployment.id,
+      score: 28 + (goal.includes('WEALTH') ? 5 : 0) + (Number(skills[activeEmployment.requiredSkill]) || 0) * 0.12
+    });
+  }
+
+  if (balancesFresh && spendable > 0n) {
+    const investibleAmounts = choices.filter((choice) => BigInt(choice.raw) <= spendable).slice(-3);
+    const relationships = new Map((agent.relationships || []).map((item) => [item.otherAgentId, item]));
+    for (const business of (context.businesses || []).filter((item) => item.status === 'active'
+      && (item.founder_agent_id || item.founderAgentId) !== agentId)) {
+      const founderAgentId = business.founder_agent_id || business.founderAgentId;
+      const relation = relationships.get(founderAgentId);
+      const trusted = Number(relation?.trust || 0) >= 2 || memories.some((memory) => memory.relatedAgentId === founderAgentId
+        && memory.memoryType === 'business');
+      const founderWallet = context.genesisWallets?.[founderAgentId];
+      const prior = (context.genesisInvestments || []).some((investment) => investment.businessId === business.id
+        && investment.investorAgentId === agentId);
+      if (!trusted || !founderWallet?.authorizationSupported || !founderWallet.observedAt || prior) continue;
+      for (const amount of investibleAmounts) for (const ownershipShare of [0.05, 0.1, 0.2]) {
+        options.push({ id: `genesis:business-invest:${business.id}:${amount.raw}:${ownershipShare}`,
+          action: 'business_invest', targetLocation: agent.location,
+          goal: `Consider proposing ${amount.human} ${currency.symbol} from your wallet for ${ownershipShare.toFixed(2)} of ${business.name}. The founder must accept, and the business equity becomes effective only after the Arc transfer is confirmed.`,
+          businessId: business.id, counterpartyAgentId: founderAgentId,
+          amountRaw: amount.raw, ownershipShare,
+          score: 18 + Math.min(12, Number(business.reputation || 0) * 0.2)
+            + Math.min(10, Math.max(0, Number(relation?.trust || 0)) * 0.3)
+            + (goal.includes('WEALTH') || goal.includes('BUSINESS') ? 5 : 0)
+            - ownershipShare * 8 });
+      }
+    }
+  }
+
+  for (const service of context.services || []) {
+    if (!service.active || service.businessStatus !== 'active' || !service.tokenPriceRaw
+        || service.tokenPriceTokenId !== currency.tokenId || !balancesFresh) continue;
+    const amount = BigInt(service.tokenPriceRaw);
+    if (spendable < amount || service.founderAgentId === agentId) continue;
+    const skillGoal = service.service_type === 'food_service' ? false
+      : service.service_type === 'social_service' ? goal.includes('COMMUNITY') || goal.includes('RELATION')
+        : service.service_type === 'engineering_service' ? goal.includes('ENGINEERING')
+          : service.service_type === 'trading_service' ? goal.includes('TRADING') || goal.includes('WEALTH')
+            : goal.includes('RESEARCH') || goal.includes('LEARN');
+    if (energy < 15 || food < 8) continue;
+    options.push({ id: `genesis:service:${service.id}`, action: 'business_service',
+      targetLocation: service.placeName || agent.location,
+      goal: `Consider whether this service is worth its explicit price of ${formatGenesisTokenRaw(amount, currency.decimals)} ${currency.symbol}.`,
+      businessId: service.business_id, serviceId: service.id, serviceType: service.service_type,
+      maxPriceRaw: amount.toString(), score: 24 + (skillGoal ? 12 : 0)
+        + (service.service_type === 'food_service' ? 2 : 0) });
+  }
+
+  return options.filter((item) => Number.isFinite(item.score)).sort((left, right) => right.score - left.score);
+}
+
 export async function practiceWorldBusinessCapability(client, { worldId, agentId, skill, serviceType, actionId, worldTime }) {
   if (!['social','trading','research','engineering'].includes(skill) || !Object.hasOwn(SERVICE_INFO, serviceType)) {
     throw error('BUSINESS_PREPARATION_INVALID', 400);
@@ -1458,7 +1841,11 @@ async function readBusiness(client, worldId, businessId, forUpdate = false) {
 export async function reopenWorldBusiness(client, { worldId, agentId, actionId, proposal, worldTime }) {
   const businessId = proposal?.businessId;
   const serviceType = proposal?.serviceType;
+  const genesisActive = await isGenesisCurrencyActive(client, worldId);
   if (!businessId || !Object.hasOwn(SERVICE_INFO, serviceType)) throw error('BUSINESS_REOPEN_PROPOSAL_INVALID', 400);
+  if (genesisActive && (proposal.capitalUsdc !== undefined || proposal.capitalSource !== undefined)) {
+    throw error('LEGACY_SIMULATED_ECONOMY_RETIRED', 409);
+  }
   if (proposal.capitalSource !== undefined) {
     const source = proposal.capitalSource;
     if (!source || !['resident','organization','project'].includes(source.type)
@@ -1466,7 +1853,7 @@ export async function reopenWorldBusiness(client, { worldId, agentId, actionId, 
         || (source.type !== 'resident' && !source.ownerId)) throw error('BUSINESS_CAPITAL_SOURCE_INVALID', 400);
   }
   const transferActionId = `business-reopen:${businessId}:${actionId}`;
-  const priorTransfer = await client.query(`SELECT id,amount::text AS amount FROM world_economic_transactions
+  const priorTransfer = genesisActive ? { rowCount: 0, rows: [] } : await client.query(`SELECT id,amount::text AS amount FROM world_economic_transactions
     WHERE world_id=$1 AND action_id=$2`, [worldId, transferActionId]);
   if (priorTransfer.rowCount) {
     const priorBusiness = await readBusiness(client, worldId, businessId);
@@ -1502,6 +1889,30 @@ export async function reopenWorldBusiness(client, { worldId, agentId, actionId, 
     FROM world_economic_demand WHERE world_id=$1 AND service_type=$2 AND world_day<=$3
       AND world_day >= $3-1 AND unmet_count>0 ORDER BY world_day DESC LIMIT 1`, [worldId, serviceType, day]);
   if (!demand.rowCount) throw error('BUSINESS_REOPEN_DEMAND_NOT_OBSERVED');
+
+  if (genesisActive) {
+    const place = business.place_id ? await client.query(`SELECT 1 FROM world_scenes
+      WHERE world_id=$1 AND id=$2 AND status='active' FOR UPDATE`, [worldId, business.place_id]) : { rowCount: 1 };
+    if (!place.rowCount) throw error('BUSINESS_PLACE_UNAVAILABLE');
+    await client.query(`UPDATE world_businesses SET status='active',consecutive_loss_days=0,
+      metadata=metadata||jsonb_build_object('lastReopenedWorldTime',$3::bigint,'lastReopenedActionId',$4::text,
+        'reopenCount',COALESCE((metadata->>'reopenCount')::int,0)+1,'legacyCapital','historical_only'),updated_at=now()
+      WHERE world_id=$1 AND id=$2`, [worldId, businessId, worldTime, actionId]);
+    await client.query(`UPDATE world_business_services SET active=true
+      WHERE world_id=$1 AND business_id=$2 AND service_type=$3`, [worldId, businessId, serviceType]);
+    await client.query(`UPDATE world_business_jobs SET status='open'
+      WHERE world_id=$1 AND business_id=$2 AND status='closed'`, [worldId, businessId]);
+    await recordHistory(client, { worldId, eventKey: `business-reopened:${businessId}:${actionId}`,
+      eventType: 'business_reopened', actorAgentId: agentId, entityType: 'business', entityId: businessId,
+      worldTime, title: business.name,
+      detail: `${business.name} reopened without converting or spending historical simulated USDC; its owner must publish fresh Genesis Token terms.`,
+      metadata: { businessId, serviceId: service.rows[0].id, serviceType,
+        legacySimulatedEconomy: 'historical_only', tokenPriceStatus: 'unpriced', tokenWageStatus: 'unpriced',
+        observedDemand: demand.rows[0] } });
+    return { id: businessId, businessId, name: business.name, status: 'active', serviceId: service.rows[0].id,
+      serviceType, reopened: true, idempotent: false, demand: demand.rows[0],
+      legacySimulatedEconomy: 'historical_only', tokenTermsRequired: true };
+  }
 
   const funding = proposal.capitalSource?.type === 'organization'
     ? { accountType: 'organization', ownerId: proposal.capitalSource.ownerId }
@@ -1591,6 +2002,10 @@ export async function foundWorldBusiness(client, { worldId, agentId, actionId, p
   const existing = await client.query(`SELECT id,name,status FROM world_businesses
     WHERE world_id=$1 AND founder_agent_id=$2 AND action_id=$3`, [worldId, agentId, actionId]);
   if (existing.rowCount) return { ...existing.rows[0], idempotent: true };
+  const genesisActive = await isGenesisCurrencyActive(client, worldId);
+  if (genesisActive && proposal.capitalUsdc !== undefined) {
+    throw error('LEGACY_SIMULATED_ECONOMY_RETIRED', 409);
+  }
   if (proposal.capitalSource?.type && !['resident','organization','project'].includes(proposal.capitalSource.type)) {
     throw error('BUSINESS_CAPITAL_SOURCE_INVALID', 400);
   }
@@ -1617,11 +2032,14 @@ export async function foundWorldBusiness(client, { worldId, agentId, actionId, p
   if (proposal.projectId && (capitalSource.accountType !== 'project' || proposal.projectId !== capitalSource.ownerId)) {
     throw error('BUSINESS_PROJECT_SOURCE_MISMATCH', 400);
   }
-  const cash = await getEconomicAccount(client, { worldId, ...capitalSource, asset: 'USDC', forUpdate: true });
-  const capital = formatUnits(parsePositiveUnits(String(proposal.capitalUsdc || FOUNDER_CAPITAL)));
-  if (!cash || parsePositiveUnits(capital) < parsePositiveUnits(FOUNDER_CAPITAL)
-      || Number(cash.balance) < MIN_FOUNDER_CASH || parsePositiveUnits(cash.balance) < parsePositiveUnits(capital)) {
-    throw error('INSUFFICIENT_FOUNDER_CAPITAL');
+  let capital = null;
+  if (!genesisActive) {
+    const cash = await getEconomicAccount(client, { worldId, ...capitalSource, asset: 'USDC', forUpdate: true });
+    capital = formatUnits(parsePositiveUnits(String(proposal.capitalUsdc || FOUNDER_CAPITAL)));
+    if (!cash || parsePositiveUnits(capital) < parsePositiveUnits(FOUNDER_CAPITAL)
+        || Number(cash.balance) < MIN_FOUNDER_CASH || parsePositiveUnits(cash.balance) < parsePositiveUnits(capital)) {
+      throw error('INSUFFICIENT_FOUNDER_CAPITAL');
+    }
   }
   const id = randomUUID();
   const inserted = await client.query(`INSERT INTO world_businesses(id,world_id,founder_agent_id,name,business_type,purpose,
@@ -1630,37 +2048,70 @@ export async function foundWorldBusiness(client, { worldId, agentId, actionId, p
     RETURNING id,name,business_type AS "businessType",status,founded_world_time AS "foundedWorldTime"`,
   [id, worldId, agentId, proposal.name.trim(), proposal.businessType, proposal.purpose.trim(), proposal.placeId || null,
     proposal.projectId || (capitalSource.accountType === 'project' ? capitalSource.ownerId : null),
-    capital, worldTime, actionId, JSON.stringify({ serviceType: proposal.serviceType,
+    capital || '0.00000000', worldTime, actionId, JSON.stringify({ serviceType: proposal.serviceType,
       foundingReason: proposal.foundingReason || 'observed_unmet_demand',
       capabilityFit: Number.isFinite(Number(proposal.capabilityFit)) ? Number(proposal.capabilityFit) : null,
       capabilityTeamAgentIds: Array.isArray(proposal.capabilityTeamAgentIds) ? proposal.capabilityTeamAgentIds : [agentId],
       founderSkillProfile: proposal.founderSkillProfile && typeof proposal.founderSkillProfile === 'object'
         ? proposal.founderSkillProfile : {} })]);
-  const businessAccount = await ensureEconomicAccount(client, { worldId, accountType: 'business', ownerId: id, key: `business:${id}` });
-  const ownerType = capitalSource.accountType;
-  await transferBetweenAccounts(client, { worldId,
-    source: capitalSource, destination: { accountType: 'business', ownerId: id, key: `business:${id}` },
-    amount: capital, transactionType: 'business_found', reason: `Founding capital committed to ${proposal.name}.`,
-    worldTime, actionId: `business-capital:${actionId}`, referenceId: id });
-  await client.query(`INSERT INTO world_economic_ownership(world_id,asset_type,asset_id,owner_type,owner_id,share,invested_usdc,acquired_world_time)
-    VALUES($1,'business',$2,$3,$4,1,$5,$6)`, [worldId, id, ownerType, capitalSource.ownerId, capital, worldTime]);
+  if (!genesisActive) {
+    const businessAccount = await ensureEconomicAccount(client, { worldId, accountType: 'business', ownerId: id, key: `business:${id}` });
+    const ownerType = capitalSource.accountType;
+    await transferBetweenAccounts(client, { worldId,
+      source: capitalSource, destination: { accountType: 'business', ownerId: id, key: `business:${id}` },
+      amount: capital, transactionType: 'business_found', reason: `Founding capital committed to ${proposal.name}.`,
+      worldTime, actionId: `business-capital:${actionId}`, referenceId: id });
+    await client.query(`INSERT INTO world_economic_ownership(world_id,asset_type,asset_id,owner_type,owner_id,share,invested_usdc,acquired_world_time)
+      VALUES($1,'business',$2,$3,$4,1,$5,$6)`, [worldId, id, ownerType, capitalSource.ownerId, capital, worldTime]);
+    await recordHistory(client, { worldId, eventKey: `business-founded:${id}`, eventType: 'business_founded',
+      actorAgentId: agentId, entityType: 'business', entityId: id, worldTime, title: proposal.name,
+      detail: `${proposal.name} opened with ${capital} simulated USDC of founder capital and offers ${proposal.serviceName}.`,
+      metadata: { serviceId: null, serviceType: proposal.serviceType, capital, accountId: businessAccount.id } });
+  }
   const service = (await client.query(`INSERT INTO world_business_services(world_id,business_id,service_type,name,description,
       base_price_usdc,stock_units,action_id,created_world_time)
     VALUES($1,$2,$3,$4,$5,$6,0,$7,$8) RETURNING id`, [worldId, id, proposal.serviceType, proposal.serviceName.trim(),
-    proposal.serviceDescription.trim(), proposal.basePriceUsdc || SERVICE_INFO[proposal.serviceType].base,
+    proposal.serviceDescription.trim(), genesisActive ? null : (proposal.basePriceUsdc || SERVICE_INFO[proposal.serviceType].base),
     `${actionId}:service`, worldTime])).rows[0];
   await client.query(`INSERT INTO world_business_jobs(world_id,business_id,role,required_skill,wage_usdc,status,created_world_time,action_id)
-    VALUES($1,$2,$3,$4,'15.00000000','open',$5,$6)`, [worldId, id,
+    VALUES($1,$2,$3,$4,$5,'open',$6,$7)`, [worldId, id,
     `${SERVICE_INFO[proposal.serviceType].skill[0].toUpperCase()}${SERVICE_INFO[proposal.serviceType].skill.slice(1)} Associate`,
-    SERVICE_INFO[proposal.serviceType].skill, worldTime, `${actionId}:opening`]);
-  await recordHistory(client, { worldId, eventKey: `business-founded:${id}`, eventType: 'business_founded',
+    SERVICE_INFO[proposal.serviceType].skill, genesisActive ? null : '15.00000000', worldTime, `${actionId}:opening`]);
+  if (genesisActive) await recordHistory(client, { worldId, eventKey: `business-founded:${id}`, eventType: 'business_founded',
     actorAgentId: agentId, entityType: 'business', entityId: id, worldTime, title: proposal.name,
-    detail: `${proposal.name} opened with ${capital} simulated USDC of founder capital and offers ${proposal.serviceName}.`,
-    metadata: { serviceId: service.id, serviceType: proposal.serviceType, capital, accountId: businessAccount.id } });
+    detail: `${proposal.name} opened without simulated capital. Its owner must publish explicit Genesis Token service and wage terms before trade or paid work.`,
+    metadata: { serviceId: service.id, serviceType: proposal.serviceType, fundingAuthority: 'agent_wallet',
+      priceStatus: 'unpriced', wageStatus: 'unpriced' } });
   return { ...inserted.rows[0], serviceId: service.id, capitalUsdc: capital, idempotent: false };
 }
 
 export async function applyToWorldBusinessJob(client, { worldId, jobId, agentId, actionId, worldTime }) {
+  const genesis = await readGenesisCurrencyActivation(client, worldId);
+  if (genesis) {
+    const job = await client.query(`SELECT job.id,job.business_id AS "businessId",job.role,
+        business.status AS "businessStatus",business.founder_agent_id AS "founderAgentId",
+        term.token_id AS "tokenId",term.wage_raw::text AS "wageRaw"
+      FROM world_business_jobs job JOIN world_businesses business
+        ON business.world_id=job.world_id AND business.id=job.business_id
+      LEFT JOIN world_business_job_token_terms term ON term.world_id=job.world_id AND term.job_id=job.id
+        AND term.token_id=$3
+      WHERE job.world_id=$1 AND job.id=$2 AND job.status='open' AND business.status='active'
+      FOR UPDATE OF job,business`, [worldId, jobId, genesis.tokenId]);
+    if (!job.rowCount) throw error('BUSINESS_JOB_UNAVAILABLE', 404);
+    const row = job.rows[0];
+    if (row.founderAgentId === agentId) throw error('FOUNDER_CANNOT_APPLY_TO_OWN_ROLE');
+    if (!row.wageRaw) throw error('BUSINESS_JOB_REQUIRES_EXPLICIT_TOKEN_WAGE', 409);
+    const existing = await client.query(`SELECT id,status FROM world_business_applications WHERE job_id=$1 AND agent_id=$2`,
+      [jobId, agentId]);
+    if (existing.rowCount) return { id: existing.rows[0].id, status: existing.rows[0].status,
+      businessId: row.businessId, jobId, wageTokenId: genesis.tokenId, wageRaw: row.wageRaw, idempotent: true };
+    const inserted = await client.query(`INSERT INTO world_business_applications(world_id,job_id,business_id,agent_id,status,
+        action_id,created_world_time,updated_world_time)
+      VALUES($1,$2,$3,$4,'pending',$5,$6,$6) RETURNING id,status`,
+    [worldId, jobId, row.businessId, agentId, actionId, worldTime]);
+    return { ...inserted.rows[0], businessId: row.businessId, jobId, wageTokenId: genesis.tokenId,
+      wageRaw: row.wageRaw, idempotent: false };
+  }
   const job = await client.query(`SELECT job.*,business.status AS "businessStatus",business.founder_agent_id AS "founderAgentId",
       account.balance::text AS "businessCash"
     FROM world_business_jobs job JOIN world_businesses business ON business.id=job.business_id
@@ -1769,6 +2220,9 @@ export async function leaveWorldBusinessJob(client, { worldId, employmentId, age
 
 export async function decideWorldBusinessApplication(client, { worldId, applicationId, founderAgentId, decision, actionId, worldTime }) {
   if (!['accept','reject'].includes(decision)) throw error('BUSINESS_APPLICATION_DECISION_INVALID', 400);
+  const genesis = await readGenesisCurrencyActivation(client, worldId, { forUpdate: true });
+  if (genesis) return decideGenesisTokenBusinessApplication(client, { worldId, applicationId,
+    founderAgentId, decision, actionId, worldTime, activation: genesis });
   const application = await client.query(`SELECT application.*,business.founder_agent_id AS "founderAgentId",
       job.status AS "jobStatus",job.wage_usdc::text AS wage,job.role,job.id AS "jobId",business.name AS "businessName"
     FROM world_business_applications application JOIN world_businesses business ON business.id=application.business_id
@@ -1818,8 +2272,74 @@ export async function decideWorldBusinessApplication(client, { worldId, applicat
     expiredApplications: expiredApplications.expired };
 }
 
+async function decideGenesisTokenBusinessApplication(client, { worldId, applicationId, founderAgentId,
+  decision, actionId, worldTime, activation }) {
+  const application = await client.query(`SELECT application.*,business.founder_agent_id AS "founderAgentId",
+      business.name AS "businessName",job.status AS "jobStatus",job.role,job.id AS "jobId",
+      term.token_id AS "tokenId",term.wage_raw::text AS "wageRaw"
+    FROM world_business_applications application JOIN world_businesses business
+      ON business.world_id=application.world_id AND business.id=application.business_id
+    JOIN world_business_jobs job ON job.world_id=application.world_id AND job.id=application.job_id
+    LEFT JOIN world_business_job_token_terms term ON term.world_id=job.world_id AND term.job_id=job.id
+      AND term.token_id=$3
+    WHERE application.world_id=$1 AND application.id=$2
+    FOR UPDATE OF application,business,job`, [worldId, applicationId, activation.tokenId]);
+  if (!application.rowCount) throw error('BUSINESS_APPLICATION_NOT_FOUND', 404);
+  const row = application.rows[0];
+  if (row.founderAgentId !== founderAgentId) throw error('BUSINESS_OWNER_REQUIRED', 403);
+  if (row.status !== 'pending') {
+    if (row.action_id !== actionId) throw error('BUSINESS_APPLICATION_NOT_PENDING', 409);
+    if (row.status === 'rejected') return { id: applicationId, status: 'rejected', applicantId: row.agent_id, idempotent: true };
+    const employment = await client.query(`SELECT id,wage_raw::text AS "wageRaw",wage_token_id AS "wageTokenId"
+      FROM world_business_employment WHERE world_id=$1 AND job_id=$2 AND agent_id=$3
+        AND status IN ('active','terminated') ORDER BY started_world_time DESC LIMIT 1`,
+    [worldId, row.jobId, row.agent_id]);
+    return { id: employment.rows[0]?.id || applicationId, applicationId, status: 'active',
+      employeeId: row.agent_id, wageTokenId: employment.rows[0]?.wageTokenId || null,
+      wageRaw: employment.rows[0]?.wageRaw || null, idempotent: true };
+  }
+  if (decision === 'reject') {
+    const updated = await client.query(`UPDATE world_business_applications SET status='rejected',action_id=$3,updated_world_time=$4
+      WHERE id=$1 AND world_id=$2 RETURNING status`, [applicationId, worldId, actionId, worldTime]);
+    return { id: applicationId, status: updated.rows[0].status, applicantId: row.agent_id };
+  }
+  if (!row.wageRaw || row.tokenId !== activation.tokenId) throw error('BUSINESS_JOB_REQUIRES_EXPLICIT_TOKEN_WAGE', 409);
+  const employed = await client.query(`SELECT 1 FROM world_business_employment
+    WHERE world_id=$1 AND agent_id=$2 AND status='active' AND wage_token_id=$3 AND wage_raw>0`,
+  [worldId, row.agent_id, activation.tokenId]);
+  if (employed.rowCount || row.jobStatus !== 'open') throw error('BUSINESS_JOB_FILLED');
+  const employer = await readSpendableGenesisTokenBalance(client, { worldId, tokenId: activation.tokenId,
+    agentId: founderAgentId });
+  if (BigInt(employer.spendableRaw) < BigInt(row.wageRaw) * 8n) throw error('BUSINESS_CANNOT_FUND_TOKEN_JOB');
+  // Confirm that the employee has an active wallet and current chain observation;
+  // the balance may be zero and is never replaced by an internal account.
+  await readSpendableGenesisTokenBalance(client, { worldId, tokenId: activation.tokenId, agentId: row.agent_id });
+  const employment = await client.query(`INSERT INTO world_business_employment(world_id,business_id,job_id,agent_id,
+      wage_usdc,wage_token_id,wage_raw,status,started_world_time)
+    VALUES($1,$2,$3,$4,NULL,$5,$6,'active',$7) RETURNING id`,
+  [worldId, row.business_id, row.jobId, row.agent_id, activation.tokenId, row.wageRaw, worldTime]);
+  await client.query(`UPDATE world_business_applications SET status='accepted',action_id=$3,updated_world_time=$4
+    WHERE id=$1 AND world_id=$2`, [applicationId, worldId, actionId, worldTime]);
+  await client.query(`UPDATE world_business_jobs SET status='filled' WHERE world_id=$1 AND id=$2`, [worldId, row.jobId]);
+  const expiredApplications = await expirePendingWorldBusinessApplications(client, { worldId, worldTime });
+  await recordHistory(client, { worldId, eventKey: `business-hire:${employment.rows[0].id}`,
+    eventType: 'business_employment', actorAgentId: founderAgentId, entityType: 'job', entityId: row.jobId,
+    worldTime, title: `${row.businessName} hired a worker`,
+    detail: `A resident accepted the ${row.role} job with an explicit Genesis Token wage; wages require the employer wallet to authorize each settlement.`,
+    metadata: { employmentId: employment.rows[0].id, employeeId: row.agent_id, tokenId: activation.tokenId,
+      wageRaw: row.wageRaw, currency: 'genesis_token', walletAuthorization: 'employer_agent_wallet',
+      expiredApplications: expiredApplications.expired } });
+  return { id: employment.rows[0].id, applicationId, status: 'active', employeeId: row.agent_id,
+    wageTokenId: activation.tokenId, wageRaw: row.wageRaw, expiredApplications: expiredApplications.expired };
+}
+
 export async function purchaseWorldBusinessService(client, { worldId, serviceId, customerAgentId, actionId, worldTime,
-  maxPriceUsdc, contractAgreementId = null, demand = 1, supply = 1, relationship = 0, wealth = 0, priceSensitivity = 0.5 }) {
+  maxPriceUsdc, maxPriceRaw = null, contractAgreementId = null, demand = 1, supply = 1, relationship = 0,
+  wealth = 0, priceSensitivity = 0.5 }) {
+  if (await isGenesisCurrencyActive(client, worldId)) {
+    return purchaseGenesisTokenBusinessService(client, { worldId, serviceId, customerAgentId,
+      actionId, worldTime, maxPriceRaw, contractAgreementId });
+  }
   const prior = await client.query(`SELECT id,status,price_usdc::text AS price,transaction_id AS "transactionId"
     FROM world_business_orders WHERE world_id=$1 AND customer_agent_id=$2 AND action_id=$3`, [worldId, customerAgentId, actionId]);
   if (prior.rowCount) return { ...prior.rows[0], idempotent: true };
@@ -1910,8 +2430,73 @@ export async function purchaseWorldBusinessService(client, { worldId, serviceId,
     businessFounderAgentId: service.founderAgentId, idempotent: false };
 }
 
+async function purchaseGenesisTokenBusinessService(client, { worldId, serviceId, customerAgentId, actionId,
+  worldTime, maxPriceRaw, contractAgreementId = null }) {
+  if (contractAgreementId) throw error('GENESIS_TOKEN_SERVICE_AGREEMENT_UNSUPPORTED', 409);
+  const existing = await client.query(`SELECT id,status,service_id AS "serviceId",token_id AS "tokenId",
+      amount_raw::text AS "amountRaw",settlement_outbox_id AS "settlementId"
+    FROM world_genesis_token_business_orders WHERE world_id=$1 AND customer_agent_id=$2 AND action_id=$3`,
+  [worldId, customerAgentId, actionId]);
+  if (existing.rowCount) return { orderId: existing.rows[0].id, ...existing.rows[0],
+    status: existing.rows[0].status, idempotent: true };
+  if (typeof maxPriceRaw !== 'string' || !/^[1-9]\d*$/.test(maxPriceRaw)) {
+    throw error('GENESIS_TOKEN_MAX_PRICE_INVALID', 400);
+  }
+  const activation = await readGenesisCurrencyActivation(client, worldId, { forUpdate: true });
+  if (!activation) throw error('GENESIS_CURRENCY_NOT_ACTIVE');
+  const selected = await client.query(`SELECT service.id,service.service_type AS "serviceType",service.name AS "serviceName",
+      service.stock_units AS "stockUnits",business.id AS "businessId",business.name AS "businessName",
+      business.founder_agent_id AS "providerAgentId",term.price_raw::text AS "priceRaw",term.token_id AS "tokenId"
+    FROM world_business_services service JOIN world_businesses business
+      ON business.world_id=service.world_id AND business.id=service.business_id
+    JOIN world_business_service_token_terms term ON term.world_id=service.world_id AND term.service_id=service.id
+    WHERE service.world_id=$1 AND service.id=$2 AND service.active=true AND business.status='active'
+      AND term.token_id=$3 FOR UPDATE OF service,business`, [worldId, serviceId, activation.tokenId]);
+  if (!selected.rowCount) throw error('GENESIS_TOKEN_SERVICE_UNPRICED_OR_UNAVAILABLE', 409);
+  const service = selected.rows[0];
+  if (service.providerAgentId === customerAgentId) throw error('BUSINESS_OWNER_CANNOT_BE_OWN_CUSTOMER');
+  await assertNotBusinessBeneficiary(client, worldId, service.businessId, customerAgentId);
+  if (Number(service.stockUnits) < 1) throw error('BUSINESS_SERVICE_OUT_OF_STOCK');
+  const amountRaw = BigInt(service.priceRaw);
+  if (amountRaw > BigInt(maxPriceRaw)) throw error('BUSINESS_TOKEN_PRICE_CHANGED', 409);
+  const outboxAction = `business-service:${createHash('sha256').update(`${worldId}:${customerAgentId}:${actionId}`).digest('hex')}`;
+  const settlement = await createArcGenesisTokenSettlementIntent(client, { worldId, tokenId: activation.tokenId,
+    fromAgentId: customerAgentId, toAgentId: service.providerAgentId, amountRaw: amountRaw.toString(),
+    actionId: outboxAction, actionFamily: 'business_service_payment',
+    reason: `Genesis Token service payment for ${service.serviceName}.`, worldMinute: worldTime,
+    metadata: { kind: 'business_service_order', sourceActionId: actionId, businessId: service.businessId,
+      serviceId, customerAgentId, providerAgentId: service.providerAgentId } });
+  await client.query(`UPDATE world_business_services SET stock_units=stock_units-1
+    WHERE world_id=$1 AND id=$2 AND stock_units>0`, [worldId, serviceId]);
+  const benefit = SERVICE_BENEFITS[service.serviceType] || { knowledge: 10 };
+  const inserted = await client.query(`INSERT INTO world_genesis_token_business_orders(world_id,business_id,service_id,
+      customer_agent_id,provider_agent_id,token_id,settlement_outbox_id,action_id,amount_raw,status,world_minute,benefit)
+    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending_settlement',$10,$11::jsonb)
+    ON CONFLICT(world_id,customer_agent_id,action_id) DO NOTHING RETURNING id`,
+  [worldId, service.businessId, serviceId, customerAgentId, service.providerAgentId, activation.tokenId,
+    settlement.settlement.id, actionId, amountRaw.toString(), worldTime, JSON.stringify(benefit)]);
+  if (!inserted.rowCount) {
+    const prior = await client.query(`SELECT id,status,service_id AS "serviceId",token_id AS "tokenId",
+        amount_raw::text AS "amountRaw",settlement_outbox_id AS "settlementId"
+      FROM world_genesis_token_business_orders WHERE world_id=$1 AND customer_agent_id=$2 AND action_id=$3`,
+    [worldId, customerAgentId, actionId]);
+    const row = prior.rows[0];
+    if (!row || row.serviceId !== serviceId || row.tokenId !== activation.tokenId || row.amountRaw !== amountRaw.toString()) {
+      throw error('GENESIS_TOKEN_BUSINESS_ORDER_ACTION_CONFLICT');
+    }
+    return { orderId: row.id, ...row, idempotent: true };
+  }
+  return { orderId: inserted.rows[0].id, settlementId: settlement.settlement.id,
+    businessId: service.businessId, serviceId, businessName: service.businessName, serviceName: service.serviceName,
+    providerAgentId: service.providerAgentId, status: 'pending_settlement', tokenId: activation.tokenId,
+    amountRaw: amountRaw.toString(), benefit, chainOwnershipAuthority: 'arc_confirmation', idempotent: false };
+}
+
 export async function completeWorldBusinessShift(client, { worldId, businessId, serviceId, agentId, employmentId = null,
   contractAgreementId = null, commitmentId = null, actionId, worldTime }) {
+  const genesis = await readGenesisCurrencyActivation(client, worldId, { forUpdate: true });
+  if (genesis) return completeGenesisTokenBusinessShift(client, { worldId, businessId, serviceId,
+    agentId, employmentId, contractAgreementId, actionId, worldTime, activation: genesis });
   const previous = await client.query(`SELECT production.id,service.service_type AS "serviceType",service.stock_units AS "stockUnits"
     FROM world_business_production production JOIN world_business_services service ON service.id=production.service_id
     WHERE production.world_id=$1 AND production.action_id=$2`, [worldId, actionId]);
@@ -1995,8 +2580,54 @@ export async function completeWorldBusinessShift(client, { worldId, businessId, 
     commitmentId: supplierCommitmentId };
 }
 
+async function completeGenesisTokenBusinessShift(client, { worldId, businessId, serviceId, agentId, employmentId,
+  contractAgreementId, actionId, worldTime, activation }) {
+  if (!employmentId || contractAgreementId) throw error('GENESIS_TOKEN_WORK_REQUIRES_ACCEPTED_TOKEN_WAGE', 409);
+  const previous = await client.query(`SELECT production.id,service.service_type AS "serviceType",service.stock_units AS "stockUnits"
+    FROM world_business_production production JOIN world_business_services service
+      ON service.world_id=production.world_id AND service.id=production.service_id
+    WHERE production.world_id=$1 AND production.action_id=$2`, [worldId, actionId]);
+  if (previous.rowCount) return { businessId, serviceId, serviceType: previous.rows[0].serviceType,
+    stockUnits: previous.rows[0].stockUnits, idempotent: true };
+  const business = await readBusiness(client, worldId, businessId, true);
+  if (business.status !== 'active') throw error('BUSINESS_NOT_ACTIVE');
+  const service = await client.query(`SELECT id,service_type AS "serviceType",active FROM world_business_services
+    WHERE world_id=$1 AND business_id=$2 AND id=$3 AND active=true FOR UPDATE`, [worldId, businessId, serviceId]);
+  if (!service.rowCount) throw error('BUSINESS_SERVICE_UNAVAILABLE', 404);
+  const employment = await client.query(`SELECT id,agent_id AS "agentId",wage_token_id AS "wageTokenId",
+      wage_raw::text AS "wageRaw"
+    FROM world_business_employment WHERE world_id=$1 AND business_id=$2 AND agent_id=$3
+      AND id=$4 AND status='active' FOR UPDATE`, [worldId, businessId, agentId, employmentId]);
+  if (!employment.rowCount) throw error('BUSINESS_EMPLOYMENT_REQUIRED', 403);
+  const role = employment.rows[0];
+  if (role.wageTokenId !== activation.tokenId || !role.wageRaw) {
+    throw error('BUSINESS_EMPLOYMENT_REQUIRES_EXPLICIT_TOKEN_WAGE_ACCEPTANCE', 409);
+  }
+  const settlementAction = `business-wage:${createHash('sha256').update(`${worldId}:${actionId}`).digest('hex')}`;
+  const settlement = await createArcGenesisTokenSettlementIntent(client, { worldId, tokenId: activation.tokenId,
+    fromAgentId: business.founder_agent_id, toAgentId: agentId, amountRaw: role.wageRaw,
+    actionId: settlementAction, actionFamily: 'business_shift_wage',
+    reason: `Genesis Token shift wage for ${business.name}.`, worldMinute: worldTime,
+    metadata: { kind: 'business_shift_wage', sourceActionId: actionId, businessId, serviceId,
+      employmentId, employeeAgentId: agentId } });
+  await client.query(`INSERT INTO world_business_production(world_id,business_id,service_id,agent_id,employment_id,
+      action_id,units,world_time) VALUES($1,$2,$3,$4,$5,$6,1,$7)`,
+  [worldId, businessId, serviceId, agentId, employmentId, actionId, worldTime]);
+  await recordEmploymentShift(client, { worldId, employmentId, workActionId: actionId,
+    worldTime, businessId, agentId });
+  const updated = await client.query(`UPDATE world_business_services SET stock_units=stock_units+1
+    WHERE world_id=$1 AND id=$2 RETURNING stock_units`, [worldId, serviceId]);
+  return { businessId, serviceId, serviceType: service.rows[0].serviceType,
+    businessName: business.name, businessFounderAgentId: business.founder_agent_id,
+    stockUnits: updated.rows[0].stock_units, producerAgentId: agentId, employmentId,
+    wageTokenId: activation.tokenId, wageRaw: role.wageRaw,
+    settlementId: settlement.settlement.id, settlementStatus: settlement.settlement.status,
+    walletAuthorization: 'employer_agent_wallet', idempotent: false };
+}
+
 export async function investInWorldBusiness(client, { worldId, businessId, investorAgentId, amount, actionId, worldTime,
   fundingSource = { type: 'resident', ownerId: investorAgentId } }) {
+  if (await isGenesisCurrencyActive(client, worldId)) throw error('LEGACY_SIMULATED_ECONOMY_RETIRED', 409);
   const business = await readBusiness(client, worldId, businessId, true);
   if (business.status !== 'active') throw error('BUSINESS_NOT_ACTIVE');
   const existingTransfer = await client.query(`SELECT id FROM world_economic_transactions
@@ -2054,6 +2685,7 @@ export async function investInWorldBusiness(client, { worldId, businessId, inves
 }
 
 export async function investInWorldProject(client, { worldId, projectId, investorAgentId, amount, actionId, worldTime }) {
+  if (await isGenesisCurrencyActive(client, worldId)) throw error('LEGACY_SIMULATED_ECONOMY_RETIRED', 409);
   const project = await client.query(`SELECT * FROM world_projects WHERE world_id=$1 AND id=$2 FOR UPDATE`,
     [worldId, projectId]);
   if (!project.rowCount || !['active','recruiting'].includes(project.rows[0].status)) throw error('PROJECT_NOT_INVESTABLE', 404);
@@ -2101,6 +2733,7 @@ export async function investInWorldProject(client, { worldId, projectId, investo
 }
 
 export async function distributeWorldProjectRevenue(client, { worldId, projectId, ownerAgentId, actionId, worldTime }) {
+  if (await isGenesisCurrencyActive(client, worldId)) throw error('LEGACY_SIMULATED_ECONOMY_RETIRED', 409);
   const project = await client.query(`SELECT * FROM world_projects WHERE world_id=$1 AND id=$2 FOR UPDATE`,
     [worldId, projectId]);
   if (!project.rowCount) throw error('PROJECT_NOT_FOUND', 404);
@@ -2150,6 +2783,7 @@ export async function distributeWorldProjectRevenue(client, { worldId, projectId
 }
 
 export async function reviewWorldBusinessPrice(client, { worldId, businessId, serviceId, agentId, direction, actionId, worldTime, demand, supply }) {
+  if (await isGenesisCurrencyActive(client, worldId)) throw error('GENESIS_TOKEN_PRICE_REQUIRES_EXPLICIT_RAW_UNITS', 409);
   if (!['raise','lower'].includes(direction)) throw error('BUSINESS_PRICE_DIRECTION_INVALID', 400);
   const service = await client.query(`SELECT service.*,business.founder_agent_id AS "founderAgentId"
     FROM world_business_services service JOIN world_businesses business ON business.id=service.business_id
@@ -2172,7 +2806,134 @@ export async function reviewWorldBusinessPrice(client, { worldId, businessId, se
   return { businessId, serviceId, oldPriceUsdc: oldPrice.toFixed(8), newPriceUsdc: next };
 }
 
+function validateGenesisRawAmount(amountRaw, code) {
+  if (typeof amountRaw !== 'string' || !/^[1-9]\d*$/.test(amountRaw)) throw error(code, 400);
+  const amount = BigInt(amountRaw);
+  if (amount > (1n << 128n) - 1n) throw error('GENESIS_TOKEN_AMOUNT_OUT_OF_RANGE', 400);
+  return amount.toString();
+}
+
+async function requireGenesisBusinessOwner(client, { worldId, businessId, agentId }) {
+  const business = await client.query(`SELECT id,name,founder_agent_id AS "founderAgentId"
+    FROM world_businesses WHERE world_id=$1 AND id=$2 AND status='active' FOR UPDATE`, [worldId, businessId]);
+  if (!business.rowCount) throw error('BUSINESS_NOT_ACTIVE', 404);
+  if (business.rows[0].founderAgentId !== agentId) await requireBusinessOwner(client, worldId, businessId, agentId);
+  return business.rows[0];
+}
+
+export async function publishGenesisTokenServicePrice(client, { worldId, businessId, serviceId, agentId,
+  priceRaw, actionId, worldTime }) {
+  const activation = await readGenesisCurrencyActivation(client, worldId, { forUpdate: true });
+  if (!activation) throw error('GENESIS_CURRENCY_NOT_ACTIVE');
+  const raw = validateGenesisRawAmount(priceRaw, 'GENESIS_TOKEN_SERVICE_PRICE_INVALID');
+  const business = await requireGenesisBusinessOwner(client, { worldId, businessId, agentId });
+  const service = await client.query(`SELECT id,name FROM world_business_services
+    WHERE world_id=$1 AND business_id=$2 AND id=$3 AND active=true FOR UPDATE`, [worldId, businessId, serviceId]);
+  if (!service.rowCount) throw error('BUSINESS_SERVICE_UNAVAILABLE', 404);
+  const prior = await client.query(`SELECT service_id,token_id,price_raw::text AS price_raw
+    FROM world_business_service_token_terms WHERE world_id=$1 AND published_by_agent_id=$2 AND action_id=$3`,
+  [worldId, agentId, actionId]);
+  if (prior.rowCount) {
+    if (prior.rows[0].service_id !== serviceId || prior.rows[0].token_id !== activation.tokenId
+        || prior.rows[0].price_raw !== raw) throw error('GENESIS_TOKEN_PRICE_ACTION_CONFLICT');
+    return { businessId, serviceId, tokenId: activation.tokenId, priceRaw: raw, idempotent: true };
+  }
+  const saved = await client.query(`INSERT INTO world_business_service_token_terms(world_id,business_id,service_id,
+      token_id,price_raw,published_by_agent_id,action_id,effective_world_minute)
+    VALUES($1,$2,$3,$4,$5,$6,$7,$8)
+    ON CONFLICT(world_id,service_id) DO UPDATE SET token_id=EXCLUDED.token_id,price_raw=EXCLUDED.price_raw,
+      published_by_agent_id=EXCLUDED.published_by_agent_id,action_id=EXCLUDED.action_id,
+      effective_world_minute=EXCLUDED.effective_world_minute,created_at=now()
+    RETURNING price_raw::text AS "priceRaw"`, [worldId, businessId, serviceId, activation.tokenId, raw,
+    agentId, actionId, worldTime]);
+  await recordHistory(client, { worldId, eventKey: `business-token-price:${actionId}`,
+    eventType: 'business_token_price_published', actorAgentId: agentId, entityType: 'business',
+    entityId: businessId, worldTime, title: business.name,
+    detail: `${service.rows[0].name} received a new explicit ${activation.symbol} price. Its historical USDC quote was not converted.`,
+    metadata: { serviceId, tokenId: activation.tokenId, tokenAddress: activation.tokenAddress,
+      symbol: activation.symbol, decimals: Number(activation.decimals), priceRaw: raw,
+      priceHuman: formatGenesisTokenRaw(raw, activation.decimals), currency: 'genesis_token' } });
+  return { businessId, serviceId, tokenId: activation.tokenId, symbol: activation.symbol,
+    decimals: Number(activation.decimals), priceRaw: saved.rows[0].priceRaw, idempotent: false };
+}
+
+export async function publishGenesisTokenJobWage(client, { worldId, businessId, jobId, agentId,
+  wageRaw, actionId, worldTime }) {
+  const activation = await readGenesisCurrencyActivation(client, worldId, { forUpdate: true });
+  if (!activation) throw error('GENESIS_CURRENCY_NOT_ACTIVE');
+  const raw = validateGenesisRawAmount(wageRaw, 'GENESIS_TOKEN_JOB_WAGE_INVALID');
+  const business = await requireGenesisBusinessOwner(client, { worldId, businessId, agentId });
+  const job = await client.query(`SELECT id,role FROM world_business_jobs
+    WHERE world_id=$1 AND business_id=$2 AND id=$3 AND status IN ('open','filled') FOR UPDATE`,
+  [worldId, businessId, jobId]);
+  if (!job.rowCount) throw error('BUSINESS_JOB_UNAVAILABLE', 404);
+  const prior = await client.query(`SELECT job_id,token_id,wage_raw::text AS wage_raw
+    FROM world_business_job_token_terms WHERE world_id=$1 AND published_by_agent_id=$2 AND action_id=$3`,
+  [worldId, agentId, actionId]);
+  if (prior.rowCount) {
+    if (prior.rows[0].job_id !== jobId || prior.rows[0].token_id !== activation.tokenId
+        || prior.rows[0].wage_raw !== raw) throw error('GENESIS_TOKEN_WAGE_ACTION_CONFLICT');
+    return { businessId, jobId, tokenId: activation.tokenId, wageRaw: raw, idempotent: true };
+  }
+  const saved = await client.query(`INSERT INTO world_business_job_token_terms(world_id,business_id,job_id,token_id,
+      wage_raw,published_by_agent_id,action_id,effective_world_minute)
+    VALUES($1,$2,$3,$4,$5,$6,$7,$8)
+    ON CONFLICT(world_id,job_id) DO UPDATE SET token_id=EXCLUDED.token_id,wage_raw=EXCLUDED.wage_raw,
+      published_by_agent_id=EXCLUDED.published_by_agent_id,action_id=EXCLUDED.action_id,
+      effective_world_minute=EXCLUDED.effective_world_minute,created_at=now()
+    RETURNING wage_raw::text AS "wageRaw"`, [worldId, businessId, jobId, activation.tokenId, raw,
+    agentId, actionId, worldTime]);
+  await recordHistory(client, { worldId, eventKey: `business-token-wage:${actionId}`,
+    eventType: 'business_token_wage_published', actorAgentId: agentId, entityType: 'business',
+    entityId: businessId, worldTime, title: business.name,
+    detail: `The ${job.rows[0].role} role received a new explicit ${activation.symbol} wage. Its historical USDC wage was not converted.`,
+    metadata: { jobId, tokenId: activation.tokenId, tokenAddress: activation.tokenAddress,
+      symbol: activation.symbol, decimals: Number(activation.decimals), wageRaw: raw,
+      wageHuman: formatGenesisTokenRaw(raw, activation.decimals), currency: 'genesis_token' } });
+  return { businessId, jobId, tokenId: activation.tokenId, symbol: activation.symbol,
+    decimals: Number(activation.decimals), wageRaw: saved.rows[0].wageRaw, idempotent: false };
+}
+
+export async function acceptGenesisTokenEmploymentWage(client, { worldId, employmentId, agentId, actionId, worldTime }) {
+  const activation = await readGenesisCurrencyActivation(client, worldId, { forUpdate: true });
+  if (!activation) throw error('GENESIS_CURRENCY_NOT_ACTIVE');
+  const employment = await client.query(`SELECT employment.id,employment.business_id AS "businessId",
+      employment.job_id AS "jobId",employment.agent_id AS "agentId",business.name AS "businessName",
+      business.founder_agent_id AS "founderAgentId",job.role,term.token_id AS "tokenId",
+      term.wage_raw::text AS "wageRaw"
+    FROM world_business_employment employment JOIN world_businesses business
+      ON business.world_id=employment.world_id AND business.id=employment.business_id
+    JOIN world_business_jobs job ON job.world_id=employment.world_id AND job.id=employment.job_id
+    JOIN world_business_job_token_terms term ON term.world_id=job.world_id AND term.job_id=job.id
+    WHERE employment.world_id=$1 AND employment.id=$2 AND employment.agent_id=$3
+      AND employment.status='active' AND term.token_id=$4 FOR UPDATE OF employment,term`,
+  [worldId, employmentId, agentId, activation.tokenId]);
+  if (!employment.rowCount) throw error('BUSINESS_EMPLOYMENT_OR_TOKEN_WAGE_UNAVAILABLE', 409);
+  const row = employment.rows[0];
+  const prior = await client.query(`SELECT metadata FROM world_history WHERE world_id=$1 AND event_key=$2`,
+    [worldId, `business-token-wage-accepted:${actionId}`]);
+  if (prior.rowCount) {
+    if (prior.rows[0].metadata.employmentId !== employmentId || prior.rows[0].metadata.agentId !== agentId) {
+      throw error('GENESIS_TOKEN_WAGE_ACCEPT_ACTION_CONFLICT');
+    }
+    return { employmentId, tokenId: activation.tokenId, wageRaw: row.wageRaw, idempotent: true };
+  }
+  await client.query(`UPDATE world_business_employment SET wage_token_id=$3,wage_raw=$4
+    WHERE world_id=$1 AND id=$2`, [worldId, employmentId, activation.tokenId, row.wageRaw]);
+  await recordHistory(client, { worldId, eventKey: `business-token-wage-accepted:${actionId}`,
+    eventType: 'business_token_wage_accepted', actorAgentId: agentId, entityType: 'job',
+    entityId: row.jobId, worldTime, title: `${row.businessName} wage accepted`,
+    detail: `The employee accepted the new ${activation.symbol} wage for ${row.role}. The prior USDC wage remains historical only.`,
+    metadata: { employmentId, agentId, businessId: row.businessId, jobId: row.jobId,
+      tokenId: activation.tokenId, wageRaw: row.wageRaw, currency: 'genesis_token' } });
+  return { employmentId, businessId: row.businessId, jobId: row.jobId, tokenId: activation.tokenId,
+    symbol: activation.symbol, decimals: Number(activation.decimals), wageRaw: row.wageRaw, idempotent: false };
+}
+
 export async function distributeWorldBusinessProfit(client, { worldId, businessId, ownerAgentId, actionId, worldTime }) {
+  const genesisCurrency = await readGenesisCurrencyActivation(client, worldId, { forUpdate: true });
+  if (genesisCurrency) return distributeGenesisBusinessProfit(client, { worldId, businessId,
+    ownerAgentId, actionId, worldTime, activation: genesisCurrency });
   const business = await readBusiness(client, worldId, businessId, true);
   if (business.founder_agent_id !== ownerAgentId) await requireBusinessOwner(client, worldId, businessId, ownerAgentId);
   const account = await getEconomicAccount(client, { worldId, accountType: 'business', ownerId: businessId, forUpdate: true });
@@ -2225,6 +2986,87 @@ export async function distributeWorldBusinessProfit(client, { worldId, businessI
     undistributedProfitUsdc: remainingProfit, outcomes };
 }
 
+async function distributeGenesisBusinessProfit(client, { worldId, businessId, ownerAgentId, actionId, worldTime, activation }) {
+  const business = await client.query(`SELECT id,name,status,founder_agent_id AS "founderAgentId"
+    FROM world_businesses WHERE world_id=$1 AND id=$2 FOR UPDATE`, [worldId, businessId]);
+  if (!business.rowCount || business.rows[0].status !== 'active') throw error('BUSINESS_NOT_ACTIVE', 404);
+  const row = business.rows[0];
+  if (row.founderAgentId !== ownerAgentId) throw error('GENESIS_BUSINESS_FOUNDER_REQUIRED', 403);
+  const prior = await client.query(`SELECT metadata FROM world_history WHERE world_id=$1 AND event_key=$2`,
+    [worldId, `genesis-business-distribution:${actionId}`]);
+  if (prior.rowCount) return { businessId, ...prior.rows[0].metadata, idempotent: true };
+  const investments = await client.query(`SELECT proposer_agent_id AS "proposerAgentId",
+      counterparty_agent_id AS "counterpartyAgentId",terms->>'ownershipShare' AS "ownershipShare"
+    FROM world_agreements WHERE world_id=$1 AND agreement_type='investment' AND status='completed'
+      AND terms->>'businessId'=$2::text AND terms->>'tokenId'=$3 ORDER BY id FOR UPDATE`,
+  [worldId, businessId, activation.tokenId]);
+  const holdersByAgent = new Map();
+  let investorShares = 0;
+  for (const investment of investments.rows) {
+    const investorAgentId = investment.proposerAgentId === row.founderAgentId
+      ? investment.counterpartyAgentId : investment.proposerAgentId;
+    const share = Number(investment.ownershipShare) || 0;
+    holdersByAgent.set(investorAgentId, (holdersByAgent.get(investorAgentId) || 0) + share);
+    investorShares += share;
+  }
+  if (investorShares <= 0 || investorShares > 1.0000001) throw error('GENESIS_BUSINESS_EQUITY_INVALID');
+  const realized = await client.query(`SELECT
+      COALESCE((SELECT sum(amount_raw) FROM world_genesis_token_business_orders
+        WHERE world_id=$1 AND business_id=$2 AND token_id=$3 AND status='fulfilled'),0)::text AS revenue,
+      COALESCE((SELECT sum(amount_raw) FROM arc_genesis_token_settlement_outbox
+        WHERE world_id=$1 AND token_id=$3 AND action_family='business_shift_wage'
+          AND from_agent_id=$4 AND metadata->>'businessId'=$2::text AND status='final'),0)::text AS wages,
+      COALESCE((SELECT sum(amount_raw) FROM arc_genesis_token_settlement_outbox
+        WHERE world_id=$1 AND token_id=$3 AND action_family='business_profit_distribution'
+          AND metadata->>'businessId'=$2::text
+          AND status IN ('prepared','submitting','submission_unknown','submitted','final')),0)::text AS distributed,
+      COALESCE((SELECT count(*) FROM arc_genesis_token_settlement_outbox
+        WHERE world_id=$1 AND token_id=$3 AND action_family='business_profit_distribution'
+          AND metadata->>'businessId'=$2::text
+          AND status IN ('prepared','submitting','submission_unknown','submitted')),0)::int AS pending`,
+  [worldId, businessId, activation.tokenId, row.founderAgentId]);
+  if (Number(realized.rows[0].pending) > 0) throw error('GENESIS_BUSINESS_DISTRIBUTION_PENDING', 409);
+  const revenueRaw = BigInt(realized.rows[0].revenue);
+  const wageRaw = BigInt(realized.rows[0].wages);
+  const profitRaw = revenueRaw > wageRaw ? revenueRaw - wageRaw : 0n;
+  const distributedRaw = BigInt(realized.rows[0].distributed);
+  const undistributedRaw = profitRaw > distributedRaw ? profitRaw - distributedRaw : 0n;
+  const distributionRaw = undistributedRaw * BigInt(Math.round(MAX_DISTRIBUTION_SHARE * 10_000)) / 10_000n;
+  if (distributionRaw <= 0n) throw error('GENESIS_BUSINESS_PROFIT_NOT_DISTRIBUTABLE', 409);
+  const holders = [...holdersByAgent.entries()].map(([agentId, share]) => ({ agentId, share: String(share) }));
+  holders.push({ agentId: row.founderAgentId, share: String(Math.max(0, 1 - investorShares)), founder: true });
+  const outcomes = [];
+  for (const allocation of allocateProRata(distributionRaw, holders)) {
+    if (allocation.owner.founder || allocation.amount <= 0n) continue;
+    const settlementAction = `business-profit:${createHash('sha256')
+      .update(`${worldId}:${actionId}:${allocation.owner.agentId}`).digest('hex')}`;
+    const settlement = await createArcGenesisTokenSettlementIntent(client, { worldId, tokenId: activation.tokenId,
+      fromAgentId: row.founderAgentId, toAgentId: allocation.owner.agentId,
+      amountRaw: allocation.amount.toString(), actionId: settlementAction,
+      actionFamily: 'business_profit_distribution',
+      reason: `Genesis Token profit distribution from business ${businessId}.`, worldMinute,
+      metadata: { kind: 'business_profit_distribution', sourceActionId: actionId, businessId,
+        investorAgentId: allocation.owner.agentId, ownershipShare: Number(allocation.owner.share),
+        realizedServiceRevenueRaw: revenueRaw.toString(), confirmedWageExpenseRaw: wageRaw.toString(),
+        tokenOwnershipAuthority: 'arc_chain_confirmation' } });
+    outcomes.push({ recipientAgentId: allocation.owner.agentId, ownershipShare: Number(allocation.owner.share),
+      amountRaw: allocation.amount.toString(), settlementId: settlement.settlement.id,
+      settlementStatus: settlement.settlement.status });
+  }
+  if (!outcomes.length) throw error('GENESIS_BUSINESS_PROFIT_NOT_DISTRIBUTABLE', 409);
+  await recordHistory(client, { worldId, eventKey: `genesis-business-distribution:${actionId}`,
+    eventType: 'business_token_profit_distribution_prepared', actorAgentId: ownerAgentId,
+    entityType: 'business', entityId: businessId, worldTime, title: business.name,
+    detail: `${business.name} prepared Arc-confirmed Genesis Token profit distributions.`,
+    metadata: { tokenId: activation.tokenId, realizedServiceRevenueRaw: revenueRaw.toString(),
+      confirmedWageExpenseRaw: wageRaw.toString(), distributionLimitRaw: distributionRaw.toString(),
+      settlements: outcomes, status: 'pending_arc_confirmation', tokenOwnershipAuthority: 'arc_chain_confirmation' } });
+  return { businessId, tokenId: activation.tokenId, status: 'pending_settlement',
+    realizedServiceRevenueRaw: revenueRaw.toString(), confirmedWageExpenseRaw: wageRaw.toString(),
+    distributionLimitRaw: distributionRaw.toString(), settlements: outcomes,
+    ownershipAuthority: 'arc_chain_confirmation', idempotent: false };
+}
+
 export async function closeWorldBusiness(client, { worldId, businessId, founderAgentId, actionId, worldTime, bankrupt = false }) {
   const business = await readBusiness(client, worldId, businessId, true);
   if (business.founder_agent_id !== founderAgentId
@@ -2251,6 +3093,10 @@ export async function closeWorldBusiness(client, { worldId, businessId, founderA
 }
 
 export async function settleWorldBusinessMaintenance(client, { worldId, worldTime }) {
+  if (await isGenesisCurrencyActive(client, worldId)) {
+    return { day: Math.floor(Number(worldTime) / 1_440), charged: 0, observed: 0, outcomes: [],
+      skipped: true, reason: 'legacy_usdc_maintenance_historical_only' };
+  }
   const day = Math.floor(Number(worldTime) / 1_440);
   await ensureEconomicAccount(client, { worldId, accountType: 'system', key: 'system:maintenance-sink' });
   const businesses = await client.query(`SELECT business.id,business.name,business.founder_agent_id AS "founderAgentId",
@@ -2343,6 +3189,10 @@ export async function settleWorldBusinessMaintenance(client, { worldId, worldTim
 }
 
 export async function settleWorldPlaceMaintenance(client, { worldId, worldTime }) {
+  if (await isGenesisCurrencyActive(client, worldId)) {
+    return { day: Math.floor(Number(worldTime) / 1_440), maintained: 0, suspended: 0, observed: 0,
+      skipped: true, reason: 'legacy_usdc_maintenance_historical_only' };
+  }
   const day = Math.floor(Number(worldTime) / 1_440);
   const places = await client.query(`SELECT place.id,place.name,place.status,place.operating_cost_usdc::text AS cost,
       place.maintenance_missed_days AS missed_days,COALESCE(ownership.owners,'[]'::jsonb) AS owners
@@ -2447,8 +3297,10 @@ export async function listWorldBusinesses(client, { worldId, limit = 100 } = {})
         ON employment.world_id=job.world_id AND employment.job_id=job.id AND employment.status='active'
       LEFT JOIN agents employee ON employee.id=employment.agent_id
       WHERE job.world_id=business.world_id AND job.business_id=business.id) jobs ON true
-    LEFT JOIN LATERAL (SELECT jsonb_agg(jsonb_build_object('agentId',employment.agent_id,'name',employee.name,
-        'role',job.role,'wageUsdc',employment.wage_usdc::text,'startedWorldTime',employment.started_world_time)
+    LEFT JOIN LATERAL (SELECT jsonb_agg(jsonb_build_object('employmentId',employment.id,'jobId',job.id,
+        'agentId',employment.agent_id,'name',employee.name,
+        'role',job.role,'wageUsdc',employment.wage_usdc::text,'wageTokenId',employment.wage_token_id,
+        'wageRaw',employment.wage_raw::text,'startedWorldTime',employment.started_world_time)
         ORDER BY employment.started_world_time,employment.agent_id) AS items
       FROM world_business_employment employment JOIN agents employee ON employee.id=employment.agent_id
       JOIN world_business_jobs job ON job.world_id=employment.world_id AND job.id=employment.job_id
@@ -2467,7 +3319,103 @@ export async function listWorldBusinesses(client, { worldId, limit = 100 } = {})
         ORDER BY world_time DESC,id DESC LIMIT 6) recent) history ON true
     WHERE business.world_id=$1 ORDER BY business.founded_world_time DESC,business.id LIMIT $2`,
   [worldId, Math.max(1, Math.min(200, Math.trunc(Number(limit) || 100)))]);
-  return result.rows;
+  const activation = await readGenesisCurrencyActivation(client, worldId);
+  if (!activation) return result.rows;
+  const [serviceTerms, jobTerms] = await Promise.all([
+    client.query(`SELECT service_id AS "serviceId",token_id AS "tokenId",price_raw::text AS "priceRaw",
+        effective_world_minute AS "effectiveWorldMinute"
+      FROM world_business_service_token_terms WHERE world_id=$1 AND token_id=$2`, [worldId, activation.tokenId]),
+    client.query(`SELECT job_id AS "jobId",token_id AS "tokenId",wage_raw::text AS "wageRaw",
+        effective_world_minute AS "effectiveWorldMinute"
+      FROM world_business_job_token_terms WHERE world_id=$1 AND token_id=$2`, [worldId, activation.tokenId])
+  ]);
+  const confirmedTokenOrders = await client.query(`SELECT business_id AS "businessId",
+      count(*)::int AS "orderCount",count(DISTINCT customer_agent_id)::int AS "customerCount"
+    FROM world_genesis_token_business_orders WHERE world_id=$1 AND status='fulfilled'
+    GROUP BY business_id`, [worldId]);
+  const equity = await readGenesisBusinessEquity(client, { worldId, tokenId: activation.tokenId });
+  const servicesById = new Map(serviceTerms.rows.map((row) => [row.serviceId, row]));
+  const jobsById = new Map(jobTerms.rows.map((row) => [row.jobId, row]));
+  const tokenOrdersByBusiness = new Map(confirmedTokenOrders.rows.map((row) => [row.businessId, row]));
+  const confirmedEquityByBusiness = new Map();
+  const pendingEquityByBusiness = new Map();
+  for (const investment of equity.investments) {
+    const rows = confirmedEquityByBusiness.get(investment.businessId) || [];
+    rows.push(investment);
+    confirmedEquityByBusiness.set(investment.businessId, rows);
+  }
+  for (const obligation of equity.pendingObligations) {
+    const rows = pendingEquityByBusiness.get(obligation.businessId) || [];
+    rows.push(obligation);
+    pendingEquityByBusiness.set(obligation.businessId, rows);
+  }
+  return result.rows.map((business) => {
+    const workforce = (business.workers || []).map((worker) => {
+      const acceptedCurrentTokenWage = worker.wageTokenId === activation.tokenId
+        && worker.wageRaw !== null && worker.wageRaw !== undefined && BigInt(worker.wageRaw) > 0n;
+      const offer = jobsById.get(worker.jobId);
+      return { ...worker, wageUsdc: null,
+        wageTokenId: acceptedCurrentTokenWage ? worker.wageTokenId : null,
+        wageRaw: acceptedCurrentTokenWage ? worker.wageRaw : null,
+        wageHuman: acceptedCurrentTokenWage ? formatGenesisTokenRaw(worker.wageRaw, activation.decimals) : null,
+        wageSymbol: acceptedCurrentTokenWage ? activation.symbol : null,
+        pendingTokenWageRaw: offer?.tokenId === activation.tokenId
+          && (!acceptedCurrentTokenWage || String(worker.wageRaw) !== String(offer.wageRaw)) ? offer.wageRaw : null,
+        economicStatus: acceptedCurrentTokenWage ? 'active_token_wage' : 'historical_only',
+        legacyWage: acceptedCurrentTokenWage ? null : 'historical_only',
+        requiresTokenWageAcceptance: !acceptedCurrentTokenWage || String(worker.wageRaw) !== String(offer?.wageRaw) };
+    });
+    return { ...business,
+    valuation_usdc: null, cashBalance: null, revenue: null, expenses: null, profitLoss: null,
+    lastRevenueWorldTime: null, lossDays: null,
+    orderCount: tokenOrdersByBusiness.get(business.id)?.orderCount || 0,
+    customerCount: tokenOrdersByBusiness.get(business.id)?.customerCount || 0,
+    legacySimulatedEconomy: 'historical_only',
+    owners: [
+      { ownerType: 'resident', ownerId: business.founderAgentId,
+        share: String(Math.max(0, 1 - (confirmedEquityByBusiness.get(business.id) || [])
+          .reduce((sum, item) => sum + (Number(item.ownershipShare) || 0), 0))),
+        investedUsdc: null, ownershipAuthority: 'business_founder_record' },
+      ...(confirmedEquityByBusiness.get(business.id) || []).map((investment) => ({
+        ownerType: 'resident', ownerId: investment.investorAgentId, share: investment.ownershipShare,
+        investedUsdc: null, tokenId: investment.tokenId, amountRaw: investment.amountRaw,
+        ownershipAuthority: investment.tokenOwnershipAuthority, agreementId: investment.agreementId,
+        transactionHash: investment.transactionHash, blockNumber: investment.blockNumber
+      }))
+    ],
+    genesisEquityInvestments: confirmedEquityByBusiness.get(business.id) || [],
+    genesisPendingEquityObligations: pendingEquityByBusiness.get(business.id) || [],
+    services: (business.services || []).map((service) => {
+      const term = servicesById.get(service.id);
+      return { ...service, basePriceUsdc: null, tokenId: term?.tokenId || null,
+        tokenPriceRaw: term?.priceRaw || null,
+        tokenPriceHuman: term?.priceRaw ? formatGenesisTokenRaw(term.priceRaw, activation.decimals) : null,
+        tokenPriceSymbol: term ? activation.symbol : null,
+        tokenPriceEffectiveWorldMinute: term ? Number(term.effectiveWorldMinute) : null };
+    }),
+    jobs: (business.jobs || []).map((job) => {
+      const term = jobsById.get(job.id);
+      return { ...job, wageUsdc: null, tokenId: term?.tokenId || null,
+        wageRaw: term?.wageRaw || null,
+        wageHuman: term?.wageRaw ? formatGenesisTokenRaw(term.wageRaw, activation.decimals) : null,
+        wageSymbol: term ? activation.symbol : null,
+        wageEffectiveWorldMinute: term ? Number(term.effectiveWorldMinute) : null };
+    }),
+    workers: workforce.filter((worker) => worker.economicStatus === 'active_token_wage'),
+    historicalEmployment: workforce.filter((worker) => worker.economicStatus === 'historical_only'),
+    agreements: (business.agreements || []).map((agreement) => {
+      const terms = agreement.terms || {};
+      const hasLegacyCurrencyTerms = Object.keys(terms).some((key) =>
+        /^(?:wageusdc|priceusdc|amountusdc|capitalusdc|basepriceusdc)$/i.test(key))
+        || terms.resourceKey === 'simulated_usdc';
+      return { ...agreement,
+        terms: Object.fromEntries(Object.entries(terms).filter(([key]) =>
+          !/^(?:wageusdc|priceusdc|amountusdc|capitalusdc|basepriceusdc)$/i.test(key))),
+        ...(hasLegacyCurrencyTerms ? { legacySimulatedEconomy: 'historical_only' } : {}) };
+    }),
+    history: (business.history || []).map((entry) => Number(entry.worldTime) < Number(activation.worldMinute)
+      ? { ...entry, historicalSimulatedEconomy: 'historical_only' } : entry) };
+  });
 }
 
 export function economicDashboardSql(worldIdPlaceholder = '$1') {

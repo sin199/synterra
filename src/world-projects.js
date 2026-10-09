@@ -2,6 +2,7 @@ import { actionIdentifier, boundedNumber, jsonObject, requireWorldMember, requir
 import { ensureEconomicAccount } from './economic-ledger.js';
 import { completeOpportunityParticipation } from './world-opportunities.js';
 import { createProjectPlace, PLACE_TYPES } from './world-places.js';
+import { isGenesisCurrencyActive } from './genesis-economy.js';
 
 export const PROJECT_TYPES = Object.freeze(['RESEARCH', 'TRADE', 'BUILD', 'SOCIAL', 'DATA', 'LEARNING', 'GENERAL']);
 const OPEN_PROJECT_STATES = ['idea', 'proposed', 'recruiting', 'active'];
@@ -69,6 +70,12 @@ export async function proposeWorldProject(client, input) {
   const requiredSkills = normalizeSkills(input.requiredSkills);
   const requiredResources = normalizeResources(input.requiredResources);
   const reward = normalizeReward(input.reward, type);
+  const genesisCurrencyActive = await isGenesisCurrencyActive(client, worldId);
+  if (genesisCurrencyActive && Object.entries(requiredResources).some(([key, value]) =>
+    /^(?:usdc|simulated_usdc|cash|capital|internal_units|token_units)$/i.test(key)
+      && Number(value) > 0)) {
+    throw worldError('LEGACY_SIMULATED_ECONOMY_RETIRED', 409);
+  }
   const metadata = jsonObject(input.metadata, 'project_metadata');
   if (metadata.createPlace !== undefined && typeof metadata.createPlace !== 'boolean') throw worldError('PROJECT_PLACE_FLAG_INVALID', 400);
   if (metadata.placeType && !PLACE_TYPES.includes(metadata.placeType)) throw worldError('PROJECT_PLACE_TYPE_INVALID', 400);
@@ -110,10 +117,12 @@ export async function proposeWorldProject(client, input) {
     JSON.stringify(requiredResources), JSON.stringify(reward), requiredResources.maxParticipants, worldTime, deadline,
     actionId, JSON.stringify(metadata)]);
   const project = inserted.rows[0];
-  await ensureEconomicAccount(client, { worldId, accountType: 'project', ownerId: project.id });
-  await client.query(`INSERT INTO world_economic_ownership(world_id,asset_type,asset_id,owner_type,owner_id,share,invested_usdc,acquired_world_time)
-    VALUES($1,'project',$2,'resident',$3,1,0,$4) ON CONFLICT DO NOTHING`,
-  [worldId, project.id, agentId, worldTime]);
+  if (!genesisCurrencyActive) {
+    await ensureEconomicAccount(client, { worldId, accountType: 'project', ownerId: project.id });
+    await client.query(`INSERT INTO world_economic_ownership(world_id,asset_type,asset_id,owner_type,owner_id,share,invested_usdc,acquired_world_time)
+      VALUES($1,'project',$2,'resident',$3,1,0,$4) ON CONFLICT DO NOTHING`,
+    [worldId, project.id, agentId, worldTime]);
+  }
   await client.query(`INSERT INTO world_project_members(world_id,project_id,agent_id,status,role,action_id,
       joined_world_time,updated_world_time)
     VALUES($1,$2,$3,'active','founder',$4,$5,$5) ON CONFLICT(project_id,agent_id) DO NOTHING`,
@@ -386,5 +395,14 @@ export async function listWorldProjects(client, { worldId, statuses = OPEN_PROJE
     FROM world_projects project WHERE project.world_id=$1 AND project.status=ANY($2::text[])
     ORDER BY project.updated_world_time DESC,project.id LIMIT $3`,
   [worldId, statuses, Math.trunc(boundedNumber(limit, 1, 100, 'limit'))]);
-  return result.rows;
+  if (!await isGenesisCurrencyActive(client, worldId)) return result.rows;
+  return result.rows.map((project) => {
+    const resources = project.required_resources || {};
+    const activeResources = Object.fromEntries(Object.entries(resources).filter(([key]) =>
+      !/^(?:usdc|simulated_usdc|cash|cashbalance|internal_units|token_units)$/i.test(key)));
+    return { ...project, required_resources: activeResources,
+      legacySimulatedResources: Object.fromEntries(Object.entries(resources).filter(([key]) =>
+        /^(?:usdc|simulated_usdc|cash|cashbalance|internal_units|token_units)$/i.test(key))),
+      legacySimulatedEconomy: 'historical_only' };
+  });
 }

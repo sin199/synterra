@@ -504,6 +504,62 @@ test('residents cannot create customer revenue by buying from an entity they ben
   assert.ok(!actions.some((item) => item.action === 'business_found'));
 });
 
+test('historical active USDC employment does not block an application to an explicitly priced Genesis Token job', () => {
+  const resident = { agentId: 'resident-a', energy: 80, food: 70, skills: { research: 60 }, primaryGoal: 'WEALTH' };
+  const tokenId = 'genesis-token-id';
+  const business = { id: 'business-a', founder_agent_id: 'owner-a', status: 'active', name: 'Research Studio' };
+  const job = { id: 'job-a', business_id: business.id, businessName: business.name, founderAgentId: 'owner-a',
+    status: 'open', businessStatus: 'active', requiredSkill: 'research', tokenWageTokenId: tokenId,
+    tokenWageRaw: '2500000', businessSpendableRaw: '50000000' };
+  const context = { genesisCurrencyActive: true, genesisCurrency: { tokenId, symbol: 'GEN', decimals: 6,
+    initialSupplyRaw: '1000000000000000000' }, worldMinutes: 2_000, businesses: [business], jobs: [job],
+    applications: [], employment: [{ id: 'historical-job', agent_id: resident.agentId, status: 'active',
+      wageTokenId: null, wageRaw: null, legacySimulatedEconomy: 'historical_only' }] };
+
+  const candidates = buildBusinessCandidates(resident, context);
+  assert.ok(candidates.some((candidate) => candidate.action === 'business_apply' && candidate.jobId === job.id));
+
+  const alreadyTokenEmployed = buildBusinessCandidates(resident, { ...context, employment: [
+    ...context.employment, { id: 'current-token-job', agent_id: resident.agentId, status: 'active',
+      wageTokenId: tokenId, wageRaw: '1000000' }
+  ] });
+  assert.ok(!alreadyTokenEmployed.some((candidate) => candidate.action === 'business_apply'),
+    'only a current accepted Genesis Token wage blocks another application');
+});
+
+test('Genesis investment candidates safely use only existing business memories as before', () => {
+  const founderAgentId = 'founder-a';
+  const resident = { agentId: 'resident-a', energy: 80, food: 70, skills: [], relationships: [],
+    genesisTokenSpendableRaw: '10', genesisTokenObservedAt: new Date() };
+  const context = { genesisCurrencyActive: true,
+    genesisCurrency: { tokenId: 'token-a', symbol: 'GEN', decimals: 0, initialSupplyRaw: '100' },
+    worldMinutes: 2_000,
+    businesses: [{ id: 'business-a', founder_agent_id: founderAgentId, name: 'Business A', status: 'active' }],
+    genesisWallets: { [founderAgentId]: { authorizationSupported: true, observedAt: new Date() } },
+    genesisInvestments: [] };
+
+  let withoutMemories;
+  assert.doesNotThrow(() => { withoutMemories = buildBusinessCandidates(resident, context); });
+  assert.deepEqual(withoutMemories, [], 'missing recentMemories defaults to an empty array and creates no investment candidate');
+
+  const unrelatedMemory = buildBusinessCandidates({ ...resident,
+    recentMemories: [{ relatedAgentId: founderAgentId, memoryType: 'personal' }] }, context);
+  assert.deepEqual(unrelatedMemory, [], 'an unrelated memory does not satisfy the existing business-memory rule');
+
+  const withBusinessMemory = buildBusinessCandidates({ ...resident,
+    recentMemories: [{ relatedAgentId: founderAgentId, memoryType: 'business' }] }, context);
+  const investments = withBusinessMemory.filter((candidate) => candidate.action === 'business_invest');
+  assert.equal(investments.length, 6, 'the matching business memory keeps the existing eligible amount/share choices');
+  assert.deepEqual([...new Set(investments.map((candidate) => candidate.amountRaw))].sort(), ['1', '10']);
+  assert.deepEqual([...new Set(investments.map((candidate) => candidate.ownershipShare))].sort((a, b) => a - b),
+    [0.05, 0.1, 0.2]);
+  assert.ok(investments.every((candidate) => candidate.businessId === 'business-a'
+    && candidate.counterpartyAgentId === founderAgentId));
+  assert.ok(investments.every((candidate, index) => index === 0
+    || withBusinessMemory[index - 1].score >= candidate.score), 'candidate scoring order remains descending');
+  assert.equal(resident.genesisTokenSpendableRaw, '10', 'candidate generation does not change the resident balance');
+});
+
 test('new economic actions map into existing Fruitfly output families', () => {
   assert.equal(fruitflyFamily('project_invest'), 'invest');
   assert.equal(fruitflyFamily('project_distribute'), 'invest');

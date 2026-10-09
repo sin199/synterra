@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildActivityCandidates, chooseActivity, clamp, initialWorldAgentProfile, movementProgress } from '../src/world-engine.js';
+import { buildActivityCandidates, chooseActivity, clamp, initialWorldAgentProfile, markPreGenesisEconomicMemories,
+  movementProgress } from '../src/world-engine.js';
 
 const scenes = [
   { id: 'garden', name: 'Garden', sceneType: 'garden', status: 'active' },
@@ -50,6 +51,24 @@ test('legacy crypto balances and quotes do not create resident trading candidate
     usdc: '10000', btc: '2', eth: '3' }), scenes, legacyMarket);
   assert.ok(!candidates.some((item) => ['trade', 'trade_crypto', 'trade_meme', 'trade_hold'].includes(item.action)));
   assert.ok(candidates.some((item) => item.action === 'work'), 'ordinary world work remains available');
+});
+
+test('pre-Genesis simulated-economy memories remain visible only as historical records', () => {
+  const memories = [
+    { memoryType: 'economic', summary: 'Received 10 USDC wages.', worldMinutes: 99, metadata: { wageUsdc: '10' } },
+    { memoryType: 'social', summary: 'Met a neighbor at the garden.', worldMinutes: 99, metadata: {} },
+    { memoryType: 'business', summary: 'Published a TOKEN service quote.', worldMinutes: 101, metadata: {} }
+  ];
+
+  const result = markPreGenesisEconomicMemories(memories, 100);
+
+  assert.equal(result[0].historicalOnly, true);
+  assert.equal(result[0].assetAuthority, 'none');
+  assert.equal(result[0].legacySimulatedEconomy, 'historical_only');
+  assert.match(result[0].summary, /not a current asset or purchasing power/);
+  assert.equal(result[0].metadata.wageUsdc, '10', 'the source memory details remain preserved');
+  assert.equal(result[1], memories[1], 'non-economic memories are unchanged');
+  assert.equal(result[2], memories[2], 'post-activation memories are not mislabeled as legacy');
 });
 
 test('resident-created studio and commons are valid destinations for autonomous activities', () => {
