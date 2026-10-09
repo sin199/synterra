@@ -27,7 +27,7 @@ WITH named_issuer AS (
   FROM world_members member
   JOIN agents agent ON agent.id=member.agent_id
   LEFT JOIN world_runtime_state runtime ON runtime.world_id=member.world_id
-  WHERE lower(regexp_replace(agent.name,'[^a-z0-9]','','g')) IN ('synterra01','synterra1')
+  WHERE regexp_replace(lower(agent.name),'[^a-z0-9]','','g') IN ('synterra01','synterra1')
     AND member.world_id='ce434421-8bcd-4aac-b9ba-183383c713de'::uuid
 )
 INSERT INTO world_genesis_issuer_assignments(world_id,capability_generation,issuer_agent_id,
