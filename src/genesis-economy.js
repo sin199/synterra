@@ -8,7 +8,13 @@ function economyError(code, statusCode = 409) {
   return Object.assign(new Error(code), { code, statusCode });
 }
 
+export async function lockGenesisCurrencyActivation(client, worldId) {
+  await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))',
+    [`synterra-genesis-currency-activation:${worldId}`]);
+}
+
 export async function readGenesisCurrencyActivation(client, worldId, { forUpdate = false } = {}) {
+  if (forUpdate) await lockGenesisCurrencyActivation(client, worldId);
   const result = await client.query(`SELECT activation.world_id,activation.token_id AS "tokenId",
       token.token_address AS "tokenAddress",token.name,token.symbol,token.decimals,
       token.initial_supply_raw::text AS "initialSupplyRaw",
@@ -18,7 +24,7 @@ export async function readGenesisCurrencyActivation(client, worldId, { forUpdate
       activation.creator_allocation_raw::text AS "creatorAllocationRaw",activation.activated_at AS "activatedAt"
     FROM world_genesis_currency_activations activation
     JOIN arc_agent_tokens token ON token.world_id=activation.world_id AND token.id=activation.token_id
-    WHERE activation.world_id=$1 ${forUpdate ? 'FOR UPDATE OF activation' : ''}`, [worldId]);
+    WHERE activation.world_id=$1`, [worldId]);
   return result.rows[0] || null;
 }
 

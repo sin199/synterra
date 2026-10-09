@@ -14,7 +14,7 @@ import { ARC_GENESIS_TOKEN_ERC20_INTERFACE, ARC_GENESIS_TOKEN_SETTLEMENT_INTERFA
   genesisSettlementWorldId } from '../src/arc/genesis-token-settlement.js';
 import { ArcGenesisTokenSettlementReconciler } from '../src/arc/genesis-token-settlement-reconciler.js';
 import { createArcGenesisTokenSettlementIntent, genesisSettlementActionHash, readActiveGenesisTokenAssets,
-  readGenesisBusinessEquity, readGenesisCurrencyActivation,
+  lockGenesisCurrencyActivation, readGenesisBusinessEquity, readGenesisCurrencyActivation,
   readGenesisTokenWalletSnapshots } from '../src/genesis-economy.js';
 import { confirmWorldTokenIssuance, createWorldTokenIssuanceIntent } from '../src/world-token-issuance.js';
 import { getEconomicAccount } from '../src/economic-ledger.js';
@@ -46,6 +46,19 @@ function assertIsolatedDatabase(connectionString) {
   assert.ok(['127.0.0.1', 'localhost', '::1'].includes(url.hostname), 'Genesis integration must use loopback PostgreSQL');
   assert.ok(url.port && url.port !== '5432', 'Genesis integration must not use the formal/default PostgreSQL port');
   assert.ok(decodeURIComponent(url.pathname.slice(1)).endsWith('_test'), 'Genesis integration requires a *_test database');
+}
+
+async function inTransaction(pool, callback) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const value = await callback(client);
+    await client.query('COMMIT');
+    return value;
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally { client.release(); }
 }
 
 async function seedWorld(pool) {
@@ -314,6 +327,70 @@ test('Genesis economy preserves simulated history, removes its active authority,
     assert.equal(activation.tokenId, fixture.tokenId);
     assert.equal(activation.issuerSelectionSource, 'creator_genesis_assignment');
     assert.equal(activation.creatorAllocationRaw, '0');
+
+    const leastPrivilegeActivation = await inTransaction(pool, async (client) => {
+      await client.query('SET LOCAL ROLE synterra_app');
+      const privileges = await client.query(`SELECT has_table_privilege(current_user,
+          'public.world_genesis_currency_activations','UPDATE') AS can_update`);
+      assert.equal(privileges.rows[0].can_update, false,
+        'the regression is tested without adding activation-table UPDATE privilege');
+      return readGenesisCurrencyActivation(client, fixture.worldId, { forUpdate: true });
+    });
+    assert.equal(leastPrivilegeActivation.tokenId, fixture.tokenId,
+      'the runtime role can take the world-scoped advisory lock and read activation without table UPDATE');
+
+    const activationSource = (await pool.query(`SELECT token_id,issuer_agent_id,transaction_hash,
+        block_number::text AS block_number,world_minute::text AS world_minute
+      FROM world_genesis_currency_activations WHERE world_id=$1`, [fixture.worldId])).rows[0];
+    const insertReconciledActivation = async (client, tokenId = activationSource.token_id) => {
+      await lockGenesisCurrencyActivation(client, fixture.worldId);
+      const inserted = await client.query(`INSERT INTO world_genesis_currency_activations(world_id,capability_generation,
+          token_id,chain_id,issuer_agent_id,issuer_selection_source,transaction_hash,block_number,world_minute,
+          creator_allocation_raw)
+        VALUES($1,1,$2,$3,$4,'creator_genesis_assignment',$5,$6,$7,0)
+        ON CONFLICT(world_id) DO NOTHING RETURNING token_id`,
+      [fixture.worldId, tokenId, CHAIN_ID, activationSource.issuer_agent_id, activationSource.transaction_hash,
+        activationSource.block_number, activationSource.world_minute]);
+      if (inserted.rowCount) return true;
+      const saved = await client.query(`SELECT token_id,issuer_agent_id,issuer_selection_source,transaction_hash,
+          block_number::text AS block_number,creator_allocation_raw::text AS creator_allocation_raw
+        FROM world_genesis_currency_activations WHERE world_id=$1`, [fixture.worldId]);
+      assert.deepEqual(saved.rows[0], { token_id: activationSource.token_id,
+        issuer_agent_id: activationSource.issuer_agent_id, issuer_selection_source: 'creator_genesis_assignment',
+        transaction_hash: activationSource.transaction_hash, block_number: activationSource.block_number,
+        creator_allocation_raw: '0' }, 'an existing activation must match the confirmed issuance exactly');
+      return false;
+    };
+
+    await pool.query('DELETE FROM arc_genesis_token_settlement_contracts WHERE world_id=$1', [fixture.worldId]);
+    await pool.query('DELETE FROM world_genesis_currency_activations WHERE world_id=$1', [fixture.worldId]);
+    const unknownTokenId = randomUUID();
+    await assert.rejects(() => inTransaction(pool, (client) => insertReconciledActivation(client, unknownTokenId)),
+      (error) => error.code === '23503', 'an unreconciled token without an arc_agent_tokens row cannot activate');
+    assert.equal((await pool.query(`SELECT count(*)::int AS count FROM world_genesis_currency_activations
+      WHERE world_id=$1`, [fixture.worldId])).rows[0].count, 0,
+    'a missing confirmed token record leaves Genesis inactive');
+
+    const concurrentActivations = await Promise.all([
+      inTransaction(pool, (client) => insertReconciledActivation(client)),
+      inTransaction(pool, (client) => insertReconciledActivation(client))
+    ]);
+    assert.deepEqual(concurrentActivations.sort(), [false, true],
+      'two concurrent reconciliations create at most one activation');
+    const activationAfterConcurrency = await pool.query(`SELECT token_id,issuer_agent_id,issuer_selection_source,
+        transaction_hash,block_number::text AS block_number,creator_allocation_raw::text AS creator_allocation_raw
+      FROM world_genesis_currency_activations WHERE world_id=$1`, [fixture.worldId]);
+    assert.equal(activationAfterConcurrency.rowCount, 1);
+    assert.equal(await inTransaction(pool, (client) => insertReconciledActivation(client)), false,
+      'reconciling the same confirmed activation again is idempotent');
+    assert.deepEqual((await pool.query(`SELECT token_id,issuer_agent_id,issuer_selection_source,transaction_hash,
+        block_number::text AS block_number,creator_allocation_raw::text AS creator_allocation_raw
+      FROM world_genesis_currency_activations WHERE world_id=$1`, [fixture.worldId])).rows,
+    activationAfterConcurrency.rows, 'a repeat does not mutate the existing activation');
+    await pool.query(`INSERT INTO arc_genesis_token_settlement_contracts(world_id,token_id,chain_id,contract_address,
+        runtime_code_hash,verified_block,status,observed_at,approved_at)
+      VALUES($1,$2,$3,$4,$5,90,'active',now(),now())`,
+    [fixture.worldId, fixture.tokenId, CHAIN_ID, SETTLEMENT_ADDRESS, keccak256(CODE)]);
 
     const externalRecipientAddress = randomAddress();
     const externalDistribution = [{ recipientType: 'external', recipientId: null,

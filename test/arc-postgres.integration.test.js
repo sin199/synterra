@@ -442,6 +442,9 @@ test('Arc Mainnet Agent action reaches persistent outbox, policy evaluation, and
     assert.equal(tokenWorker.getStatus().mode, 'read_only_reconciliation');
     assert.equal(tokenWorker.getStatus().writesEnabled, false);
     assert.equal(tokenBroadcasts, 0, 'closed Mainnet gate prevents token issuance broadcast');
+    assert.equal(Number((await pool.query(`SELECT count(*)::int AS count
+      FROM world_genesis_currency_activations WHERE world_id=$1`, [worldId])).rows[0].count), 0,
+    'an issuer-confirmed intent without a reconciled Arc creation event does not activate Genesis');
     await tokenWorker.stop();
     tokenWorker = null;
 

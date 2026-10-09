@@ -15,6 +15,7 @@ import { reserveArcMainnetPilotCost, releaseArcMainnetPilotCost, setArcMainnetPi
 import { indexArcContractEvents } from './indexer.js';
 import { writeWorldHistory } from '../world-domain.js';
 import { toArcBytes16Uuid } from './settlement.js';
+import { lockGenesisCurrencyActivation } from '../genesis-economy.js';
 
 export const ARC_AGENT_TOKEN_WORKER_LOCK_NAME = 'synterra-arc-agent-token-issuance-worker';
 const POLL_INTERVAL_MS = 2_000;
@@ -508,6 +509,9 @@ export class ArcAgentTokenIssuanceWorker {
     const gasUsed = BigInt(receipt.gasUsed).toString();
     const effectiveGasPrice = BigInt(receipt.effectiveGasPrice).toString();
     return withTransaction(this.#pool, async (client) => {
+      if (event.capabilityGeneration === 1) {
+        await lockGenesisCurrencyActivation(client, this.#worldId);
+      }
       let genesisAssignment = null;
       if (event.capabilityGeneration === 1) {
         const assignment = await client.query(`SELECT issuer_agent_id,selection_source
