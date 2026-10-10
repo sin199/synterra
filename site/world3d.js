@@ -294,7 +294,7 @@ function buildExchangePavilion(b) {
     b.cyl(0.09, 0.1, 1.3, 7, '#fbf7ec', Math.cos(angle) * 1.62, 0.2, Math.sin(angle) * 1.62);
   }
   b.cyl(1.82, 1.82, 0.14, 8, '#e7dfca', 0, 1.5, 0, { ry: Math.PI / 8 });
-  b.cone(1.45, 0.72, 8, '#b9a77f', 0, 1.95, 0, { ry: Math.PI / 8 });
+  b.pyramid(1.45, 0.72, 8, '#b9a77f', 0, 1.95, 0, { ry: Math.PI / 8 });
   b.sphere(0.12, '#d9b45a', 0, 2.34, 0);
   b.door(0, 0.2, 1.51, '#2f5a50', 0.42, 0.3);
 }
