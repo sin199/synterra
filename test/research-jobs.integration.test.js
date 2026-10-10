@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { Pool } from 'pg';
 import { applyWorldSchemaAndMigrations } from '../src/database-migrations.js';
@@ -380,6 +380,43 @@ test('REA research jobs are durable, isolated from World Engine ticks, attribute
         WHERE world_id=$1 AND actor_agent_id=$2`, [worldId,agentId]);
       assert.ok(ownJobs.rows.some((row) => row.evidence_reference?.startsWith('rea-evidence:')));
       assert.ok(ownJobs.rows.every((row) => !String(row.evidence_reference || '').startsWith('/')));
+    });
+
+    await t.test('worker shutdown during pending REA readiness terminates its owned MCP process', async () => {
+      const pidFile = path.join(root, 'rea-readiness-child.pid');
+      const delayedServer = await writeFakeReaMcpServer(root, { initializeDelayMs: 1_500, pidFile });
+      const worker = startReaResearchWorker({ pool, worldId, stateDirectory: root,
+        artifactDirectory: path.join(root, 'artifacts'), evidenceDirectory: path.join(root, 'evidence'),
+        environment: { REA_NODE_BINARY: nodeBinary, REA_SERVER_ENTRY: delayedServer,
+          PATH: process.env.PATH, HOME: root },
+        isOwner: () => engine.running && engine.worldLockOwned && engine.worldId === worldId,
+        pollIntervalMs: 500 });
+      workers.push(worker);
+      worker.start();
+      const deadline = Date.now() + 5_000;
+      let childPid = null;
+      while (Date.now() < deadline && !childPid) {
+        try { childPid = Number((await readFile(pidFile, 'utf8')).trim()); }
+        catch { await sleep(25); }
+      }
+      assert.ok(Number.isSafeInteger(childPid) && childPid > 0, 'fake MCP process reached delayed initialize');
+      assert.doesNotThrow(() => process.kill(childPid, 0), 'the recorded PID belongs to the live fake MCP process');
+      try {
+        await worker.stop();
+        const exitDeadline = Date.now() + 5_000;
+        let alive = true;
+        while (alive && Date.now() < exitDeadline) {
+          try { process.kill(childPid, 0); await sleep(25); }
+          catch (error) { if (error.code !== 'ESRCH') throw error; alive = false; }
+        }
+        assert.equal(alive, false, 'worker.stop must not leave a late-initialized REA process alive');
+        const persisted = (await pool.query(`SELECT worker_status FROM world_research_runtime_status
+          WHERE world_id=$1`, [worldId])).rows[0];
+        assert.equal(persisted.worker_status, 'stopped');
+      } finally {
+        try { process.kill(childPid, 0); process.kill(childPid, 'SIGKILL'); }
+        catch (error) { if (error.code !== 'ESRCH') throw error; }
+      }
     });
   } finally {
     for (const worker of workers.reverse()) await worker.stop().catch(() => {});

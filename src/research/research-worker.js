@@ -145,6 +145,7 @@ export function startReaResearchWorker({ pool, worldId, isOwner = () => true, en
   }
 
   async function ensureClient() {
+    if (stopped) throw Object.assign(new Error('REA_WORKER_STOPPED'), { code: 'REA_WORKER_STOPPED' });
     if (client) return client;
     if (clientPromise) return clientPromise;
     const now = Date.now();
@@ -152,23 +153,29 @@ export function startReaResearchWorker({ pool, worldId, isOwner = () => true, en
       { code: status.reason || 'REA_UNAVAILABLE' });
     const attempt = (async () => {
       try {
-        client = await createReaMcpClient({ nodeBinary: config.nodeBinary, serverEntry: config.serverEntry,
+        const connectedClient = await createReaMcpClient({ nodeBinary: config.nodeBinary, serverEntry: config.serverEntry,
           environment, requestTimeoutMs: config.requestTimeoutMs });
+        if (stopped) {
+          await connectedClient.close({ timeoutMs: 2_000 }).catch(() => {});
+          throw Object.assign(new Error('REA_WORKER_STOPPED'), { code: 'REA_WORKER_STOPPED' });
+        }
+        client = connectedClient;
         status.available = true;
-        status.nodeVersion = client.nodeVersion;
-        status.reaPackageVersion = client.readiness.packageVersion;
-        status.serverName = client.readiness.serverName;
-        status.providers = client.readiness.providers;
-        status.toolCatalog = client.readiness.toolCatalog;
-        status.supportedTargets = client.readiness.supportedTargets;
-        status.toolCount = client.readiness.toolCatalog.length;
-        status.ghidraAvailable = client.readiness.ghidraAvailable;
+        status.nodeVersion = connectedClient.nodeVersion;
+        status.reaPackageVersion = connectedClient.readiness.packageVersion;
+        status.serverName = connectedClient.readiness.serverName;
+        status.providers = connectedClient.readiness.providers;
+        status.toolCatalog = connectedClient.readiness.toolCatalog;
+        status.supportedTargets = connectedClient.readiness.supportedTargets;
+        status.toolCount = connectedClient.readiness.toolCatalog.length;
+        status.ghidraAvailable = connectedClient.readiness.ghidraAvailable;
         status.reason = null;
         readinessRetryAt = 0;
         await persistStatus('ready').catch((error) => onError({ code: 'REA_STATUS_PERSISTENCE_FAILED',
           errorCode: safeFailureCode(error) }));
-        return client;
+        return connectedClient;
       } catch (error) {
+        if (stopped || error?.code === 'REA_WORKER_STOPPED') throw error;
         status.available = false;
         status.reason = safeFailureCode(error);
         readinessRetryAt = Date.now() + 60_000;
@@ -309,12 +316,12 @@ export function startReaResearchWorker({ pool, worldId, isOwner = () => true, en
       if (recovered.length) for (const job of recovered) onError({ code: 'REA_JOB_RECOVERED', jobId: job.id, status: job.status });
       const job = await withJobTransaction((db) => claimNextResearchJob(db, { worldId, workerId, leaseSeconds: LEASE_SECONDS }));
       if (job) await processJob(job);
-      else if (config.nodeBinary && config.serverEntry && !client && Date.now() >= readinessRetryAt) {
+      else if (!stopped && config.nodeBinary && config.serverEntry && !client && Date.now() >= readinessRetryAt) {
         try { await ensureClient(); }
-        catch (error) { onError({ code: 'REA_READINESS_FAILED', failureCode: safeFailureCode(error) }); }
+        catch (error) { if (!stopped) onError({ code: 'REA_READINESS_FAILED', failureCode: safeFailureCode(error) }); }
       }
     } catch (error) {
-      onError({ code: 'REA_WORKER_POLL_FAILED', failureCode: safeFailureCode(error) });
+      if (!stopped) onError({ code: 'REA_WORKER_POLL_FAILED', failureCode: safeFailureCode(error) });
     } finally { busy = false; }
   }
 
@@ -327,7 +334,9 @@ export function startReaResearchWorker({ pool, worldId, isOwner = () => true, en
       void persistStatus('unavailable', status.reason).catch((error) => onError({ code: 'REA_STATUS_PERSISTENCE_FAILED',
         failureCode: safeFailureCode(error) }));
     } else {
-      void ensureClient().catch((error) => onError({ code: 'REA_READINESS_FAILED', failureCode: safeFailureCode(error) }));
+      void ensureClient().catch((error) => {
+        if (!stopped) onError({ code: 'REA_READINESS_FAILED', failureCode: safeFailureCode(error) });
+      });
     }
     const schedulePoll = () => {
       if (stopped || busy) return;
@@ -339,17 +348,25 @@ export function startReaResearchWorker({ pool, worldId, isOwner = () => true, en
   }
 
   async function stop() {
+    if (stopped && !client && !clientPromise && !activePoll) return;
     stopped = true;
     running = false;
     status.running = false;
     if (timer) clearInterval(timer);
     timer = null;
-    if (client) {
-      const active = client;
+    const active = client;
+    if (active) {
       await active.close({ closeTarget: false, timeoutMs: 5_000 }).catch(() => {});
-      client = null;
+      if (client === active) client = null;
     }
+    const pendingClient = clientPromise;
+    if (pendingClient) await pendingClient.catch(() => {});
     if (activePoll) await activePoll.catch(() => {});
+    if (client) {
+      const late = client;
+      await late.close({ closeTarget: false, timeoutMs: 5_000 }).catch(() => {});
+      if (client === late) client = null;
+    }
     await persistStatus('stopped').catch((error) => onError({ code: 'REA_STATUS_PERSISTENCE_FAILED',
       failureCode: safeFailureCode(error) }));
   }
