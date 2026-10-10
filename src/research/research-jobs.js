@@ -71,7 +71,8 @@ export async function listResearchInputsByWorld(client, { worldId }) {
       JOIN world_research_artifact_grants artifact_grant ON artifact_grant.world_id=artifact.world_id AND artifact_grant.artifact_id=artifact.id
       WHERE artifact.world_id=$1 AND artifact.active=true
       ORDER BY artifact.created_at DESC,artifact.id LIMIT 2000`, [worldId]),
-    client.query(`SELECT agent_id AS "agentId",'goal'::text AS "relationType",id::text AS "relationId",
+    client.query(`SELECT * FROM (
+      SELECT agent_id AS "agentId",'goal'::text AS "relationType",id::text AS "relationId",
         COALESCE(NULLIF(description,''),category) AS objective,category AS label,goal_type AS "goalType",priority::text AS priority
       FROM world_agent_goals WHERE world_id=$1 AND status='active'
       UNION ALL
@@ -96,6 +97,7 @@ export async function listResearchInputsByWorld(client, { worldId }) {
       FROM world_organization_members member JOIN world_organizations organization
         ON organization.world_id=member.world_id AND organization.id=member.organization_id
       WHERE member.world_id=$1 AND member.status='active' AND organization.status='active'
+    ) AS research_contexts
       ORDER BY "agentId",CASE "relationType" WHEN 'goal' THEN 0 WHEN 'project' THEN 1 ELSE 2 END,
         "priority" DESC NULLS LAST,"relationId" LIMIT 4000`, [worldId])
   ]);

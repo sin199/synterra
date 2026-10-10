@@ -7,7 +7,7 @@ import { randomUUID } from 'node:crypto';
 import { buildCapabilityUseCandidates } from '../src/world-capabilities.js';
 import { containsPrivateMaterial, MAX_RESEARCH_ARTIFACT_BYTES } from '../src/research/artifacts.js';
 import { readIntakeArtifact } from '../src/research/artifact-intake.js';
-import { normalizeResearchIntent, RESEARCH_CAPABILITY_KEY, RESEARCH_CAPABILITY_SPEC } from '../src/research/research-jobs.js';
+import { listResearchInputsByWorld, normalizeResearchIntent, RESEARCH_CAPABILITY_KEY, RESEARCH_CAPABILITY_SPEC } from '../src/research/research-jobs.js';
 import { isReaCompatibleNodeVersion } from '../src/research/rea-mcp-client.js';
 
 test('REA is an optional native-system capability and only produces a candidate when a granted artifact and resident context exist', async () => {
@@ -47,6 +47,14 @@ test('research intent accepts only a granted artifact reference and typed active
   assert.throws(() => normalizeResearchIntent({ artifactId, targetType: 'binary', researchQuestion: 'A sufficiently long question?',
     objective: 'A sufficiently long objective.', desiredInvestigation: 'Inspect safely.', expectedResult: 'Summary.' },
   { id: artifactId, targetType: 'source_code' }), /REA_TARGET_TYPE_MISMATCH/);
+});
+
+test('resident research context query orders a wrapped UNION result', async () => {
+  const queries = [];
+  await listResearchInputsByWorld({ query: async (sql) => { queries.push(sql); return { rows: [] }; } },
+    { worldId: randomUUID() });
+  assert.equal(queries.length, 2);
+  assert.match(queries[1], /SELECT \* FROM \([\s\S]*UNION ALL[\s\S]*\) AS research_contexts\s+ORDER BY "agentId",CASE "relationType"/);
 });
 
 test('known private material is scanned through the entire artifact, not only its prefix', () => {

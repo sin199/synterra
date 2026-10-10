@@ -11,6 +11,7 @@ import { prepareStartupSchema } from '../src/startup-schema.js';
 import { startWorldEngine } from '../src/world-engine.js';
 import { seedWorldCapabilityRegistry } from '../src/world-capabilities.js';
 import { importResearchArtifact } from '../src/research/artifacts.js';
+import { listResearchInputsByWorld } from '../src/research/research-jobs.js';
 import { writeFakeReaMcpServer } from './helpers/fake-rea-mcp.js';
 import { cancelResearchJob, claimNextResearchJob, completeResearchJob, enqueueResearchCapabilityUse,
   markResearchExternalCallStarted, recoverExpiredResearchJobs, RESEARCH_CAPABILITY_KEY } from '../src/research/research-jobs.js';
@@ -102,6 +103,8 @@ test('REA research jobs are durable, isolated from World Engine ticks, attribute
     assert.equal(engine.running, true);
     assert.equal(engine.worldLockOwned, true);
     await pool.query('DELETE FROM world_agent_goals WHERE world_id=$1', [worldId]);
+    const emptyInputs = await listResearchInputsByWorld(pool, { worldId });
+    assert.equal(emptyInputs.contextsByAgent.size, 0, 'resident-context UNION query executes on isolated PostgreSQL');
     const capabilityRows = await pool.query(`SELECT id,specification FROM world_capabilities
       WHERE world_id=$1 AND capability_key=$2`, [worldId, RESEARCH_CAPABILITY_KEY]);
     assert.equal(capabilityRows.rowCount, 1, 'the system registry exposes the REA native capability');
