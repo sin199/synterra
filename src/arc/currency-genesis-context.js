@@ -1,9 +1,18 @@
 import { arcNetworkConfig } from './config.js';
+import { AGENT_TOKEN_HUMAN_SUPPLY, AGENT_TOKEN_PILOT_GENERATION } from './token-issuance.js';
 
 // Infrastructure facts are shared by cognition providers, never token design defaults.
-export function currencyGenesisInfrastructureFacts({ requirement, config = arcNetworkConfig() }) {
+export function currencyGenesisInfrastructureFacts({ requirement, issuerAssignment = null, config = arcNetworkConfig() }) {
   const network = `Arc ${config.name[0].toUpperCase()}${config.name.slice(1)}`;
   return Object.freeze({
+    currencyRequirement: 'CURRENCY_GENESIS_REQUIRED',
+    requirementStatus: requirement?.status || null,
+    genesisIssuer: typeof issuerAssignment?.issuerName === 'string' ? issuerAssignment.issuerName : null,
+    generation: Number.isSafeInteger(Number(issuerAssignment?.capabilityGeneration))
+      ? Number(issuerAssignment.capabilityGeneration) : AGENT_TOKEN_PILOT_GENERATION,
+    issuerSelectionSource: typeof issuerAssignment?.selectionSource === 'string'
+      ? issuerAssignment.selectionSource : null,
+    totalHumanReadableSupply: AGENT_TOKEN_HUMAN_SUPPLY,
     executionNetwork: network,
     chainId: config.chainId,
     tokenCreationTarget: network,

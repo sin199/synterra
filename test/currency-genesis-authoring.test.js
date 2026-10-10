@@ -38,9 +38,9 @@ test('local authoring receives resident-specific state and only expresses a prio
   assert.equal(context.resident.currentGoal, 'coordinate research exchange');
   assert.equal(context.resident.goals[0].description, 'Share research notes');
   assert.equal(context.resident.recentMemories[0].summary, 'A peer lacked a way to record exchange.');
-  for (const [key, value] of Object.entries(currencyGenesisInfrastructureFacts({ requirement: { status: 'UNRESOLVED' } }))) {
-    assert.equal(context.worldFacts[key], value);
-  }
+  const sharedFacts = currencyGenesisInfrastructureFacts({ requirement: { status: 'UNRESOLVED' } });
+  for (const key of ['executionNetwork','chainId','tokenCreationTarget','networkRole','mainnetWriteGate',
+    'onchainStatus','currencyRequirement','requirementStatus']) assert.equal(context.worldFacts[key], sharedFacts[key]);
   assert.equal(context.worldFacts.currentEconomicEvidence[0], 'Two unmet research exchanges.');
   assert.equal(context.publicCurrencyHistory[0].decision, 'support');
   assert.equal(context.currentProposal.existingSpecification.purpose, 'Resident authored purpose.');
@@ -67,8 +67,12 @@ test('missing resident context remains unresolved without calling the local mode
 
 test('infrastructure facts follow Arc config and reconciled requirement, not execution preparation', () => {
   const config = arcNetworkConfig({});
-  const facts = currencyGenesisInfrastructureFacts({ config, requirement: { status: 'UNRESOLVED' } });
-  assert.deepEqual(facts, { executionNetwork: 'Arc Mainnet', chainId: 5042,
+  const issuerAssignment = { issuerName: 'Synterra-01', capabilityGeneration: 1,
+    selectionSource: 'creator_genesis_assignment' };
+  const facts = currencyGenesisInfrastructureFacts({ config, requirement: { status: 'UNRESOLVED' }, issuerAssignment });
+  assert.deepEqual(facts, { currencyRequirement: 'CURRENCY_GENESIS_REQUIRED', requirementStatus: 'UNRESOLVED',
+    genesisIssuer: 'Synterra-01', generation: 1, issuerSelectionSource: 'creator_genesis_assignment',
+    totalHumanReadableSupply: '1000000000', executionNetwork: 'Arc Mainnet', chainId: 5042,
     tokenCreationTarget: 'Arc Mainnet', networkRole: 'the blockchain execution environment for this pilot',
     mainnetWriteGate: false, onchainStatus: 'not yet created' });
   for (const status of ['UNRESOLVED', 'PROPOSAL_FORMED', 'EXECUTION_READY', 'SATISFIED']) {
@@ -90,7 +94,8 @@ test('network context preserves undecided fields and makes no call beyond local 
       calls.push(url);
       const body = JSON.parse(options.body);
       const context = JSON.parse(body.messages[1].content);
-      for (const [key, value] of Object.entries(facts)) assert.equal(context.worldFacts[key], value);
+      for (const key of ['executionNetwork','chainId','tokenCreationTarget','networkRole','mainnetWriteGate',
+        'onchainStatus','currencyRequirement','requirementStatus']) assert.equal(context.worldFacts[key], facts[key]);
       assert.equal(context.currentProposal, null);
       assert.deepEqual(context.availableRecipients, []);
       assert.match(body.messages[0].content, /infrastructure facts, not token attributes/);

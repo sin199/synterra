@@ -207,9 +207,14 @@ test('Arc Mainnet Agent action reaches persistent outbox, policy evaluation, and
         }
         cognitionFacts.set(request.agentId, request.state.worldFacts);
         for (const [key, value] of Object.entries(currencyGenesisInfrastructureFacts({
-          requirement: { status: request.state.requirementStatus } }))) {
+          requirement: { status: request.state.requirementStatus },
+          issuerAssignment: { issuerName: 'Synterra-01', capabilityGeneration: 1,
+            selectionSource: 'creator_genesis_assignment' } }))) {
           assert.equal(request.state.worldFacts[key], value);
         }
+        assert.equal(request.state.worldFacts.genesisIssuer, 'Synterra-01');
+        assert.equal(request.state.worldFacts.issuerSelectionSource, 'creator_genesis_assignment');
+        assert.equal(request.state.worldFacts.totalHumanReadableSupply, '1000000000');
         const options = request.options || [];
         const choose = options.find((option) => option.id === 'no_action');
         let selected = choose;

@@ -13,6 +13,17 @@ const MAX_REQUEST_RESERVATION_TOKENS = 32_000;
 const MAX_STATE_BYTES = 24_000;
 let client;
 
+export function initializeTypeSafeProvider() {
+  if (!process.env.TYPESAFE_API_KEY?.trim()) return { initialized: false, reason: 'missing_api_key' };
+  try {
+    client ||= new TypeSafeClient();
+    return { initialized: true };
+  } catch {
+    client = null;
+    return { initialized: false, reason: 'provider_initialization_failed' };
+  }
+}
+
 function currencyReviewFailure(request, outcome, reasonCode, { model = MODEL, confidence = null,
   providerAttempted = false, inputTokens = null, estimatedCostUsd = null } = {}) {
   if (request?.choiceType !== 'currency_genesis') return null;
@@ -65,7 +76,7 @@ function safeState(observation, candidates, inbox) {
   };
 }
 
-async function startReservation(state) {
+async function startReservation(state, persistState = saveState) {
   const month = monthKey();
   let usage = state.typesafeUsage;
   if (!usage || usage.month !== month) usage = { month, spentUsd: 0, pending: null };
@@ -79,16 +90,16 @@ async function startReservation(state) {
   const reserveUsd = MAX_REQUEST_RESERVATION_TOKENS * INPUT_PRICE_PER_TOKEN_USD;
   if (usage.spentUsd + reserveUsd > MONTHLY_BUDGET_USD) {
     state.typesafeUsage = usage;
-    await saveState(state);
+    await persistState(state);
     return null;
   }
   usage.pending = { usd: reserveUsd, at: new Date().toISOString() };
   state.typesafeUsage = usage;
-  await saveState(state);
+  await persistState(state);
   return { month, usage, reserveUsd };
 }
 
-async function settleReservation(state, reservation, inputTokens) {
+async function settleReservation(state, reservation, inputTokens, persistState = saveState) {
   const usage = state.typesafeUsage;
   const actualUsd = Number.isFinite(inputTokens) && inputTokens >= 0
     ? inputTokens * INPUT_PRICE_PER_TOKEN_USD
@@ -98,7 +109,7 @@ async function settleReservation(state, reservation, inputTokens) {
   const chargeUsd = actualUsd;
   usage.spentUsd += chargeUsd;
   usage.pending = null;
-  await saveState(state);
+  await persistState(state);
   return { inputTokens: Number.isFinite(inputTokens) ? inputTokens : null, costUsd: chargeUsd, monthlySpendUsd: usage.spentUsd };
 }
 
@@ -151,7 +162,7 @@ export async function chooseWithTypeSafe(observation, candidates, runtimeState, 
 // Low-frequency V6 judgment over dynamically composed, code-validated
 // civilization options. TypeSafe selects an offered option; it never emits or
 // executes code, and resident-written proposal text is evidence, not authority.
-export async function chooseCivilizationOption(request, runtimeState) {
+export async function chooseCivilizationOption(request, runtimeState, { persistState = saveState } = {}) {
   if (!process.env.TYPESAFE_API_KEY) return currencyReviewFailure(request, 'provider_unavailable', 'missing_api_key');
   if (!request || !Array.isArray(request.options) || request.options.length < 2) {
     return currencyReviewFailure(request, 'no_valid_decision', 'insufficient_review_options');
@@ -174,7 +185,7 @@ export async function chooseCivilizationOption(request, runtimeState) {
   if (Buffer.byteLength(JSON.stringify(state), 'utf8') > MAX_STATE_BYTES) {
     return currencyReviewFailure(request, 'no_valid_decision', 'review_input_too_large');
   }
-  const reservation = await startReservation(runtimeState);
+  const reservation = await startReservation(runtimeState, persistState);
   if (!reservation) return currencyReviewFailure(request, 'provider_unavailable', 'monthly_budget_reached');
   let providerRequestStarted = false;
   try {
@@ -192,7 +203,7 @@ export async function chooseCivilizationOption(request, runtimeState) {
         )
       }
     }, { retry: { maxRetries: 0 }, timeout: 10_000 });
-    const usage = await settleReservation(runtimeState, reservation, response?.usage?.input_tokens);
+    const usage = await settleReservation(runtimeState, reservation, response?.usage?.input_tokens, persistState);
     const answer = response?.answers?.civilization_choice;
     if (!answer || typeof answer !== 'object' || typeof answer.choice !== 'string') {
       return currencyReviewFailure(request, 'malformed_output', 'choice_answer_missing',
@@ -210,7 +221,7 @@ export async function chooseCivilizationOption(request, runtimeState) {
     return { choice: selected, confidence, ...usage, model: response?.model || MODEL, provider: 'typesafe',
       providerAttempted: true };
   } catch (error) {
-    await settleReservation(runtimeState, reservation, null);
+    await settleReservation(runtimeState, reservation, null, persistState);
     const diagnostic = currencyReviewProviderError(error);
     return currencyReviewFailure(request, diagnostic.outcome, diagnostic.reasonCode,
       { providerAttempted: providerRequestStarted });

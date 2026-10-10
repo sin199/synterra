@@ -13,7 +13,8 @@ import { MESSAGE_TEMPLATES, messageText } from './message-templates.js';
 import { parsePositiveUnits } from './units.js';
 import { loadState, STATE_DIR } from './agent-runtime/client.js';
 import { createFruitflyRuntime } from './agent-runtime/fruitfly.js';
-import { chooseCivilizationOption, chooseWithTypeSafe, chooseWorldV7Reflection } from './agent-runtime/typesafe.js';
+import { chooseCivilizationOption, chooseWithTypeSafe, chooseWorldV7Reflection,
+  initializeTypeSafeProvider } from './agent-runtime/typesafe.js';
 import { startWorldEngine, worldClock } from './world-engine.js';
 import { enrichMapEnvironment } from './world-environment.js';
 import { buildWorldLiveness, reportWorldEngineError } from './world-engine-diagnostics.js';
@@ -2405,7 +2406,16 @@ if (arcSchemaReady) {
 await expireAdultServiceBookings();
 await app.listen({ host: HOST, port: PORT });
 let typeSafeRuntimeState = null;
+let typeSafeProviderInitialized = false;
 if (process.env.TYPESAFE_API_KEY) {
+  const providerStatus = initializeTypeSafeProvider();
+  typeSafeProviderInitialized = providerStatus.initialized;
+  if (typeSafeProviderInitialized) {
+    app.log.info({ provider: 'typesafe', initialized: true }, 'TypeSafe provider client initialized');
+  } else {
+    app.log.error({ provider: 'typesafe', initialized: false, reason: providerStatus.reason },
+      'TypeSafe provider client initialization failed');
+  }
   try { typeSafeRuntimeState = await loadState(); }
   catch (error) { app.log.error({ err: error }, 'TypeSafe state could not be loaded; local utility decisions remain active'); }
 }
@@ -2414,9 +2424,9 @@ try { fruitflyRuntime = await createFruitflyRuntime(STATE_DIR); }
 catch (error) { app.log.error({ err: error }, 'Fruitfly selection unavailable; utility rules remain active'); }
 try {
   worldEngine = await startWorldEngine(pool, {
-    chooseWithTypeSafe: process.env.TYPESAFE_API_KEY && typeSafeRuntimeState ? chooseWithTypeSafe : null,
-    chooseCivilizationOption: process.env.TYPESAFE_API_KEY && typeSafeRuntimeState ? chooseCivilizationOption : null,
-    chooseWorldV7Reflection: process.env.TYPESAFE_API_KEY && typeSafeRuntimeState ? chooseWorldV7Reflection : null,
+    chooseWithTypeSafe: typeSafeProviderInitialized && typeSafeRuntimeState ? chooseWithTypeSafe : null,
+    chooseCivilizationOption: typeSafeProviderInitialized && typeSafeRuntimeState ? chooseCivilizationOption : null,
+    chooseWorldV7Reflection: typeSafeProviderInitialized && typeSafeRuntimeState ? chooseWorldV7Reflection : null,
     currencyGenesisEnabled: arcTokenSchemaReady,
     onAutonomousBusinessAction: arcSchemaReady ? enqueueArcAgentEconomicAction : null,
     runtimeState: typeSafeRuntimeState,

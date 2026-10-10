@@ -1,10 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { chooseCivilizationOption } from '../src/agent-runtime/typesafe.js';
+import { TypeSafeClient } from '@typesafe-ai/sdk';
+import { chooseCivilizationOption, initializeTypeSafeProvider } from '../src/agent-runtime/typesafe.js';
 import { classifyCurrencyReviewResult, currencyReviewErrorOutcome,
   recordCurrencyReviewOutcome } from '../src/world-token-issuance.js';
 import { recordInfrastructureUsageEvent } from '../src/infrastructure-metering.js';
+import { currencyGenesisInfrastructureFacts } from '../src/arc/currency-genesis-context.js';
+import { arcNetworkConfig } from '../src/arc/config.js';
 
 const options = [
   { id: 'no_action', label: 'No action' },
@@ -58,10 +61,53 @@ test('Currency Genesis reports an unavailable TypeSafe provider without invoking
   const savedApiKey = process.env.TYPESAFE_API_KEY;
   delete process.env.TYPESAFE_API_KEY;
   try {
+    assert.deepEqual(initializeTypeSafeProvider(), { initialized: false, reason: 'missing_api_key' });
     const result = await chooseCivilizationOption({ choiceType: 'currency_genesis', options }, {});
     assert.deepEqual(result.currencyReviewDiagnostic, { outcome: 'provider_unavailable',
       reasonCode: 'missing_api_key', provider: 'typesafe', model: 'jev-1.13.0', confidence: null,
       providerAttempted: false, inputTokens: null, estimatedCostUsd: null });
+  } finally {
+    if (savedApiKey === undefined) delete process.env.TYPESAFE_API_KEY;
+    else process.env.TYPESAFE_API_KEY = savedApiKey;
+  }
+});
+
+test('initialized TypeSafe client attempts the offered currency review with authoritative Genesis facts', async (t) => {
+  const savedApiKey = process.env.TYPESAFE_API_KEY;
+  process.env.TYPESAFE_API_KEY = 'test-only-typesafe-key';
+  const attempts = [];
+  t.mock.method(TypeSafeClient.prototype, 'systemOne', async (request, options) => {
+    attempts.push({ request, options });
+    return { answers: { civilization_choice: { choice: 'no_action', confidence: 0.91 } },
+      usage: { input_tokens: 48 }, model: 'jev-1.13.0' };
+  });
+  try {
+    assert.deepEqual(initializeTypeSafeProvider(), { initialized: true });
+    const issuerAssignment = { issuerName: 'Synterra-01', capabilityGeneration: 1,
+      selectionSource: 'creator_genesis_assignment' };
+    const worldFacts = currencyGenesisInfrastructureFacts({ requirement: { status: 'UNRESOLVED' },
+      issuerAssignment, config: arcNetworkConfig({}) });
+    const result = await chooseCivilizationOption({ choiceType: 'currency_genesis', worldId: randomUUID(),
+      worldMinute: 460_496, agent: { agentId: randomUUID() }, state: { worldFacts }, options },
+    { typesafeUsage: { month: new Date().toISOString().slice(0, 7), spentUsd: 0, pending: null } },
+    { persistState: async () => {} });
+
+    assert.equal(attempts.length, 1, 'the TypeSafe callback was actually attempted');
+    assert.equal(result.choice.id, 'no_action');
+    assert.equal(result.providerAttempted, true);
+    assert.equal(result.provider, 'typesafe');
+    assert.equal(result.model, 'jev-1.13.0');
+    const observedFacts = attempts[0].request.state.observedState.worldFacts;
+    for (const [key, value] of Object.entries(worldFacts)) assert.equal(observedFacts[key], value);
+    assert.deepEqual({ requirement: observedFacts.currencyRequirement,
+      status: observedFacts.requirementStatus, issuer: observedFacts.genesisIssuer,
+      generation: observedFacts.generation, provenance: observedFacts.issuerSelectionSource,
+      network: observedFacts.executionNetwork, chainId: observedFacts.chainId,
+      supply: observedFacts.totalHumanReadableSupply, gate: observedFacts.mainnetWriteGate }, {
+      requirement: 'CURRENCY_GENESIS_REQUIRED', status: 'UNRESOLVED', issuer: 'Synterra-01', generation: 1,
+      provenance: 'creator_genesis_assignment', network: 'Arc Mainnet', chainId: 5042,
+      supply: '1000000000', gate: false
+    });
   } finally {
     if (savedApiKey === undefined) delete process.env.TYPESAFE_API_KEY;
     else process.env.TYPESAFE_API_KEY = savedApiKey;

@@ -436,8 +436,12 @@ export async function decideWorldTokenIssuerCandidate(client, { worldId, agentId
 }
 
 async function creatorGenesisIssuerAssignment(client, worldId, capabilityGeneration = 1) {
-  const result = await client.query(`SELECT issuer_agent_id AS "issuerAgentId",selection_source AS "selectionSource"
-    FROM world_genesis_issuer_assignments WHERE world_id=$1 AND capability_generation=$2`,
+  const result = await client.query(`SELECT assignment.issuer_agent_id AS "issuerAgentId",
+      assignment.capability_generation AS "capabilityGeneration",
+      assignment.selection_source AS "selectionSource",agent.name AS "issuerName"
+    FROM world_genesis_issuer_assignments assignment
+    JOIN agents agent ON agent.id=assignment.issuer_agent_id
+    WHERE assignment.world_id=$1 AND assignment.capability_generation=$2`,
   [worldId, capabilityGeneration]);
   return result.rows[0] || null;
 }
@@ -558,6 +562,7 @@ async function recordCurrencyReviewChoice(client, { worldId, agent, worldMinute,
 }
 
 async function currencyAuthoringInput(client, { worldId, agent, worldMinute, requirement, intent = null }) {
+  const issuerAssignment = await creatorGenesisIssuerAssignment(client, worldId, AGENT_TOKEN_PILOT_GENERATION);
   const history = await client.query(`SELECT history.event_type AS type,actor.name AS agent,
         history.metadata->>'decision' AS decision,history.title AS summary,history.world_time AS "worldMinute"
       FROM world_history history LEFT JOIN agents actor ON actor.id=history.actor_agent_id
@@ -587,9 +592,8 @@ async function currencyAuthoringInput(client, { worldId, agent, worldMinute, req
       meaning: intent.meaning, purpose: intent.purpose, rationale: intent.rationale,
       existingSpecification: agentTokenSpecificationFromIntentRow(intent) };
   }
-  return { resident: agent, worldFacts: { ...currencyGenesisInfrastructureFacts({ requirement }),
-    currencyRequirement: 'CURRENCY_GENESIS_REQUIRED',
-    requirementStatus: requirement.status, currentWorldMinute: Number(worldMinute),
+  return { resident: agent, worldFacts: { ...currencyGenesisInfrastructureFacts({ requirement, issuerAssignment }),
+    currentWorldMinute: Number(worldMinute),
     currentEconomicEvidence: economicEvidence.rows.map((row) =>
       `${row.service_type} had ${row.unmet_count} unmet requests on world day ${row.world_day}.`) },
   publicCurrencyHistory: history.rows, availableRecipients: recipients.rows, currentProposal };
