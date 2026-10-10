@@ -126,7 +126,7 @@ export async function refreshWorldCurrencyGenesisRequirement(client, { worldId, 
 async function recordRequirementAwareness(client, { worldId, agent, requirement, worldMinute }) {
   const summary = requirement.status === 'SATISFIED'
     ? 'The world has established its first reconciled currency; future asset ideas remain optional.'
-    : 'The world has an unresolved requirement to eventually establish a currency; this is a world fact, not a command.';
+    : 'The world has a mandatory unresolved requirement to establish its first currency. The resident owns every design choice and may continue design without submitting a proposal in this review.';
   await client.query(`INSERT INTO agent_memories(world_id,agent_id,memory_type,summary,importance,world_minutes,
       location,metadata,consolidation_key,long_term)
     VALUES($1,$2,'world_currency_requirement',$3,0.35,$4,$5,$6::jsonb,'currency-genesis-requirement',true)
@@ -490,7 +490,8 @@ export function currencyReviewErrorOutcome(error) {
 
 function currencyReviewChoiceOutcome(choiceId) {
   if (choiceId === 'no_action') return 'explicit_no_action';
-  if (choiceId === 'propose_currency') return 'explicit_propose';
+  if (choiceId === 'continue_design') return 'explicit_continue_design';
+  if (choiceId === 'propose_when_ready') return 'explicit_propose';
   if (choiceId.startsWith('response:')) return 'explicit_response';
   return 'other';
 }
@@ -501,7 +502,7 @@ export async function recordCurrencyReviewOutcome(client, { worldId, agent, worl
   const reviewId = currencyReviewActionId({ worldId, agentId: agent.agentId, worldMinute, action: 'review-outcome' });
   const safeLabel = (value, fallback = null) => typeof value === 'string' && value.length
     ? value.replace(/[^A-Za-z0-9._:/-]/g, '_').slice(0, 120) : fallback;
-  const outcomes = new Set(['explicit_no_action','explicit_propose','explicit_response','provider_unavailable',
+  const outcomes = new Set(['explicit_no_action','explicit_continue_design','explicit_propose','explicit_response','provider_unavailable',
     'provider_timeout','provider_error','malformed_output','invalid_choice','low_confidence','no_valid_decision',
     'skipped_not_due','other']);
   const safeOutcome = outcomes.has(outcome) ? outcome : 'other';
@@ -545,10 +546,13 @@ async function recordCurrencyReviewChoice(client, { worldId, agent, worldMinute,
         requirement: 'CURRENCY_GENESIS_REQUIRED', requirementStatus: requirement.status,
         selectedOption: selected.id }), actionId]);
   }
+  const eventType = selected.id === 'no_action' ? 'currency_genesis.no_action'
+    : selected.id === 'continue_design' ? 'currency_genesis.design_continued'
+      : selected.id === 'propose_when_ready' ? 'currency_genesis.propose_when_ready' : 'currency_genesis.choice';
   await client.query(`INSERT INTO world_v7_events(world_id,actor_agent_id,event_type,entity_type,entity_id,
       world_minute,details,action_id) VALUES($1,$2,$3,'currency_genesis_requirement',$4,$5,$6::jsonb,$7)
     ON CONFLICT(world_id,actor_agent_id,action_id) DO NOTHING`,
-  [worldId, agent.agentId, selected.id === 'no_action' ? 'currency_genesis.no_action' : 'currency_genesis.choice',
+  [worldId, agent.agentId, eventType,
     worldId, worldMinute, JSON.stringify({ requirementStatus: requirement.status, choice: selected.id,
       decisionSource: selected.source }), actionId]);
   if (selected.id === 'no_action') {
@@ -559,6 +563,38 @@ async function recordCurrencyReviewChoice(client, { worldId, agent, worldMinute,
       detail: 'The resident left the persistent requirement unresolved and continued with other concerns.',
       metadata: { status: requirement.status, decisionSource: selected.source, validAutonomousNoAction: true } });
   }
+}
+
+async function readCurrencyGenesisDesignDraft(client, { worldId, agentId }) {
+  const result = await client.query(`SELECT details,world_minute AS "worldMinute"
+    FROM world_v7_events WHERE world_id=$1 AND actor_agent_id=$2
+      AND event_type='currency_genesis.design_draft'
+    ORDER BY world_minute DESC,created_at DESC LIMIT 1`, [worldId, agentId]);
+  if (!result.rowCount) return null;
+  try {
+    const details = result.rows[0].details;
+    const specification = cleanPartialSpecification(details?.specification || {});
+    return { specification, worldMinute: Number(result.rows[0].worldMinute),
+      incompleteFields: Array.isArray(details?.incompleteFields) ? details.incompleteFields : [],
+      authoring: details?.authoring || null };
+  } catch {
+    return null;
+  }
+}
+
+async function recordCurrencyGenesisDesignDraft(client, { worldId, agent, worldMinute, specification, authoring }) {
+  const incompleteFields = SPEC_FIELDS.filter((field) => specification[field] === undefined || specification[field] === null
+    || (field === 'distribution' && (!Array.isArray(specification.distribution) || !specification.distribution.length)));
+  const actionId = currencyReviewActionId({ worldId, agentId: agent.agentId, worldMinute, action: 'design-draft' });
+  const safeReason = typeof authoring.reason === 'string'
+    ? authoring.reason.replace(/[^A-Za-z0-9._:/-]/g, '_').slice(0, 120) : null;
+  await client.query(`INSERT INTO world_v7_events(world_id,actor_agent_id,event_type,entity_type,entity_id,
+      world_minute,details,action_id) VALUES($1,$2,'currency_genesis.design_draft','currency_genesis_design_draft',
+      $3,$4,$5::jsonb,$6) ON CONFLICT(world_id,actor_agent_id,action_id) DO NOTHING`,
+  [worldId, agent.agentId, worldId, worldMinute, JSON.stringify({ specification, incompleteFields,
+    authoring: { provider: 'ollama_loopback', model: authoring.model || null,
+      status: authoring.status || 'incomplete', reason: safeReason } }), actionId]);
+  return { actionId, incompleteFields };
 }
 
 async function currencyAuthoringInput(client, { worldId, agent, worldMinute, requirement, intent = null }) {
@@ -582,6 +618,7 @@ async function currencyAuthoringInput(client, { worldId, agent, worldMinute, req
       WHERE organization.world_id=$1 ORDER BY type,id LIMIT 32`, [worldId]);
   const economicEvidence = await client.query(`SELECT service_type,world_day,unmet_count FROM world_economic_demand
       WHERE world_id=$1 AND unmet_count>0 ORDER BY world_day DESC,service_type LIMIT 8`, [worldId]);
+  const currentDesignDraft = await readCurrencyGenesisDesignDraft(client, { worldId, agentId: agent.agentId });
   let currentProposal = null;
   if (intent) {
     const proposer = await client.query('SELECT name FROM agents WHERE id=$1', [intent.proposer_agent_id]);
@@ -596,7 +633,7 @@ async function currencyAuthoringInput(client, { worldId, agent, worldMinute, req
     currentWorldMinute: Number(worldMinute),
     currentEconomicEvidence: economicEvidence.rows.map((row) =>
       `${row.service_type} had ${row.unmet_count} unmet requests on world day ${row.world_day}.`) },
-  publicCurrencyHistory: history.rows, availableRecipients: recipients.rows, currentProposal };
+  publicCurrencyHistory: history.rows, availableRecipients: recipients.rows, currentProposal, currentDesignDraft };
 }
 
 export function classifyCurrencyReviewResult(result, options) {
@@ -702,8 +739,10 @@ export async function advanceWorldCurrencyGenesis(client, { worldId, agent, worl
     currentIntent = openRows.rows[rotation];
   }
   const options = [
-    { id: 'no_action', label: 'No action now', description: 'Leave the unresolved currency requirement as a world fact and attend to other goals.' },
-    { id: 'propose_currency', label: 'Express a currency proposal', description: 'If this fits your own goals and evidence, form a proposal for residents to consider. This does not select an issuer or authorize execution.' }
+    { id: 'continue_design', label: 'Continue the required currency design',
+      description: 'Keep the mandatory Genesis Currency requirement open. Develop or preserve only design choices you have made; do not submit a proposal in this review. The requirement returns at the normal review cadence.' },
+    { id: 'propose_when_ready', label: 'Submit your complete currency design for consideration',
+      description: 'Choose this only when your own specification is complete and you are ready to submit it for resident consideration. This does not confirm issuance or authorize execution; an incomplete design remains a draft.' }
   ];
   if (currentIntent) {
     const intentId = currentIntent.id;
@@ -755,6 +794,7 @@ export async function advanceWorldCurrencyGenesis(client, { worldId, agent, worl
       activeGoals: Array.isArray(agent.goals) ? agent.goals.slice(0, 8) : [],
       currentNeeds: { energy: agent.energy, food: agent.food, social: agent.social, knowledge: agent.knowledge },
       ownRecentMemories: (agent.recentMemories || []).slice(0, 10),
+      currentDesignDraft: input.currentDesignDraft,
       currentProposal: currentIntent ? { id: currentIntent.id, status: currentIntent.status,
         proposerAgentId: currentIntent.proposer_agent_id, issuerAgentId: currentIntent.issuer_agent_id,
         name: currentIntent.name, purpose: currentIntent.purpose, specification: agentTokenSpecificationFromIntentRow(currentIntent) } : null,
@@ -768,24 +808,40 @@ export async function advanceWorldCurrencyGenesis(client, { worldId, agent, worl
   await recordCurrencyReviewOutcome(client, { worldId, agent, worldMinute, requirement, ...review.diagnostic });
   if (selected.id === 'no_action') return { status: requirement.status, decision: 'no_action' };
 
-  if (selected.id === 'propose_currency') {
+  if (selected.id === 'continue_design' || selected.id === 'propose_when_ready') {
     let authored = { specification: null, reason: 'local_authoring_unavailable' };
     try { authored = await authorProposal(input, { timeoutMs: 8_000 }); }
     catch { authored = { specification: null, reason: 'local_authoring_unavailable' }; }
-    let specification = {};
+    const priorSpecification = input.currentDesignDraft?.specification || {};
+    let patch = {};
     let authoringReason = authored.reason || null;
     if (authored.specification) {
-      try { specification = cleanPartialSpecification(authored.specification); }
+      try {
+        const generated = cleanPartialSpecification(authored.specification);
+        patch = Object.fromEntries(Object.entries(generated).filter(([, value]) => value !== null));
+      }
       catch { authoringReason = 'local_authoring_specification_invalid'; }
     }
-    const created = await createWorldTokenIssuanceIntent(client, { worldId, agentId: agent.agentId,
-      specification, actionId: currencyReviewActionId({ worldId, agentId: agent.agentId, worldMinute, action: 'propose' }),
-      worldMinute, decisionPath: 'world_engine', authoring: { provider: 'ollama_loopback',
-        model: authored.model || null, status: authored.specification && !authoringReason ? 'expressed' : 'incomplete',
-        reason: authoringReason } });
-    return { status: created.intent.status === 'incomplete' ? 'INCOMPLETE' : 'PROPOSAL_FORMED',
-      decision: 'proposal_created', intentId: created.intent.id,
-      authoringStatus: created.intent.metadata.localAuthoring?.status };
+    const specification = { ...priorSpecification, ...patch };
+    const complete = specificationFieldsComplete(specification);
+    if (selected.id === 'propose_when_ready' && complete) {
+      const created = await createWorldTokenIssuanceIntent(client, { worldId, agentId: agent.agentId,
+        specification, actionId: currencyReviewActionId({ worldId, agentId: agent.agentId,
+          worldMinute, action: 'propose' }), worldMinute, decisionPath: 'world_engine',
+        authoring: { provider: 'ollama_loopback', model: authored.model || input.currentDesignDraft?.authoring?.model || null,
+          status: authored.specification && !authoringReason ? 'expressed' : 'reused_complete_draft',
+          reason: authoringReason } });
+      return { status: created.intent.status === 'incomplete' ? 'INCOMPLETE' : 'PROPOSAL_FORMED',
+        decision: 'proposal_created', intentId: created.intent.id,
+        authoringStatus: created.intent.metadata.localAuthoring?.status };
+    }
+    const authoringStatus = authored.specification && !authoringReason ? 'expressed' : 'incomplete';
+    const savedDraft = await recordCurrencyGenesisDesignDraft(client, { worldId, agent, worldMinute,
+      specification, authoring: { model: authored.model || input.currentDesignDraft?.authoring?.model || null,
+        status: authoringStatus, reason: authoringReason } });
+    return { status: savedDraft.incompleteFields.length ? 'DRAFT_INCOMPLETE' : 'DRAFT_COMPLETE',
+      decision: selected.id === 'continue_design' ? 'design_continued' : 'specification_incomplete',
+      incompleteFields: savedDraft.incompleteFields, actionId: savedDraft.actionId, authoringStatus };
   }
   if (selected.id.startsWith('response:')) {
     const [, intentId, decision] = selected.id.split(':');

@@ -7,6 +7,7 @@ export function currencyGenesisInfrastructureFacts({ requirement, issuerAssignme
   return Object.freeze({
     currencyRequirement: 'CURRENCY_GENESIS_REQUIRED',
     requirementStatus: requirement?.status || null,
+    currencyRequirementMandatory: requirement?.status !== 'SATISFIED',
     genesisIssuer: typeof issuerAssignment?.issuerName === 'string' ? issuerAssignment.issuerName : null,
     generation: Number.isSafeInteger(Number(issuerAssignment?.capabilityGeneration))
       ? Number(issuerAssignment.capabilityGeneration) : AGENT_TOKEN_PILOT_GENERATION,

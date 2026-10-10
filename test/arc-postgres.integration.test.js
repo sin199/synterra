@@ -191,8 +191,9 @@ test('Arc Mainnet Agent action reaches persistent outbox, policy evaluation, and
 
     let allowProposal = false;
     let allowIssuerDecision = false;
+    let completeContinueDesign = false;
     let responseRecorded = false;
-    let authoringContextObserved = null;
+    const authoringContextsObserved = [];
     let reviewOutcomeOverride = null;
     const cognitionChoices = [];
     const cognitionFacts = new Map();
@@ -216,12 +217,12 @@ test('Arc Mainnet Agent action reaches persistent outbox, policy evaluation, and
         assert.equal(request.state.worldFacts.issuerSelectionSource, 'creator_genesis_assignment');
         assert.equal(request.state.worldFacts.totalHumanReadableSupply, '1000000000');
         const options = request.options || [];
-        const choose = options.find((option) => option.id === 'no_action');
+        const choose = options.find((option) => option.id === 'continue_design');
         let selected = choose;
         if (allowProposal && request.agentId === payerId
-            && options.some((option) => option.id === 'propose_currency')
+            && options.some((option) => option.id === 'propose_when_ready')
             && !request.state.currentProposal) {
-          selected = options.find((option) => option.id === 'propose_currency');
+          selected = options.find((option) => option.id === 'propose_when_ready');
         } else if (allowProposal && request.agentId === recipientId
             && options.some((option) => option.id.startsWith('response:') && option.id.endsWith(':support'))) {
           selected = options.find((option) => option.id.startsWith('response:') && option.id.endsWith(':support'));
@@ -238,33 +239,41 @@ test('Arc Mainnet Agent action reaches persistent outbox, policy evaluation, and
       authorCurrencyProposal: async (input) => {
         assert.strictEqual(input.worldFacts, cognitionFacts.get(input.resident.agentId),
           'cognition and authoring receive the very same world facts object');
-        authoringContextObserved = { agentId: input.resident.agentId, currentGoal: input.resident.currentGoal,
+        const observed = { agentId: input.resident.agentId, currentGoal: input.resident.currentGoal,
           goalCount: input.resident.goals.length, memories: input.resident.recentMemories.map((memory) => memory.summary),
           requirementStatus: input.worldFacts.requirementStatus,
-          recipientCount: input.availableRecipients.length };
-        assert.equal(input.resident.agentId, payerId);
-        assert.equal(input.resident.currentGoal, 'coordinate a research exchange with peers');
+          recipientCount: input.availableRecipients.length, currentDesignDraft: input.currentDesignDraft };
+        authoringContextsObserved.push(observed);
+        assert.ok(input.resident.agentId === payerId || input.resident.agentId === recipientId);
         assert.ok(input.resident.goals.length > 0, 'authoring receives this resident\'s active goals');
-        assert.ok(input.resident.recentMemories.some((memory) =>
-          memory.summary === 'A peer could not record the value of shared research.'),
-        'authoring receives this resident\'s own memory');
         assert.equal(input.worldFacts.requirementStatus, 'UNRESOLVED');
         const proposer = input.availableRecipients.find((recipient) => recipient.id === payerId);
         const peer = input.availableRecipients.find((recipient) => recipient.id === recipientId);
         assert.ok(proposer && peer, 'the resident receives real recipient options from the isolated world');
-        return { model: 'isolated-resident-authoring', reason: null, specification: {
-          name: 'Research Exchange', symbol: 'REX',
-          meaning: `A value record for ${input.resident.currentGoal}.`,
-          purpose: input.resident.currentGoal,
-          rationale: input.resident.recentMemories[0].summary,
-          decimals: 0,
-          distribution: [
-            { recipientType: 'agent', recipientId: proposer.id, recipientAddress: proposer.address, amount: '600000000' },
-            { recipientType: 'agent', recipientId: peer.id, recipientAddress: peer.address, amount: '400000000' }
-          ],
-          reserveAmount: '0', unallocatedSupplyHandling: 'fully_distributed',
-          ownershipModel: 'erc20_holder_owned', authorityModel: 'no_mint_no_burn'
-        } };
+        if ((allowProposal || completeContinueDesign) && input.resident.agentId === payerId) {
+          assert.equal(input.resident.currentGoal, 'coordinate a research exchange with peers');
+          assert.ok(input.resident.recentMemories.some((memory) =>
+            memory.summary === 'A peer could not record the value of shared research.'),
+          'authoring receives this resident\'s own memory');
+          assert.equal(input.currentDesignDraft?.specification?.purpose, input.resident.currentGoal,
+            'the prior resident-owned draft is available on the next design review');
+        }
+        if ((allowProposal || completeContinueDesign) && input.resident.agentId === payerId) return { model: 'isolated-resident-authoring',
+          reason: null, specification: {
+            name: 'Research Exchange', symbol: 'REX',
+            meaning: `A value record for ${input.resident.currentGoal}.`,
+            purpose: input.resident.currentGoal,
+            rationale: input.resident.recentMemories[0].summary,
+            decimals: 0,
+            distribution: [
+              { recipientType: 'agent', recipientId: proposer.id, recipientAddress: proposer.address, amount: '600000000' },
+              { recipientType: 'agent', recipientId: peer.id, recipientAddress: peer.address, amount: '400000000' }
+            ],
+            reserveAmount: '0', unallocatedSupplyHandling: 'fully_distributed',
+            ownershipModel: 'erc20_holder_owned', authorityModel: 'no_mint_no_burn'
+          } };
+        return { model: 'isolated-resident-authoring', reason: null,
+          specification: { purpose: input.resident.currentGoal || 'A resident-owned unresolved draft.' } };
       },
       onAutonomousBusinessAction: enqueueArcAgentEconomicAction, emergencySink: { write() {} } });
     assert.equal(engine.running, true);
@@ -288,8 +297,8 @@ test('Arc Mainnet Agent action reaches persistent outbox, policy evaluation, and
     assert.equal(Number((await pool.query(`SELECT count(*)::int AS count FROM arc_token_issuance_intents WHERE world_id=$1`,
       [worldId])).rows[0].count), 0, 'no proposal is created before a resident chooses one');
     let outcomeEvents = await pool.query(`SELECT actor_agent_id,world_minute,action_id,details FROM world_v7_events
-      WHERE world_id=$1 AND event_type='currency_genesis.review_outcome' AND details->>'outcome'='explicit_no_action'`, [worldId]);
-    assert.equal(outcomeEvents.rowCount, 2, 'each resident review gets an explicit no-action outcome');
+      WHERE world_id=$1 AND event_type='currency_genesis.review_outcome' AND details->>'outcome'='explicit_continue_design'`, [worldId]);
+    assert.equal(outcomeEvents.rowCount, 2, 'each resident review records that mandatory design remains open');
     assert.ok(outcomeEvents.rows.every((row) => row.details.reasonCode === 'offered_choice_selected'
       && row.details.provider === 'isolated-resident-cognition' && row.details.confidence === 0.99));
     const attributedInference = await pool.query(`SELECT attribution_type,agent_id,resource_category,provider,model,
@@ -301,7 +310,14 @@ test('Arc Mainnet Agent action reaches persistent outbox, policy evaluation, and
       && row.provider === 'isolated-resident-cognition' && row.model === 'isolated-resident-cognition'
       && row.quantity_raw === '1' && row.unit === 'provider_request_attempt'
       && row.cost_status === 'unpriced' && row.cost_currency === null && row.cost_microunits === null
-      && row.metadata.outcome === 'explicit_no_action'));
+      && row.metadata.outcome === 'explicit_continue_design'));
+    const initialDrafts = await pool.query(`SELECT actor_agent_id,details FROM world_v7_events WHERE world_id=$1
+      AND event_type='currency_genesis.design_draft' ORDER BY actor_agent_id`, [worldId]);
+    assert.equal(initialDrafts.rowCount, 2, 'continued design is persisted in existing V7 event history');
+    assert.ok(initialDrafts.rows.every((row) => row.details.specification.purpose
+      && row.details.incompleteFields.includes('name') && row.details.incompleteFields.includes('distribution')));
+    assert.equal(Number((await pool.query(`SELECT count(*)::int AS count FROM arc_token_issuance_intents WHERE world_id=$1`,
+      [worldId])).rows[0].count), 0, 'partial drafts do not create proposal or intent rows');
     assert.equal(Number((await pool.query(`SELECT count(*)::int AS count FROM world_infrastructure_fee_policies
       WHERE world_id=$1`, [worldId])).rows[0].count), 0,
     'the infrastructure metering path does not configure an operator fee or Agent tax');
@@ -328,7 +344,7 @@ test('Arc Mainnet Agent action reaches persistent outbox, policy evaluation, and
     await runReviewFailure({ type: 'throw', error: Object.assign(new Error('timed out'), { name: 'APITimeoutError' }) },
       'provider_timeout');
     await runReviewFailure({ type: 'return', value: {} }, 'malformed_output');
-    await runReviewFailure({ type: 'return', value: { choice: { id: 'no_action' }, confidence: 0.1,
+    await runReviewFailure({ type: 'return', value: { choice: { id: 'continue_design' }, confidence: 0.1,
       model: 'isolated-resident-cognition', provider: 'isolated-resident-cognition' } }, 'low_confidence');
     await runReviewFailure({ type: 'throw', error: new Error('simulated provider error') }, 'provider_error');
     await runReviewFailure({ type: 'return', value: { choice: { id: 'not-an-offered-option' }, confidence: 0.99,
@@ -340,8 +356,8 @@ test('Arc Mainnet Agent action reaches persistent outbox, policy evaluation, and
     let unavailableResult;
     try {
       unavailableResult = await chooseCivilizationOption({ choiceType: 'currency_genesis', options: [
-        { id: 'no_action', label: 'No action', description: 'none' },
-        { id: 'propose_currency', label: 'Propose', description: 'proposal' }
+        { id: 'continue_design', label: 'Continue design', description: 'continue' },
+        { id: 'propose_when_ready', label: 'Propose when ready', description: 'proposal' }
       ] }, {});
     } finally {
       if (savedApiKey === undefined) delete process.env.TYPESAFE_API_KEY;
@@ -350,14 +366,26 @@ test('Arc Mainnet Agent action reaches persistent outbox, policy evaluation, and
     assert.equal(unavailableResult.currencyReviewDiagnostic.outcome, 'provider_unavailable');
     await runReviewFailure({ type: 'return', value: unavailableResult }, 'provider_unavailable');
 
-    assert.ok(cognitionChoices.some((entry) => entry.choice === 'no_action'));
-    assert.equal(authoringContextObserved, null, 'network facts alone do not invoke authoring');
+    assert.ok(cognitionChoices.some((entry) => entry.choice === 'continue_design'));
+    assert.ok(authoringContextsObserved.length >= 2, 'a continue-design choice invokes authoring to update its draft');
     for (const table of ['arc_token_issuance_issuer_candidates', 'arc_token_issuance_decisions', 'arc_agent_tokens']) {
       assert.equal((await pool.query(`SELECT count(*)::int AS count FROM ${table} WHERE world_id=$1`, [worldId])).rows[0].count, 0);
     }
     assert.equal(cognitionFacts.get(payerId).mainnetWriteGate, false);
 
     reviewOutcomeOverride = null;
+    completeContinueDesign = true;
+    await runCurrencyReview();
+    completeContinueDesign = false;
+    const completeDraft = await pool.query(`SELECT details FROM world_v7_events WHERE world_id=$1 AND actor_agent_id=$2
+      AND event_type='currency_genesis.design_draft' ORDER BY world_minute DESC,created_at DESC LIMIT 1`, [worldId, payerId]);
+    assert.equal(completeDraft.rowCount, 1);
+    assert.deepEqual(completeDraft.rows[0].details.incompleteFields, [], 'the resident can complete a draft without proposing');
+    requirement = await pool.query(`SELECT status FROM arc_currency_genesis_requirements WHERE world_id=$1`, [worldId]);
+    assert.equal(requirement.rows[0].status, 'UNRESOLVED', 'a completed draft alone does not advance the requirement');
+    assert.equal(Number((await pool.query(`SELECT count(*)::int AS count FROM arc_token_issuance_intents WHERE world_id=$1`,
+      [worldId])).rows[0].count), 0, 'a completed continue-design choice still does not create a proposal');
+
     allowProposal = true;
     await runCurrencyReview();
     let proposal = await pool.query(`SELECT id,status,decision_path,issuer_agent_id,issuer_selection_source,name,specification_hash
@@ -373,9 +401,11 @@ test('Arc Mainnet Agent action reaches persistent outbox, policy evaluation, and
       AND actor_agent_id=$2 AND event_type='currency_genesis.review_outcome'
       AND details->>'outcome'='explicit_propose'`, [worldId, payerId]);
     assert.ok(outcomeEvents.rowCount >= 1 && outcomeEvents.rows.some((row) =>
-      row.details.actionId === 'propose_currency' && row.details.confidence === 0.99));
-    assert.ok(authoringContextObserved, 'a resident who chose the proposal action invoked local authoring');
-    assert.equal(proposal.rows[0].name, 'Research Exchange', JSON.stringify(authoringContextObserved));
+      row.details.actionId === 'propose_when_ready' && row.details.confidence === 0.99));
+    assert.ok(authoringContextsObserved.some((context) => context.agentId === payerId
+      && context.currentDesignDraft?.specification?.purpose === 'coordinate a research exchange with peers'),
+    'the resident authoring call receives the prior draft');
+    assert.equal(proposal.rows[0].name, 'Research Exchange', JSON.stringify(authoringContextsObserved));
     assert.equal(proposal.rows[0].status, 'proposed', 'a complete Agent-authored specification remains unconfirmed');
     assert.equal(proposal.rows[0].specification_hash, null,
       'proposal authoring is not itself execution confirmation');
@@ -418,7 +448,7 @@ test('Arc Mainnet Agent action reaches persistent outbox, policy evaluation, and
     assert.equal(proposal.rows[0].unallocated_supply_handling, 'fully_distributed');
     assert.equal(proposal.rows[0].ownership_model, 'erc20_holder_owned');
     assert.equal(proposal.rows[0].authority_model, 'no_mint_no_burn');
-    assert.ok(cognitionChoices.some((entry) => entry.choice === 'propose_currency'));
+    assert.ok(cognitionChoices.some((entry) => entry.choice === 'propose_when_ready'));
     assert.ok(cognitionChoices.some((entry) => entry.choice.startsWith('response:') && entry.choice.endsWith(':support')));
     assert.ok(!cognitionChoices.some((entry) => entry.choice.startsWith(`nominate:${proposalId}:`)));
     assert.ok(!cognitionChoices.some((entry) => entry.choice.startsWith(`candidate:${recipientId}:`)));

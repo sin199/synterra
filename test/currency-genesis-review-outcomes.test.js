@@ -10,21 +10,25 @@ import { currencyGenesisInfrastructureFacts } from '../src/arc/currency-genesis-
 import { arcNetworkConfig } from '../src/arc/config.js';
 
 const options = [
-  { id: 'no_action', label: 'No action' },
-  { id: 'propose_currency', label: 'Propose currency' },
+  { id: 'continue_design', label: 'Continue the required currency design' },
+  { id: 'propose_when_ready', label: 'Submit a complete currency design' },
   { id: 'response:00000000-0000-4000-8000-000000000000:support', label: 'Support proposal' },
   { id: 'issuer:00000000-0000-4000-8000-000000000000:reject', label: 'Reject issuer role' }
 ];
 
-test('currency review result classifier preserves explicit choices and separates non-decisions', () => {
-  const noAction = classifyCurrencyReviewResult({ choice: { id: 'no_action' }, confidence: 0.91,
+test('currency review classifier treats continued design as a valid decision and retains legacy outcome parsing', () => {
+  const continued = classifyCurrencyReviewResult({ choice: { id: 'continue_design' }, confidence: 0.91,
     provider: 'typesafe', model: 'jev-1.13.0' }, options);
-  assert.equal(noAction.diagnostic.outcome, 'explicit_no_action');
-  assert.equal(noAction.diagnostic.confidence, 0.91);
+  assert.equal(continued.diagnostic.outcome, 'explicit_continue_design');
+  assert.equal(continued.diagnostic.confidence, 0.91);
 
-  const proposal = classifyCurrencyReviewResult({ choice: { id: 'propose_currency' }, confidence: 0.8 }, options);
+  const proposal = classifyCurrencyReviewResult({ choice: { id: 'propose_when_ready' }, confidence: 0.8 }, options);
   assert.equal(proposal.diagnostic.outcome, 'explicit_propose');
-  assert.equal(proposal.diagnostic.selectedActionId, 'propose_currency');
+  assert.equal(proposal.diagnostic.selectedActionId, 'propose_when_ready');
+
+  const historicalNoAction = classifyCurrencyReviewResult({ choice: { id: 'no_action' }, confidence: 0.91 },
+    [...options, { id: 'no_action', label: 'Legacy no action' }]);
+  assert.equal(historicalNoAction.diagnostic.outcome, 'explicit_no_action');
 
   const response = classifyCurrencyReviewResult({ choice: options[2].id, confidence: 0.8 }, options);
   assert.equal(response.diagnostic.outcome, 'explicit_response');
@@ -37,7 +41,7 @@ test('currency review result classifier preserves explicit choices and separates
   assert.equal(classifyCurrencyReviewResult({}, options).diagnostic.outcome, 'malformed_output');
   assert.equal(classifyCurrencyReviewResult({ choice: 'not-offered', confidence: 0.8 }, options).diagnostic.outcome,
     'invalid_choice');
-  assert.equal(classifyCurrencyReviewResult({ choice: 'no_action', confidence: 0.29 }, options).diagnostic.outcome,
+  assert.equal(classifyCurrencyReviewResult({ choice: 'continue_design', confidence: 0.29 }, options).diagnostic.outcome,
     'low_confidence');
   assert.equal(classifyCurrencyReviewResult({ currencyReviewDiagnostic: { outcome: 'provider_unavailable',
     reasonCode: 'missing_api_key', provider: 'typesafe', model: 'jev-1.13.0' } }, options).diagnostic.outcome,
@@ -78,7 +82,7 @@ test('initialized TypeSafe client attempts the offered currency review with auth
   const attempts = [];
   t.mock.method(TypeSafeClient.prototype, 'systemOne', async (request, options) => {
     attempts.push({ request, options });
-    return { answers: { civilization_choice: { choice: 'no_action', confidence: 0.91 } },
+    return { answers: { civilization_choice: { choice: 'continue_design', confidence: 0.91 } },
       usage: { input_tokens: 48 }, model: 'jev-1.13.0' };
   });
   try {
@@ -93,12 +97,16 @@ test('initialized TypeSafe client attempts the offered currency review with auth
     { persistState: async () => {} });
 
     assert.equal(attempts.length, 1, 'the TypeSafe callback was actually attempted');
-    assert.equal(result.choice.id, 'no_action');
+    assert.equal(result.choice.id, 'continue_design');
     assert.equal(result.providerAttempted, true);
     assert.equal(result.provider, 'typesafe');
     assert.equal(result.model, 'jev-1.13.0');
     const observedFacts = attempts[0].request.state.observedState.worldFacts;
     for (const [key, value] of Object.entries(worldFacts)) assert.equal(observedFacts[key], value);
+    assert.match(attempts[0].request.questions.civilization_choice.instructions,
+      /mandatory CURRENCY_GENESIS_REQUIRED/);
+    assert.match(attempts[0].request.questions.civilization_choice.instructions,
+      /may not permanently reject or opt out/);
     assert.deepEqual({ requirement: observedFacts.currencyRequirement,
       status: observedFacts.requirementStatus, issuer: observedFacts.genesisIssuer,
       generation: observedFacts.generation, provenance: observedFacts.issuerSelectionSource,
