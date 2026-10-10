@@ -19,12 +19,30 @@ isolated real-REA smoke used Node `v24.21.0` with `rea-agents@6.3.0`. The same
 real MCP smoke also passed with the available sidecar runtime Node `v22.22.0`;
 production Node `v25.7.0` remains unchanged.
 
-Configure these LaunchAgent environment values after the separate runtime is
-installed and verified:
+The production host's validated pairing is REA Node `v22.22.0`,
+`rea-agents@6.3.0`, Eclipse Temurin JDK `21.0.12.1+1`, and Ghidra `12.1.4`
+on macOS `arm64`. Ghidra came from the official
+[`Ghidra_12.1.4_build` release](https://github.com/NationalSecurityAgency/ghidra/releases/tag/Ghidra_12.1.4_build)
+archive (SHA-256
+`ddac49f903da9d5bac833e5cc79395098b9c33cfd3279be5f31bd00387d2d4db`). The
+official archive did not include REA's required `mac_arm_64/decompile`
+executable, so that helper was built with Apple Clang from the same upstream
+tag, commit `8b6bbb857accdfa20dc5b2f5dea471178c2e9fbc`; its installed SHA-256 is
+`e31bc93586b13c7c4d3b705cce1d5ae761ca62e5bdd506ee3cdecbf9ee06fb54`.
+Toolchain files stay outside the Synterra repository. The LaunchAgent supplies
+`JAVA_HOME`, `GHIDRA_INSTALL_DIR`, and the bounded
+`REA_GHIDRA_STARTUP_TIMEOUT_MS=330000` setting; no host-specific path is
+embedded in Synterra code.
+
+Configure these LaunchAgent environment values for the separate runtime and
+native provider:
 
 ```text
 REA_NODE_BINARY=/absolute/path/to/compatible/node
 REA_SERVER_ENTRY=/absolute/path/to/node_modules/rea-agents/scripts/rea.mjs
+JAVA_HOME=/absolute/path/to/compatible/jdk
+GHIDRA_INSTALL_DIR=/absolute/path/to/extracted/ghidra
+REA_GHIDRA_STARTUP_TIMEOUT_MS=330000
 ```
 
 The worker launches `REA_NODE_BINARY REA_SERVER_ENTRY mcp` over stdio. It allows
@@ -36,13 +54,15 @@ not assume a fixed tool catalog or require Ghidra for JavaScript, EVM, or web
 targets. The worker owns an isolated process group and terminates it on shutdown
 or failed work.
 
-The inspected host has no usable Java runtime (`java -version` reports that a
-runtime cannot be located), no configured `GHIDRA_INSTALL_DIR`, and no `ghidra`
-or `analyzeHeadless` executable. Ghidra readiness is therefore reported
-unavailable; no Ghidra analysis is claimed as validated.
+The dynamic readiness check reports the Ghidra provider available while keeping
+the JavaScript analysis tool available. A real MCP native smoke explicitly
+selected `provider_id=ghidra`, decompiled a harmless fixture function, returned
+Evidence, and closed the session without changing fixture bytes. A Synterra
+isolated worker smoke also completed a binary job with Ghidra attribution while
+the World Engine tick continued. Ghidra remains optional for JavaScript, EVM,
+and web targets.
 
-Run the separate local real-REA smoke after installing the pinned REA package
-under a compatible Node runtime:
+Run the separate local REA JavaScript smoke under a compatible Node runtime:
 
 ```sh
 REA_NODE_BINARY=/absolute/path/to/compatible/node \
