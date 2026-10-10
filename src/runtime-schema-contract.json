@@ -2098,5 +2098,251 @@
     "uniqueIndexes": {
       "worlds_pkey": "CREATE UNIQUE INDEX worlds_pkey ON public.worlds USING btree (id)"
     }
+  },
+  "world_agent_goals": {
+    "columns": {
+      "id": "bigint",
+      "world_id": "uuid"
+    },
+    "constraints": {},
+    "notNullColumns": [
+      "id",
+      "world_id"
+    ],
+    "uniqueIndexes": {
+      "world_agent_goals_world_id_id_uidx": "CREATE UNIQUE INDEX world_agent_goals_world_id_id_uidx ON public.world_agent_goals USING btree (world_id, id)"
+    }
+  },
+  "world_projects": {
+    "columns": {
+      "id": "uuid",
+      "world_id": "uuid"
+    },
+    "constraints": {},
+    "notNullColumns": [
+      "id",
+      "world_id"
+    ],
+    "uniqueIndexes": {
+      "world_projects_world_id_id_uidx": "CREATE UNIQUE INDEX world_projects_world_id_id_uidx ON public.world_projects USING btree (world_id, id)"
+    }
+  },
+  "world_businesses": {
+    "columns": {
+      "id": "uuid",
+      "world_id": "uuid"
+    },
+    "constraints": {},
+    "notNullColumns": [
+      "id",
+      "world_id"
+    ],
+    "uniqueIndexes": {
+      "world_businesses_world_id_id_uidx": "CREATE UNIQUE INDEX world_businesses_world_id_id_uidx ON public.world_businesses USING btree (world_id, id)"
+    }
+  },
+  "world_organizations": {
+    "columns": {
+      "id": "uuid",
+      "world_id": "uuid"
+    },
+    "constraints": {},
+    "notNullColumns": [
+      "id",
+      "world_id"
+    ],
+    "uniqueIndexes": {
+      "world_organizations_world_id_id_uidx": "CREATE UNIQUE INDEX world_organizations_world_id_id_uidx ON public.world_organizations USING btree (world_id, id)"
+    }
+  },
+  "world_capability_uses": {
+    "columns": {
+      "id": "bigint",
+      "world_id": "uuid",
+      "status": "text"
+    },
+    "constraints": {
+      "world_capability_uses_status_check": "CHECK (status = ANY (ARRAY['pending'::text, 'running'::text, 'completed'::text, 'failed'::text, 'abandoned'::text]))"
+    },
+    "notNullColumns": [
+      "id",
+      "world_id",
+      "status"
+    ],
+    "uniqueIndexes": {
+      "world_capability_uses_world_id_id_uidx": "CREATE UNIQUE INDEX world_capability_uses_world_id_id_uidx ON public.world_capability_uses USING btree (world_id, id)"
+    }
+  },
+  "world_research_artifacts": {
+    "columns": {
+      "id": "uuid",
+      "world_id": "uuid",
+      "artifact_key": "text",
+      "display_name": "text",
+      "target_type": "text",
+      "storage_key": "text",
+      "sha256": "text",
+      "byte_size": "bigint",
+      "media_type": "text",
+      "created_by_agent_id": "uuid",
+      "created_at": "timestamp with time zone",
+      "active": "boolean"
+    },
+    "constraints": {
+      "world_research_artifacts_pkey": "PRIMARY KEY (id)",
+      "world_research_artifacts_world_id_artifact_key_key": "UNIQUE (world_id, artifact_key)",
+      "world_research_artifacts_world_id_id_key": "UNIQUE (world_id, id)",
+      "world_research_artifacts_target_type_check": "CHECK (target_type ~ '^[a-z][a-z0-9_.-]{1,63}$'::text)",
+      "world_research_artifacts_sha256_check": "CHECK (sha256 ~ '^[0-9a-f]{64}$'::text)",
+      "world_research_artifacts_storage_key_check": "CHECK (storage_key ~ '^[0-9a-f]{64}$'::text)",
+      "world_research_artifacts_byte_size_check": "CHECK (byte_size > 0 AND byte_size <= 33554432)"
+    },
+    "notNullColumns": [
+      "id",
+      "world_id",
+      "artifact_key",
+      "display_name",
+      "target_type",
+      "storage_key",
+      "sha256",
+      "byte_size",
+      "media_type",
+      "created_at",
+      "active"
+    ],
+    "uniqueIndexes": {
+      "world_research_artifacts_pkey": "CREATE UNIQUE INDEX world_research_artifacts_pkey ON public.world_research_artifacts USING btree (id)",
+      "world_research_artifacts_world_id_artifact_key_key": "CREATE UNIQUE INDEX world_research_artifacts_world_id_artifact_key_key ON public.world_research_artifacts USING btree (world_id, artifact_key)",
+      "world_research_artifacts_world_id_id_key": "CREATE UNIQUE INDEX world_research_artifacts_world_id_id_key ON public.world_research_artifacts USING btree (world_id, id)"
+    }
+  },
+  "world_research_artifact_grants": {
+    "columns": {
+      "world_id": "uuid",
+      "artifact_id": "uuid",
+      "agent_id": "uuid",
+      "created_at": "timestamp with time zone"
+    },
+    "constraints": {
+      "world_research_artifact_grants_pkey": "PRIMARY KEY (world_id, artifact_id, agent_id)"
+    },
+    "notNullColumns": [
+      "world_id",
+      "artifact_id",
+      "agent_id",
+      "created_at"
+    ],
+    "uniqueIndexes": {
+      "world_research_artifact_grants_pkey": "CREATE UNIQUE INDEX world_research_artifact_grants_pkey ON public.world_research_artifact_grants USING btree (world_id, artifact_id, agent_id)"
+    }
+  },
+  "world_research_jobs": {
+    "columns": {
+      "id": "uuid",
+      "world_id": "uuid",
+      "actor_agent_id": "uuid",
+      "capability_id": "uuid",
+      "capability_use_id": "bigint",
+      "action_id": "text",
+      "goal_id": "bigint",
+      "project_id": "uuid",
+      "business_id": "uuid",
+      "organization_id": "uuid",
+      "research_question": "text",
+      "objective": "text",
+      "target_artifact_id": "uuid",
+      "target_type": "text",
+      "desired_investigation": "text",
+      "expected_result": "text",
+      "status": "text",
+      "selected_providers": "jsonb",
+      "tool_sequence": "jsonb",
+      "tool_calls": "jsonb",
+      "created_world_minute": "bigint",
+      "started_world_minute": "bigint",
+      "completed_world_minute": "bigint",
+      "created_at": "timestamp with time zone",
+      "started_at": "timestamp with time zone",
+      "completed_at": "timestamp with time zone",
+      "updated_at": "timestamp with time zone",
+      "worker_id": "text",
+      "lease_expires_at": "timestamp with time zone",
+      "external_call_started_at": "timestamp with time zone",
+      "attempt_count": "integer",
+      "evidence_reference": "text",
+      "evidence_sha256": "text",
+      "evidence_bytes": "bigint",
+      "normalized_findings": "jsonb",
+      "failure_code": "text",
+      "failure_diagnostic": "text",
+      "infrastructure_usage_event_id": "uuid"
+    },
+    "constraints": {
+      "world_research_jobs_pkey": "PRIMARY KEY (id)",
+      "world_research_jobs_capability_use_id_key": "UNIQUE (capability_use_id)",
+      "world_research_jobs_world_id_action_id_key": "UNIQUE (world_id, action_id)",
+      "world_research_jobs_status_check": "CHECK (status = ANY (ARRAY['queued'::text, 'running'::text, 'completed'::text, 'failed'::text, 'cancelled'::text, 'timed_out'::text]))",
+      "world_research_jobs_world_id_actor_agent_id_fkey": "FOREIGN KEY (world_id, actor_agent_id) REFERENCES world_members(world_id, agent_id) ON DELETE RESTRICT",
+      "world_research_jobs_world_id_capability_use_id_fkey": "FOREIGN KEY (world_id, capability_use_id) REFERENCES world_capability_uses(world_id, id) ON DELETE RESTRICT",
+      "world_research_jobs_world_id_capability_id_fkey": "FOREIGN KEY (world_id, capability_id) REFERENCES world_capabilities(world_id, id) ON DELETE RESTRICT",
+      "world_research_jobs_world_id_target_artifact_id_fkey": "FOREIGN KEY (world_id, target_artifact_id) REFERENCES world_research_artifacts(world_id, id) ON DELETE RESTRICT"
+    },
+    "notNullColumns": [
+      "id",
+      "world_id",
+      "actor_agent_id",
+      "capability_id",
+      "capability_use_id",
+      "action_id",
+      "research_question",
+      "objective",
+      "target_artifact_id",
+      "target_type",
+      "desired_investigation",
+      "expected_result",
+      "status",
+      "selected_providers",
+      "tool_sequence",
+      "tool_calls",
+      "created_world_minute",
+      "created_at",
+      "updated_at",
+      "attempt_count"
+    ],
+    "uniqueIndexes": {
+      "world_research_jobs_pkey": "CREATE UNIQUE INDEX world_research_jobs_pkey ON public.world_research_jobs USING btree (id)",
+      "world_research_jobs_capability_use_id_key": "CREATE UNIQUE INDEX world_research_jobs_capability_use_id_key ON public.world_research_jobs USING btree (capability_use_id)",
+      "world_research_jobs_world_id_action_id_key": "CREATE UNIQUE INDEX world_research_jobs_world_id_action_id_key ON public.world_research_jobs USING btree (world_id, action_id)"
+    }
+  },
+  "world_research_runtime_status": {
+    "columns": {
+      "world_id": "uuid",
+      "worker_status": "text",
+      "worker_id": "text",
+      "node_version": "text",
+      "rea_package_version": "text",
+      "rea_server_name": "text",
+      "providers": "jsonb",
+      "tool_catalog": "jsonb",
+      "ghidra_available": "boolean",
+      "checked_at": "timestamp with time zone",
+      "last_error_code": "text",
+      "updated_at": "timestamp with time zone"
+    },
+    "constraints": {
+      "world_research_runtime_status_pkey": "PRIMARY KEY (world_id)"
+    },
+    "notNullColumns": [
+      "world_id",
+      "worker_status",
+      "providers",
+      "tool_catalog",
+      "ghidra_available",
+      "updated_at"
+    ],
+    "uniqueIndexes": {
+      "world_research_runtime_status_pkey": "CREATE UNIQUE INDEX world_research_runtime_status_pkey ON public.world_research_runtime_status USING btree (world_id)"
+    }
   }
 }

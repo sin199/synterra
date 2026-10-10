@@ -40,7 +40,7 @@ export async function prepareStartupSchema(pool, { rootDirectory, mode = 'apply'
   const migrations = await readWorldMigrationPlan(rootDirectory);
   const requiredMigrations = ['0001_arc_mainnet.sql', '0002_world_environment.sql',
     '0002_arc_agent_token_issuance.sql', '0003_arc_agent_token_issuance_runtime_privileges.sql',
-    '0004_genesis_token_economy.sql'];
+    '0004_genesis_token_economy.sql', '0005_rea_research_jobs.sql'];
   for (const name of requiredMigrations) {
     if (!migrations.some((migration) => migration.name === name)) throw incompatible(`missing migration source ${name}`);
   }
@@ -120,6 +120,35 @@ export async function prepareStartupSchema(pool, { rootDirectory, mode = 'apply'
         [role, names, ['SELECT', ...privileges.split(',')]]);
         for (const row of grants.rows) if (!row.allowed) throw incompatible(`${role} ${row.privilege} missing on ${row.name}`);
       }
+    }
+    const researchTableGrants = [
+      ['world_research_artifacts', ['SELECT','INSERT']],
+      ['world_research_artifact_grants', ['SELECT','INSERT']],
+      ['world_research_jobs', ['SELECT','INSERT']],
+      ['world_research_runtime_status', ['SELECT','INSERT','UPDATE']],
+      ['world_capability_uses', ['SELECT','INSERT']],
+      ['world_capabilities', ['SELECT']]
+    ];
+    const researchColumnUpdates = {
+      world_research_jobs: ['status','worker_id','started_at','lease_expires_at','attempt_count','external_call_started_at',
+        'completed_at','completed_world_minute','evidence_reference','evidence_sha256','evidence_bytes','normalized_findings',
+        'selected_providers','tool_sequence','tool_calls','infrastructure_usage_event_id','failure_code','failure_diagnostic','updated_at'],
+      world_capability_uses: ['status','success','costs','effects','side_effects','result'],
+      world_capabilities: ['usage_count','success_count','failure_count','updated_at']
+    };
+    for (const role of new Set([currentRole, 'synterra_app'])) {
+      for (const [table, privileges] of researchTableGrants) {
+        const grants = await client.query(`SELECT privilege,has_table_privilege($1,'public.' || $2,privilege) AS allowed
+          FROM unnest($3::text[]) AS privilege`, [role, table, privileges]);
+        for (const row of grants.rows) if (!row.allowed) throw incompatible(`${role} ${row.privilege} missing on ${table}`);
+      }
+      for (const [table, columnsForUpdate] of Object.entries(researchColumnUpdates)) {
+        const grants = await client.query(`SELECT column_name,has_column_privilege($1,'public.' || $2,column_name,'UPDATE') AS allowed
+          FROM unnest($3::text[]) AS column_name`, [role, table, columnsForUpdate]);
+        for (const row of grants.rows) if (!row.allowed) throw incompatible(`${role} UPDATE missing on ${table}.${row.column_name}`);
+      }
+      const sequence = await client.query(`SELECT has_sequence_privilege($1,'public.world_capability_uses_id_seq','USAGE') AS allowed`, [role]);
+      if (!sequence.rows[0]?.allowed) throw incompatible(`${role} USAGE missing on world_capability_uses_id_seq`);
     }
     for (const [privileges, names] of Object.entries(coreWrites)) {
       const grants = await client.query(`SELECT name,privilege,

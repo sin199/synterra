@@ -59,6 +59,9 @@ import { isGenesisCurrencyActive, readActiveGenesisTokenAssets, readGenesisBusin
   createArcGenesisTokenSettlementIntent } from './genesis-economy.js';
 import { prepareGenesisTokenSettlementAuthorization, readGenesisTokenSettlement,
   recordGenesisTokenSettlementSubmission } from './arc/genesis-token-settlement-api.js';
+import { cancelResearchJob, enqueueResearchCapabilityUse, listAgentResearchJobs,
+  readResearchWorldStatus } from './research/research-jobs.js';
+import { startReaResearchWorker } from './research/research-worker.js';
 import { alignWorldValue, createCoordinationMechanism, createEmergentEntity, createGoalPrimitiveProposal, createObservationMethod,
   createPolicyExperiment, createWorldResourceType, decideObservationMethod, decideWorldResourceType, evaluateCoordinationExperiment,
   exposeWorldValue,
@@ -77,6 +80,7 @@ const challenges = new Map();
 let worldEngine = { running: false, reason: 'starting' };
 let v6LifecycleObserver = null;
 let arcObserver = null;
+let reaResearchWorker = null;
 let arcSigner = null;
 let arcInfrastructureSigner = null;
 let arcSignerSetupError = null;
@@ -224,9 +228,12 @@ app.addHook('preHandler', async (request, reply) => {
   const pathOnly = request.raw.url?.split('?')[0] || '';
   const localResidentDetail = /^\/local\/map-data\/residents\/[^/]+$/.test(pathOnly)
     && ['127.0.0.1', '::1', 'localhost'].includes(HOST);
+  const localResearchStatus = pathOnly === '/local/research-status'
+    && ['127.0.0.1', '::1', 'localhost'].includes(HOST);
   if (pathOnly === '/' || pathOnly === '/styles.css' || pathOnly === '/app.js' || pathOnly === '/world3d.js' ||
       pathOnly === '/vendor/three.module.min.js' || pathOnly === '/v6-observer-status.js' || pathOnly === '/og.jpg' || pathOnly.startsWith('/fonts/') || pathOnly === '/public/stats' ||
-      pathOnly === '/local/map-data' || localResidentDetail || pathOnly === '/health' || pathOnly === '/v1/agents/challenges' || pathOnly === '/v1/agents') return;
+      pathOnly === '/local/map-data' || localResidentDetail || localResearchStatus || pathOnly === '/health'
+      || pathOnly === '/v1/agents/challenges' || pathOnly === '/v1/agents') return;
 
   const agentId = request.headers['x-agent-id'];
   const time = Number(request.headers['x-agent-time']);
@@ -317,7 +324,9 @@ app.get('/health', async () => {
         reason: arcTokenSchemaReady ? 'worker_not_registered' : 'genesis_economy_migration_required' },
       arcAgentTokenIssuanceWorker: arcAgentTokenIssuanceWorker?.getStatus() || {
         available: arcTokenSchemaReady, running: false, mode: 'read_only_reconciliation',
-        writesEnabled: false, reason: arcTokenSchemaReady ? 'worker_not_registered' : 'arc_token_issuance_migration_required' } };
+        writesEnabled: false, reason: arcTokenSchemaReady ? 'worker_not_registered' : 'arc_token_issuance_migration_required' },
+      reaResearch: reaResearchWorker?.getStatus() || { available: false, running: false,
+        mode: 'asynchronous_research', reason: 'research_worker_not_registered' } };
   } catch {
     const observerStatus = await readV6LifecycleObserverRuntimeStatus();
     const arcObserverStatus = arcPublicStatus();
@@ -335,7 +344,9 @@ app.get('/health', async () => {
         reason: arcTokenSchemaReady ? 'worker_not_registered' : 'genesis_economy_migration_required' },
       arcAgentTokenIssuanceWorker: arcAgentTokenIssuanceWorker?.getStatus() || {
         available: arcTokenSchemaReady, running: false, mode: 'read_only_reconciliation',
-        writesEnabled: false, reason: arcTokenSchemaReady ? 'worker_not_registered' : 'arc_token_issuance_migration_required' } };
+        writesEnabled: false, reason: arcTokenSchemaReady ? 'worker_not_registered' : 'arc_token_issuance_migration_required' },
+      reaResearch: reaResearchWorker?.getStatus() || { available: false, running: false,
+        mode: 'asynchronous_research', reason: 'research_worker_not_registered' } };
   }
 });
 
@@ -2001,6 +2012,18 @@ app.post('/v1/worlds/:worldId/capabilities/:capabilityId/use', async (request, r
       || (body.partnerAgentId !== undefined && !validUuid(body.partnerAgentId))
       || (body.experimentId !== undefined && !validUuid(body.experimentId))) return fail(reply, 400, 'CAPABILITY_USE_FIELDS_INVALID');
   const actionId = requireActionId(body);
+  if (body.researchIntent !== undefined) {
+    if (!body.researchIntent || typeof body.researchIntent !== 'object' || Array.isArray(body.researchIntent)) {
+      return fail(reply, 400, 'RESEARCH_INTENT_INVALID');
+    }
+    const queued = await transaction(async (client) => {
+      await assertMember(client, worldId, request.agentId, true);
+      return enqueueResearchCapabilityUse(client, { worldId, agentId: request.agentId, capabilityId,
+        actionId, worldMinute: await readWorldMinutes(client, worldId), decisionSource: 'agent_api',
+        researchIntent: body.researchIntent });
+    });
+    return reply.code(queued.idempotent ? 200 : 202).send({ use: queued });
+  }
   const use = await transaction(async (client) => {
     await assertMember(client, worldId, request.agentId, true);
     const resident = await client.query(`SELECT energy,food FROM world_members WHERE world_id=$1 AND agent_id=$2 FOR UPDATE`,
@@ -2374,6 +2397,35 @@ app.get('/v1/worlds/:worldId/events', async (request, reply) => {
   return { events: events.rows };
 });
 
+app.get('/v1/worlds/:worldId/research-jobs', async (request, reply) => {
+  const { worldId } = request.params;
+  if (!validUuid(worldId)) return fail(reply, 400, 'WORLD_ID_INVALID');
+  await assertMember(pool, worldId, request.agentId);
+  return { worldId, jobs: await listAgentResearchJobs(pool, { worldId, agentId: request.agentId,
+    limit: Math.min(100, Math.max(1, Number(request.query.limit) || 30)) }) };
+});
+
+app.post('/v1/worlds/:worldId/research-jobs/:jobId/cancel', async (request, reply) => {
+  const { worldId, jobId } = request.params;
+  if (!validUuid(worldId) || !validUuid(jobId)) return fail(reply, 400, 'RESEARCH_JOB_ID_INVALID');
+  const actionId = requireActionId(request.body || {});
+  const job = await transaction(async (client) => {
+    await assertMember(client, worldId, request.agentId, true);
+    return cancelResearchJob(client, { worldId, agentId: request.agentId, jobId, actionId,
+      worldMinute: await readWorldMinutes(client, worldId) });
+  });
+  return reply.code(job.idempotent ? 200 : 202).send({ job });
+});
+
+app.get('/local/research-status', async (request, reply) => {
+  if (!['127.0.0.1', '::1', 'localhost'].includes(HOST)) return fail(reply, 404, 'NOT_FOUND');
+  if (!worldEngine.worldId) return reply.code(503).send({ error: 'WORLD_ENGINE_UNAVAILABLE',
+    reaResearch: reaResearchWorker?.getStatus() || { available: false, reason: 'world_engine_not_registered' } });
+  return { worldId: worldEngine.worldId, reaResearch: reaResearchWorker?.getStatus() || null,
+    ...await readResearchWorldStatus(pool, { worldId: worldEngine.worldId,
+      limit: Math.min(100, Math.max(1, Number(request.query.limit) || 30)) }) };
+});
+
 try {
   await prepareStartupSchema(pool, { rootDirectory: ROOT, mode: process.env.SYNTERRA_SCHEMA_MODE ?? 'apply' });
 } catch (error) {
@@ -2447,6 +2499,12 @@ if (worldEngine.running && worldEngine.worldLockOwned && worldEngine.worldId) {
     directory: path.join(STATE_DIR, 'v6-observations'),
     isOwner: () => worldEngine.running && worldEngine.worldLockOwned && worldEngine.worldId === observerWorldId,
     onError: (error) => app.log.error({ err: error }, 'read-only V6 lifecycle observer snapshot failed') });
+  reaResearchWorker = startReaResearchWorker({ pool, worldId: observerWorldId, stateDirectory: STATE_DIR,
+    artifactDirectory: path.join(STATE_DIR, 'research', 'artifacts'),
+    evidenceDirectory: path.join(STATE_DIR, 'research', 'evidence'),
+    isOwner: () => worldEngine.running && worldEngine.worldLockOwned && worldEngine.worldId === observerWorldId,
+    onError: (record) => app.log.error({ ...record }, 'REA research worker event') });
+  reaResearchWorker.start();
   if (arcSchemaReady) {
     arcObserver = startArcReadOnlyObserver({ pool, config: ARC_CONFIG,
       rpcClient: ARC_RPC_CLIENT,
@@ -2485,6 +2543,7 @@ async function shutdown() {
   await arcObserver?.stop();
   await v6LifecycleObserver?.stop();
   await worldEngine.stop?.();
+  await reaResearchWorker?.stop();
   await app.close();
   await pool.end();
   process.exit(0);

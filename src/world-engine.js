@@ -47,6 +47,7 @@ import { writeWorldHistory } from './world-domain.js';
 import { advanceWorldCurrencyGenesis, ensureWorldCurrencyGenesisRequirement } from './world-token-issuance.js';
 import { ensureResidentEconomicAccounts } from './economic-ledger.js';
 import { readGenesisCurrencyActivation, readGenesisTokenWalletSnapshots } from './genesis-economy.js';
+import { enqueueResearchCapabilityUse, listResearchInputsByWorld } from './research/research-jobs.js';
 
 export const WORLD_TICK_MS = 1_000;
 const TYPE_SAFE_INTERVAL_MS = 30 * 60_000;
@@ -1370,13 +1371,19 @@ async function completeActivity(client, worldId, agent, runtime, now, scene, onA
       happiness: socialInteraction ? 6 : 0, knowledge: socialInteraction ? 1 : 0 };
   } else if (activity === 'capability_use') {
     try {
-      const use = await performWorldCapabilityUse(client, { worldId, agentId: agent.agentId,
-        partnerId: agent.planned_partner_id || agent.planned_context?.capabilityContext?.partnerAgentId || null,
-        capabilityId: agent.planned_context?.capabilityId,
-        experimentId: agent.planned_context?.capabilityExperimentId || null,
-        selectionSource: agent.planned_context?.capabilitySelectionSource || 'utility_fallback',
-        actionId: actionId(agent.agentId, runtime.tick_count, 'capability-use'),
-        worldMinute: runtime.world_minutes, agentEnergy: agent.energy });
+      const useActionId = actionId(agent.agentId, runtime.tick_count, 'capability-use');
+      const researchIntent = agent.planned_context?.capabilityContext?.researchIntent || null;
+      const use = researchIntent
+        ? await enqueueResearchCapabilityUse(client, { worldId, agentId: agent.agentId,
+          capabilityId: agent.planned_context?.capabilityId,
+          decisionSource: agent.planned_context?.capabilitySelectionSource || 'utility_fallback',
+          actionId: useActionId, worldMinute: runtime.world_minutes, researchIntent })
+        : await performWorldCapabilityUse(client, { worldId, agentId: agent.agentId,
+          partnerId: agent.planned_partner_id || agent.planned_context?.capabilityContext?.partnerAgentId || null,
+          capabilityId: agent.planned_context?.capabilityId,
+          experimentId: agent.planned_context?.capabilityExperimentId || null,
+          selectionSource: agent.planned_context?.capabilitySelectionSource || 'utility_fallback',
+          actionId: useActionId, worldMinute: runtime.world_minutes, agentEnergy: agent.energy });
       result.capability = use;
       needs.energy = -Number(use.costs?.energy || 0);
       needs.food = -Number(use.costs?.food || 0);
@@ -2288,6 +2295,10 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
         const placeIdsByName = Object.fromEntries(scenes.map((scene) => [scene.name, scene.id]));
         const dueResidents = membersResult.rows.filter((member) => member.status === 'idle'
           && new Date(member.next_decision_at).getTime() <= now.getTime());
+        let researchInputs = null;
+        if (dueResidents.length && capabilityOptions.some((row) => safeJson(row.specification).systemKey === 'technical_reverse_engineering_research')) {
+          researchInputs = await listResearchInputsByWorld(client, { worldId });
+        }
         phaseSucceeded('RESIDENT_UPDATE');
         setPhase('INSTITUTIONAL_EXPIRY');
         let initiativeState = null;
@@ -2492,6 +2503,7 @@ export async function startWorldEngine(pool, { worldId: requestedWorldId = null,
             residentsAt: placeCounts, residentsAtLocation, environment, occupancy });
           const capabilityCandidates = await buildCapabilityUseCandidates(agent, capabilityOptions, {
             worldMinutes, residentsAtLocation, placeIdsByName,
+            researchInputs,
             maxAlternativeScore: Math.max(0, ...nativeUtilityCandidates.map((candidate) => Number(candidate.score) || 0)) });
           const utilityCandidates = [...nativeUtilityCandidates,
             ...capabilityCandidates.filter((candidate) => destinationFeasible(candidate, agent, scenes, environment))];

@@ -6,6 +6,7 @@ import { isGenesisCurrencyActive } from './genesis-economy.js';
 import { contributeOrganizationEffort } from './world-organizations.js';
 import { contributeToProject } from './world-projects.js';
 import { capabilityGraphDepth, recordWorldCapabilityDependencies } from './world-v7.js';
+import { RESEARCH_CAPABILITY_KEY, RESEARCH_CAPABILITY_SPEC } from './research/research-jobs.js';
 
 export const CIVILIZATION_REVIEW_INTERVAL_MINUTES = 7 * 1_440;
 export const EXPERIMENT_DURATION_MINUTES = 14 * 1_440;
@@ -37,7 +38,9 @@ const CORE_CAPABILITIES = [
   ['norm', 'institution.norm', 'Norm', 'Repeated interactions can form durable social expectations.'],
   ['place_creation', 'world.place', 'Place creation', 'Residents and projects can create shared places.'],
   ['information_sharing', 'social.information', 'Information sharing', 'Residents can share and assess information.'],
-  ['market_observation', 'economy.market_observation', 'Market observation', 'Residents can observe demand and supply signals.']
+  ['market_observation', 'economy.market_observation', 'Market observation', 'Residents can observe demand and supply signals.'],
+  [RESEARCH_CAPABILITY_KEY, 'learning.technical_research', 'Technical reverse-engineering research',
+    'Residents can request bounded, evidence-based research on artifacts made available to them.']
 ];
 
 const PRIMITIVE_CAPABILITIES = [
@@ -259,7 +262,8 @@ export async function seedWorldCapabilityRegistry(client, worldId) {
       ON CONFLICT(world_id,capability_key,version) DO NOTHING RETURNING id`,
     [id, worldId, key, category, name, description, JSON.stringify(primitiveId
       ? { schemaVersion: 1, kind: 'primitive', primitiveId }
-      : { schemaVersion: 1, kind: 'native_system', systemKey: key }),
+      : key === RESEARCH_CAPABILITY_KEY ? RESEARCH_CAPABILITY_SPEC
+        : { schemaVersion: 1, kind: 'native_system', systemKey: key }),
     JSON.stringify({ systemProvided: true, v6Baseline: true })]);
     const selected = result.rows[0]?.id || (await client.query(`SELECT id FROM world_capabilities
       WHERE world_id=$1 AND capability_key=$2 AND version=1`, [worldId, key])).rows[0]?.id;
@@ -1253,10 +1257,55 @@ export async function advanceWorldCivilization(client, { worldId, agent, worldMi
     experimentsStarted: experiments.length, experimentsEvaluated: outcomes.length };
 }
 
+function buildResearchCapabilityCandidates(agent, row, context = {}) {
+  const researchInputs = context.researchInputs;
+  const artifacts = researchInputs?.artifactsByAgent?.get(agent.agentId) || [];
+  const relations = researchInputs?.contextsByAgent?.get(agent.agentId) || [];
+  if (!artifacts.length || !relations.length) return [];
+  const primaryGoalId = String(agent.goals?.find((goal) => goal.goalType === 'primary' && goal.status === 'active')?.id || '');
+  const relation = relations.find((item) => item.relationType === 'goal' && String(item.relationId) === primaryGoalId)
+    || relations.find((item) => /research|learn|study|investigate|analy[sz]|build|engineer/i.test(`${item.label} ${item.objective}`))
+    || relations[0];
+  if (!relation?.objective) return [];
+  const curious = clamp(agent.curiosity ?? agent.traits?.curiosity, 0, 1);
+  const researchSkill = Math.max(0, Number(agent.skills?.research) || 0);
+  const goalAligned = /research|learn|study|investigate|analy[sz]|build|engineer/i.test(
+    `${relation.label} ${relation.objective} ${agent.primaryGoal || ''} ${agent.currentGoal || ''}`);
+  const priorUses = (agent.recentMemories || []).filter((memory) => memory.memoryType === 'capability_use'
+    && String(memory.metadata?.capabilityId) === String(row.id));
+  const naturalScore = 20 + curious * 10 + researchSkill * 0.08 + (goalAligned ? 12 : 0)
+    + (priorUses[0]?.metadata?.success === true ? 4 : priorUses[0]?.metadata?.success === false ? -8 : 0);
+  const discoveryInterest = clamp(curious * 0.55 + (goalAligned ? 0.3 : 0) + researchSkill / 700, 0, 1);
+  const discoverableScore = Number(context.maxAlternativeScore) > 0
+    ? Number(context.maxAlternativeScore) * (0.55 + discoveryInterest * 0.2) : 0;
+  return artifacts.slice(0, 2).map((artifact) => {
+    const objective = `${relation.label}: ${relation.objective}`.slice(0, 1_600);
+    const researchIntent = {
+      artifactId: String(artifact.id), targetType: artifact.targetType,
+      researchQuestion: `What evidence does ${artifact.displayName} provide about ${relation.label}?`.slice(0, 1_200),
+      objective,
+      desiredInvestigation: `Use REA's supported ${artifact.targetType} analysis to examine the artifact for evidence relevant to this existing ${relation.relationType}.`,
+      expectedResult: `A bounded, evidence-backed summary of findings and unresolved questions relevant to ${relation.label}.`,
+      relationType: relation.relationType, relationId: String(relation.relationId)
+    };
+    return { id: `research:${row.id}:${artifact.id}`, action: 'capability_use', targetLocation: agent.location,
+      goal: `Optional REA research for ${relation.label}: ${artifact.displayName}`,
+      score: Math.max(naturalScore, discoverableScore), capabilityId: row.id,
+      capabilityName: row.name, capabilityExperimentId: null,
+      description: `Optional evidence-based investigation of an available ${artifact.targetType} artifact in service of the resident's existing ${relation.relationType}.`,
+      capabilityContext: { capabilityId: row.id, experimentId: null,
+        worldMinutes: Number(context.worldMinutes) || 0, researchIntent } };
+  });
+}
+
 export async function buildCapabilityUseCandidates(agent, capabilities, context = {}) {
   const candidates = [];
   for (const row of Array.isArray(capabilities) ? capabilities : []) {
     const spec = jsonValue(row.specification);
+    if (spec.kind === 'native_system' && spec.systemKey === RESEARCH_CAPABILITY_KEY) {
+      candidates.push(...buildResearchCapabilityCandidates(agent, row, context));
+      continue;
+    }
     if (spec.kind !== 'composition') continue;
     const requirements = spec.requirements || {};
     if (Number(agent.energy) < Number(requirements.minEnergy ?? 20) || Number(agent.food) < Number(requirements.minFood ?? 8)) continue;
