@@ -63,3 +63,62 @@ export async function applyWorldSchemaAndMigrations(pool, { rootDirectory }) {
   } finally { client.release(); }
   return { applied, alreadyApplied };
 }
+
+export async function applySingleWorldMigration(pool, { rootDirectory, migrationName }) {
+  if (!pool || typeof pool.connect !== 'function') {
+    throw new TypeError('A PostgreSQL pool is required to apply a Synterra migration.');
+  }
+  if (typeof rootDirectory !== 'string' || !rootDirectory) throw new TypeError('Repository root is required.');
+  if (typeof migrationName !== 'string' || !/^\d{4}_[a-z0-9_]+\.sql$/.test(migrationName)) {
+    throw new TypeError('A numbered migration filename is required.');
+  }
+
+  const migrations = await readWorldMigrationPlan(rootDirectory);
+  const targetIndex = migrations.findIndex((migration) => migration.name === migrationName);
+  if (targetIndex < 0) throw Object.assign(new Error(`Unknown migration: ${migrationName}.`), { code: 'DATABASE_MIGRATION_UNKNOWN' });
+  const target = migrations[targetIndex];
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', [DATABASE_MIGRATION_LOCK]);
+    const ledgerExists = await client.query("SELECT to_regclass('public.synterra_schema_migrations') AS name");
+    if (!ledgerExists.rows[0]?.name) {
+      throw Object.assign(new Error('Migration ledger is missing; refusing to bootstrap schema for a selected migration.'),
+        { code: 'DATABASE_MIGRATION_LEDGER_MISSING' });
+    }
+    const required = migrations.slice(0, targetIndex + 1);
+    const ledger = await client.query(`SELECT version,checksum FROM public.synterra_schema_migrations
+      WHERE version=ANY($1::text[])`, [required.map((migration) => migration.name)]);
+    for (const migration of required.slice(0, -1)) {
+      const entry = ledger.rows.find((row) => row.version === migration.name);
+      if (!entry) {
+        throw Object.assign(new Error(`Required earlier migration is missing: ${migration.name}.`),
+          { code: 'DATABASE_MIGRATION_PREREQUISITE_MISSING' });
+      }
+      if (entry.checksum !== migration.checksum) {
+        throw Object.assign(new Error(`Applied migration checksum changed: ${migration.name}.`),
+          { code: 'DATABASE_MIGRATION_CHECKSUM_MISMATCH' });
+      }
+    }
+    const targetEntry = ledger.rows.find((row) => row.version === target.name);
+    if (targetEntry) {
+      if (targetEntry.checksum !== target.checksum) {
+        throw Object.assign(new Error(`Applied migration checksum changed: ${target.name}.`),
+          { code: 'DATABASE_MIGRATION_CHECKSUM_MISMATCH' });
+      }
+      await client.query('COMMIT');
+      return { applied: [], alreadyApplied: [target.name], checksum: target.checksum };
+    }
+
+    await client.query(target.sql);
+    await client.query('INSERT INTO public.synterra_schema_migrations(version,checksum) VALUES($1,$2)',
+      [target.name, target.checksum]);
+    await client.query('COMMIT');
+    return { applied: [target.name], alreadyApplied: [], checksum: target.checksum };
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+}

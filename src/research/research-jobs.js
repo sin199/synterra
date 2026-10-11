@@ -6,7 +6,7 @@ export const RESEARCH_CAPABILITY_KEY = 'technical_reverse_engineering_research';
 export const RESEARCH_CAPABILITY_SPEC = Object.freeze({ schemaVersion: 1, kind: 'native_system',
   systemKey: RESEARCH_CAPABILITY_KEY, targetTypes: ['binary', 'source_code', 'javascript', 'evm_contract', 'web'],
   agentInput: { researchQuestion: 'string', artifactId: 'granted_artifact_uuid', targetType: 'known_artifact_type',
-    relation: 'optional_goal_project_business_or_organization', objective: 'string',
+    relation: 'explicit_active_goal_project_business_or_organization_binding', objective: 'string',
     desiredInvestigation: 'string', expectedResult: 'string' } });
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -45,8 +45,8 @@ export function normalizeResearchIntent(value, artifact = null) {
   }
   const validRelationId = relationType === 'goal'
     ? /^[1-9]\d{0,15}$/.test(String(relationId || ''))
-    : relationId === null || UUID_RE.test(String(relationId));
-  if ((relationType === null) !== (relationId === null) || !validRelationId) {
+    : UUID_RE.test(String(relationId || ''));
+  if (!relationType || relationId === null || !validRelationId) {
     throw Object.assign(new Error('REA_RELATION_ID_INVALID'), { statusCode: 400 });
   }
   if (artifact && String(intent.artifactId) !== String(artifact.id)) {
@@ -63,61 +63,72 @@ export function normalizeResearchIntent(value, artifact = null) {
 }
 
 export async function listResearchInputsByWorld(client, { worldId }) {
-  const [artifacts, contexts] = await Promise.all([
-    client.query(`SELECT artifact_grant.agent_id AS "agentId",artifact.id,artifact.artifact_key AS "artifactKey",
-        artifact.display_name AS "displayName",artifact.target_type AS "targetType",artifact.sha256,
-        artifact.byte_size AS "byteSize",artifact.media_type AS "mediaType"
-      FROM world_research_artifacts artifact
-      JOIN world_research_artifact_grants artifact_grant ON artifact_grant.world_id=artifact.world_id AND artifact_grant.artifact_id=artifact.id
-      WHERE artifact.world_id=$1 AND artifact.active=true
-      ORDER BY artifact.created_at DESC,artifact.id LIMIT 2000`, [worldId]),
-    client.query(`SELECT * FROM (
-      SELECT agent_id AS "agentId",'goal'::text AS "relationType",id::text AS "relationId",
-        COALESCE(NULLIF(description,''),category) AS objective,category AS label,goal_type AS "goalType",priority::text AS priority
-      FROM world_agent_goals WHERE world_id=$1 AND status='active'
-      UNION ALL
-      SELECT member.agent_id,'project'::text,project.id::text,
-        concat_ws(': ',project.title,project.goal,project.description),project.title,NULL::text,NULL::text
-      FROM world_project_members member JOIN world_projects project
-        ON project.world_id=member.world_id AND project.id=member.project_id
-      WHERE member.world_id=$1 AND member.status='active' AND project.status='active'
-      UNION ALL
-      SELECT business.founder_agent_id,'business'::text,business.id::text,
-        concat_ws(': ',business.name,business.purpose),business.name,NULL::text,NULL::text
-      FROM world_businesses business WHERE business.world_id=$1 AND business.status='active'
-      UNION ALL
-      SELECT employment.agent_id,'business'::text,business.id::text,
-        concat_ws(': ',business.name,business.purpose),business.name,NULL::text,NULL::text
-      FROM world_business_employment employment JOIN world_businesses business
-        ON business.world_id=employment.world_id AND business.id=employment.business_id
-      WHERE employment.world_id=$1 AND employment.status='active' AND business.status='active'
-      UNION ALL
-      SELECT member.agent_id,'organization'::text,organization.id::text,
-        concat_ws(': ',organization.name,organization.purpose),organization.name,NULL::text,NULL::text
-      FROM world_organization_members member JOIN world_organizations organization
-        ON organization.world_id=member.world_id AND organization.id=member.organization_id
-      WHERE member.world_id=$1 AND member.status='active' AND organization.status='active'
-    ) AS research_contexts
-      ORDER BY "agentId",CASE "relationType" WHEN 'goal' THEN 0 WHEN 'project' THEN 1 ELSE 2 END,
-        "priority" DESC NULLS LAST,"relationId" LIMIT 4000`, [worldId])
-  ]);
-  const artifactsByAgent = new Map();
-  for (const artifact of artifacts.rows) {
-    const entries = artifactsByAgent.get(artifact.agentId) || [];
-    entries.push(artifact);
-    artifactsByAgent.set(artifact.agentId, entries);
+  const result = await client.query(`WITH active_relation_contexts AS (
+      SELECT relation.world_id,relation.artifact_id,relation.id AS "relationBindingId",goal.agent_id AS "agentId",
+        'goal'::text AS "relationType",goal.id::text AS "relationId",goal.category AS label,
+        COALESCE(NULLIF(goal.description,''),goal.category) AS objective,
+        relation.provenance,relation.relevance_description AS "relevanceDescription",goal.priority::text AS priority
+      FROM world_research_artifact_relations relation
+      JOIN world_agent_goals goal ON goal.world_id=relation.world_id AND goal.id=relation.goal_id
+      WHERE relation.world_id=$1 AND relation.active=true AND goal.status='active'
+      UNION
+      SELECT relation.world_id,relation.artifact_id,relation.id,member.agent_id,
+        'project'::text,project.id::text,project.title,
+        concat_ws(': ',project.title,project.goal,project.description),
+        relation.provenance,relation.relevance_description,NULL::text
+      FROM world_research_artifact_relations relation
+      JOIN world_projects project ON project.world_id=relation.world_id AND project.id=relation.project_id
+      JOIN world_project_members member ON member.world_id=project.world_id AND member.project_id=project.id
+      WHERE relation.world_id=$1 AND relation.active=true AND project.status='active' AND member.status='active'
+      UNION
+      SELECT relation.world_id,relation.artifact_id,relation.id,business_agents.agent_id,
+        'business'::text,business.id::text,business.name,concat_ws(': ',business.name,business.purpose),
+        relation.provenance,relation.relevance_description,NULL::text
+      FROM world_research_artifact_relations relation
+      JOIN world_businesses business ON business.world_id=relation.world_id AND business.id=relation.business_id
+      CROSS JOIN LATERAL (
+        SELECT business.founder_agent_id AS agent_id
+        UNION
+        SELECT employment.agent_id FROM world_business_employment employment
+        WHERE employment.world_id=business.world_id AND employment.business_id=business.id AND employment.status='active'
+      ) AS business_agents
+      WHERE relation.world_id=$1 AND relation.active=true AND business.status='active'
+      UNION
+      SELECT relation.world_id,relation.artifact_id,relation.id,member.agent_id,
+        'organization'::text,organization.id::text,organization.name,
+        concat_ws(': ',organization.name,organization.purpose),
+        relation.provenance,relation.relevance_description,NULL::text
+      FROM world_research_artifact_relations relation
+      JOIN world_organizations organization ON organization.world_id=relation.world_id AND organization.id=relation.organization_id
+      JOIN world_organization_members member ON member.world_id=organization.world_id AND member.organization_id=organization.id
+      WHERE relation.world_id=$1 AND relation.active=true AND organization.status='active' AND member.status='active'
+    )
+    SELECT context."agentId",artifact.id,artifact.artifact_key AS "artifactKey",
+      artifact.display_name AS "displayName",artifact.target_type AS "targetType",artifact.sha256,
+      artifact.byte_size AS "byteSize",artifact.media_type AS "mediaType",
+      context."relationBindingId",context."relationType",context."relationId",context.label,context.objective,
+      context.provenance,context."relevanceDescription"
+    FROM active_relation_contexts context
+    JOIN world_research_artifacts artifact ON artifact.world_id=context.world_id AND artifact.id=context.artifact_id
+    JOIN world_research_artifact_grants artifact_grant ON artifact_grant.world_id=artifact.world_id
+      AND artifact_grant.artifact_id=artifact.id AND artifact_grant.agent_id=context."agentId"
+    WHERE artifact.world_id=$1 AND artifact.active=true
+    ORDER BY context."agentId",artifact.created_at DESC,artifact.id,
+      CASE context."relationType" WHEN 'goal' THEN 0 WHEN 'project' THEN 1 WHEN 'business' THEN 2 ELSE 3 END,
+      context.priority DESC NULLS LAST,context."relationId" LIMIT 8000`, [worldId]);
+  const researchOpportunitiesByAgent = new Map();
+  for (const opportunity of result.rows) {
+    const entries = researchOpportunitiesByAgent.get(opportunity.agentId) || [];
+    entries.push(opportunity);
+    researchOpportunitiesByAgent.set(opportunity.agentId, entries);
   }
-  const contextsByAgent = new Map();
-  for (const context of contexts.rows) {
-    const entries = contextsByAgent.get(context.agentId) || [];
-    entries.push(context);
-    contextsByAgent.set(context.agentId, entries);
-  }
-  return { artifactsByAgent, contextsByAgent };
+  return { researchOpportunitiesByAgent };
 }
 
-async function validateResearchRelation(client, { worldId, agentId, relationType, relationId }) {
-  if (!relationType) return;
+async function validateResearchRelation(client, { worldId, agentId, artifactId, relationType, relationId }) {
+  if (!relationType || relationId === null) {
+    throw Object.assign(new Error('REA_RESEARCH_RELATION_REQUIRED'), { statusCode: 400 });
+  }
   const queries = {
     goal: `SELECT 1 FROM world_agent_goals WHERE world_id=$1 AND agent_id=$2 AND id=$3 AND status='active'`,
     project: `SELECT 1 FROM world_project_members member JOIN world_projects project
@@ -135,6 +146,11 @@ async function validateResearchRelation(client, { worldId, agentId, relationType
   };
   const result = await client.query(queries[relationType], [worldId, agentId, relationId]);
   if (!result.rowCount) throw Object.assign(new Error('REA_RESEARCH_RELATION_NOT_ACTIVE'), { statusCode: 409 });
+  const relationColumns = { goal: 'goal_id', project: 'project_id', business: 'business_id', organization: 'organization_id' };
+  const binding = await client.query(`SELECT 1 FROM world_research_artifact_relations
+    WHERE world_id=$1 AND artifact_id=$2 AND ${relationColumns[relationType]}=$3 AND active=true`,
+  [worldId, artifactId, relationId]);
+  if (!binding.rowCount) throw Object.assign(new Error('REA_ARTIFACT_RELATION_NOT_ACTIVE'), { statusCode: 409 });
 }
 
 export async function enqueueResearchCapabilityUse(client, { worldId, agentId, capabilityId, actionId: rawActionId,
@@ -159,7 +175,8 @@ export async function enqueueResearchCapabilityUse(client, { worldId, agentId, c
   if (!artifactResult.rowCount) throw Object.assign(new Error('REA_ARTIFACT_NOT_AVAILABLE_TO_AGENT'), { statusCode: 403 });
   const artifact = artifactResult.rows[0];
   const intent = normalizeResearchIntent(researchIntent, artifact);
-  await validateResearchRelation(client, { worldId, agentId, relationType: intent.relationType, relationId: intent.relationId });
+  await validateResearchRelation(client, { worldId, agentId, artifactId: intent.artifactId,
+    relationType: intent.relationType, relationId: intent.relationId });
   const existing = await client.query(`SELECT usage.id AS "useId",usage.capability_id AS "capabilityId",
       usage.status,job.id AS "jobId",job.status AS "jobStatus",job.research_question AS "researchQuestion",
       job.objective,job.target_artifact_id AS "artifactId",job.target_type AS "targetType",

@@ -9,7 +9,7 @@ import { Pool } from 'pg';
 import { applyWorldSchemaAndMigrations } from '../src/database-migrations.js';
 import { prepareStartupSchema } from '../src/startup-schema.js';
 import { startWorldEngine } from '../src/world-engine.js';
-import { seedWorldCapabilityRegistry } from '../src/world-capabilities.js';
+import { buildCapabilityUseCandidates, seedWorldCapabilityRegistry } from '../src/world-capabilities.js';
 import { importResearchArtifact } from '../src/research/artifacts.js';
 import { listResearchInputsByWorld } from '../src/research/research-jobs.js';
 import { writeFakeReaMcpServer } from './helpers/fake-rea-mcp.js';
@@ -41,17 +41,22 @@ async function inTransaction(pool, operation) {
   }
 }
 
-function researchIntent(artifactId, label = 'success') {
+function researchIntent(artifactId, relationId, label = 'success') {
   return { artifactId, targetType: 'javascript',
     researchQuestion: `What evidence does the ${label} artifact provide?`,
     objective: `Investigate the isolated ${label} artifact before using it.`,
     desiredInvestigation: `Use REA static JavaScript analysis to inspect the ${label} artifact.`,
-    expectedResult: `Return bounded evidence and open questions about the ${label} artifact.` };
+    expectedResult: `Return bounded evidence and open questions about the ${label} artifact.`,
+    relationType: 'goal', relationId: String(relationId) };
 }
 
 async function queue(pool, worldId, agentId, capabilityId, artifactId, actionId, label = 'success') {
+  const relation = (await pool.query(`SELECT goal_id::text AS id FROM world_research_artifact_relations
+    WHERE world_id=$1 AND artifact_id=$2 AND goal_id IS NOT NULL AND active=true`, [worldId, artifactId])).rows[0];
+  if (!relation) throw new Error(`Test artifact lacks an active goal binding: ${artifactId}`);
   return inTransaction(pool, (client) => enqueueResearchCapabilityUse(client, { worldId, agentId, capabilityId,
-    actionId, decisionSource: 'agent_api', worldMinute: 480, researchIntent: researchIntent(artifactId, label) }));
+    actionId, decisionSource: 'agent_api', worldMinute: 480,
+    researchIntent: researchIntent(artifactId, relation.id, label) }));
 }
 
 async function waitForJob(pool, jobId, terminal, timeoutMs = 15_000) {
@@ -66,9 +71,14 @@ async function waitForJob(pool, jobId, terminal, timeoutMs = 15_000) {
 }
 
 async function importArtifact(pool, root, { worldId, agentId, key, contents }) {
-  return importResearchArtifact(pool, { worldId, grantAgentIds: [agentId], artifactKey: key,
+  const goal = (await pool.query(`SELECT id::text AS id FROM world_agent_goals
+    WHERE world_id=$1 AND agent_id=$2 AND status='active' ORDER BY priority DESC,id LIMIT 1`, [worldId, agentId])).rows[0];
+  if (!goal) throw new Error(`Test Agent lacks an active goal: ${agentId}`);
+  return inTransaction(pool, (client) => importResearchArtifact(client, { worldId, grantAgentIds: [agentId],
+    relations: [{ type: 'goal', id: goal.id, relevanceDescription: 'Supports this isolated research fixture goal.' }],
+    originReference: 'operator:isolated research fixture', artifactKey: key,
     displayName: `${key}.js`, targetType: 'javascript', mediaType: 'application/javascript',
-    bytes: Buffer.from(contents), artifactDirectory: path.join(root, 'artifacts') });
+    bytes: Buffer.from(contents), artifactDirectory: path.join(root, 'artifacts') }));
 }
 
 test('REA research jobs are durable, isolated from World Engine ticks, attributed, and recover deterministically', {
@@ -103,8 +113,11 @@ test('REA research jobs are durable, isolated from World Engine ticks, attribute
     assert.equal(engine.running, true);
     assert.equal(engine.worldLockOwned, true);
     await pool.query('DELETE FROM world_agent_goals WHERE world_id=$1', [worldId]);
+    const mainGoal = (await pool.query(`INSERT INTO world_agent_goals(world_id,agent_id,goal_type,category,description,source)
+      VALUES($1,$2,'primary','LEARN_RESEARCH','Understand the isolated research fixtures.','seed') RETURNING id`,
+    [worldId,agentId])).rows[0];
     const emptyInputs = await listResearchInputsByWorld(pool, { worldId });
-    assert.equal(emptyInputs.contextsByAgent.size, 0, 'resident-context UNION query executes on isolated PostgreSQL');
+    assert.equal(emptyInputs.researchOpportunitiesByAgent.size, 0, 'active goals alone are not artifact research opportunities');
     const capabilityRows = await pool.query(`SELECT id,specification FROM world_capabilities
       WHERE world_id=$1 AND capability_key=$2`, [worldId, RESEARCH_CAPABILITY_KEY]);
     assert.equal(capabilityRows.rowCount, 1, 'the system registry exposes the REA native capability');
@@ -114,6 +127,9 @@ test('REA research jobs are durable, isolated from World Engine ticks, attribute
       VALUES($1,$2,$3,5042,true)`, [foreignWorldId, agentId, `REA foreign ${foreignWorldId.slice(0, 8)}`]);
     await pool.query(`INSERT INTO world_members(world_id,agent_id,role,location,energy,food,social)
       VALUES($1,$2,'owner','Garden',100,100,100)`, [foreignWorldId, agentId]);
+    const foreignGoal = (await pool.query(`INSERT INTO world_agent_goals(world_id,agent_id,goal_type,category,description,source)
+      VALUES($1,$2,'primary','LEARN_RESEARCH','Understand the foreign research fixture.','seed') RETURNING id`,
+    [foreignWorldId,agentId])).rows[0];
     const foreignCapabilities = await seedWorldCapabilityRegistry(pool, foreignWorldId);
     const foreignArtifact = await importArtifact(pool, root, { worldId: foreignWorldId, agentId,
       key: 'source-foreign-v1', contents: 'export const foreign = true;\n' });
@@ -151,7 +167,7 @@ test('REA research jobs are durable, isolated from World Engine ticks, attribute
       assert.equal(repeated.jobId, first.jobId);
       await assert.rejects(inTransaction(pool, (client) => enqueueResearchCapabilityUse(client, { worldId, agentId,
         capabilityId, actionId: 'rea-idempotency-action-0001', worldMinute: 480,
-        researchIntent: researchIntent(successArtifact.id, 'changed') })), (error) => error.statusCode === 409);
+        researchIntent: researchIntent(successArtifact.id, mainGoal.id, 'changed') })), (error) => error.statusCode === 409);
       assert.equal(Number((await pool.query(`SELECT count(*)::int AS count FROM world_capability_uses
         WHERE world_id=$1 AND action_id='rea-idempotency-action-0001'`, [worldId])).rows[0].count), 1);
       assert.equal(Number((await pool.query(`SELECT count(*)::int AS count FROM world_research_jobs
@@ -170,11 +186,11 @@ test('REA research jobs are durable, isolated from World Engine ticks, attribute
         await clientA.query('BEGIN');
         first = await enqueueResearchCapabilityUse(clientA, { worldId, agentId, capabilityId,
           actionId: 'rea-concurrent-action-0001', worldMinute: 480,
-          researchIntent: researchIntent(successArtifact.id, 'concurrent') });
+          researchIntent: researchIntent(successArtifact.id, mainGoal.id, 'concurrent') });
         await clientB.query('BEGIN');
         secondPromise = enqueueResearchCapabilityUse(clientB, { worldId, agentId, capabilityId,
           actionId: 'rea-concurrent-action-0001', worldMinute: 480,
-          researchIntent: researchIntent(successArtifact.id, 'concurrent') });
+          researchIntent: researchIntent(successArtifact.id, mainGoal.id, 'concurrent') });
         await sleep(75);
         await clientA.query('COMMIT');
         const second = await secondPromise;
@@ -238,8 +254,16 @@ test('REA research jobs are durable, isolated from World Engine ticks, attribute
       assert.ok(Number(row.completed_world_minute) >= Number(row.started_world_minute));
     });
 
-    const successRequest = await queue(pool, worldId, agentId, capabilityId, successArtifact.id,
-      'rea-success-action-0001', 'success');
+    const researchInputs = await listResearchInputsByWorld(pool, { worldId });
+    const selectedCandidate = (await buildCapabilityUseCandidates({ agentId, location: 'Garden',
+      goals: [{ id: String(mainGoal.id), goalType: 'primary', status: 'active' }],
+      primaryGoal: 'Understand the isolated research fixtures.', curiosity: 0.5, skills: { research: 2 },
+      recentMemories: [] }, capabilityRows.rows, { researchInputs, worldMinutes: 480 }))
+      .find((candidate) => candidate.capabilityContext.researchIntent.artifactId === successArtifact.id);
+    assert.ok(selectedCandidate, 'the normal candidate builder exposes the explicitly related artifact');
+    const successRequest = await inTransaction(pool, (client) => enqueueResearchCapabilityUse(client, { worldId, agentId,
+      capabilityId, actionId: 'rea-success-action-0001', decisionSource: 'fruitfly', worldMinute: 480,
+      researchIntent: selectedCandidate.capabilityContext.researchIntent }));
     const errorRequest = await queue(pool, worldId, agentId, capabilityId, errorArtifact.id,
       'rea-error-action-0001', 'provider error');
     const timeoutRequest = await queue(pool, worldId, agentId, capabilityId, timeoutArtifact.id,

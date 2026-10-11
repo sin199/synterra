@@ -36,10 +36,10 @@ Numbered additive migrations are applied explicitly after a verified backup:
 npm run db:migrate -- --plan
 SYNTERRA_MIGRATION_DATABASE_URL='postgres://...' \
 SYNTERRA_MIGRATION_ACK=I_CONFIRMED_TARGET_BACKUP_AND_WORLD_ID \
-npm run db:migrate -- --apply
+npm run db:migrate -- --migration 0006_research_artifact_relations.sql
 ```
 
-The migration command never falls back to `DATABASE_URL`. The sample command shows the interface only; use the operator-selected target and do not place a real credential in shell history. A restored database must keep the existing world ID and all world, resident, economy, V6, V7, and Arc rows.
+The selected-migration mode never executes `schema.sql` and applies only the named migration after verifying the migration ledger and all earlier checksums. The migration command never falls back to `DATABASE_URL`. The sample command shows the interface only; use the operator-selected target and do not place a real credential in shell history. A restored database must keep the existing world ID and all world, resident, economy, V6, V7, and Arc rows. `--apply` remains the bootstrap/all-pending mode for development and test databases.
 
 ## Backups and restore
 

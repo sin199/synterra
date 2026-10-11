@@ -1,13 +1,17 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Pool } from 'pg';
-import { applyWorldSchemaAndMigrations, readWorldMigrationPlan } from '../../src/database-migrations.js';
+import { applySingleWorldMigration, applyWorldSchemaAndMigrations, readWorldMigrationPlan } from '../../src/database-migrations.js';
 
 const rootDirectory = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
-const mode = process.argv[2] || '--plan';
+const args = process.argv.slice(2);
+const mode = args[0] || '--plan';
+const migrationName = mode === '--migration' ? args[1] : null;
 
-if (!['--plan', '--apply'].includes(mode)) {
-  throw new TypeError('Use --plan or --apply.');
+if (!['--plan', '--apply', '--migration'].includes(mode)
+    || (mode === '--migration' && (!migrationName || args.length !== 2))
+    || (mode !== '--migration' && args.length > 1)) {
+  throw new TypeError('Use --plan, --apply, or --migration <numbered-file>.');
 }
 
 const plan = await readWorldMigrationPlan(rootDirectory);
@@ -27,8 +31,13 @@ if (mode === '--plan') {
   }
   const pool = new Pool({ connectionString, max: 1, connectionTimeoutMillis: 5_000 });
   try {
-    const result = await applyWorldSchemaAndMigrations(pool, { rootDirectory });
-    console.log(JSON.stringify({ mode: 'applied', ...result }, null, 2));
+    if (mode === '--migration') {
+      const result = await applySingleWorldMigration(pool, { rootDirectory, migrationName });
+      console.log(JSON.stringify({ mode: 'single_migration', ...result }, null, 2));
+    } else {
+      const result = await applyWorldSchemaAndMigrations(pool, { rootDirectory });
+      console.log(JSON.stringify({ mode: 'applied', ...result }, null, 2));
+    }
   } finally {
     await pool.end();
   }

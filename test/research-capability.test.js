@@ -5,32 +5,65 @@ import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { buildCapabilityUseCandidates } from '../src/world-capabilities.js';
+import { createFruitflyRuntime } from '../src/agent-runtime/fruitfly.js';
 import { containsPrivateMaterial, MAX_RESEARCH_ARTIFACT_BYTES } from '../src/research/artifacts.js';
 import { readIntakeArtifact } from '../src/research/artifact-intake.js';
 import { listResearchInputsByWorld, normalizeResearchIntent, RESEARCH_CAPABILITY_KEY, RESEARCH_CAPABILITY_SPEC } from '../src/research/research-jobs.js';
 import { isReaCompatibleNodeVersion } from '../src/research/rea-mcp-client.js';
 
-test('REA is an optional native-system capability and only produces a candidate when a granted artifact and resident context exist', async () => {
+test('REA is optional and only produces candidates from explicit granted-artifact relation opportunities', async () => {
   assert.equal(RESEARCH_CAPABILITY_SPEC.kind, 'native_system');
   assert.equal(RESEARCH_CAPABILITY_SPEC.systemKey, RESEARCH_CAPABILITY_KEY);
+  assert.match(RESEARCH_CAPABILITY_SPEC.agentInput.relation, /explicit_active/);
   const capability = { id: randomUUID(), name: 'Technical reverse-engineering research',
     specification: RESEARCH_CAPABILITY_SPEC };
-  const agent = { agentId: randomUUID(), goals: [{ id: '41', goalType: 'primary', status: 'active' }],
+  const agent = { agentId: 'agent-a', goals: [{ id: '41', goalType: 'primary', status: 'active' }],
     primaryGoal: 'Understand a dependency', curiosity: 0.7, skills: { research: 4 }, recentMemories: [] };
   assert.deepEqual(await buildCapabilityUseCandidates(agent, [capability], { researchInputs: {
-    artifactsByAgent: new Map(), contextsByAgent: new Map() } }), [], 'no grant/context means no research candidate');
+    researchOpportunitiesByAgent: new Map() } }), [], 'a grant without an explicit relation does not make a candidate');
   const artifactId = randomUUID();
+  const unrelatedAgent = randomUUID();
+  const opportunity = { id: artifactId, displayName: 'Dependency source', targetType: 'javascript',
+    relationType: 'goal', relationId: '41', label: 'LEARNING',
+    objective: 'Understand a dependency before using it.', provenance: 'operator_intake' };
+  const unrelated = await buildCapabilityUseCandidates(agent, [capability], { researchInputs: {
+    researchOpportunitiesByAgent: new Map([[unrelatedAgent, [opportunity]]]) } });
+  assert.deepEqual(unrelated, [], 'another Agent goal cannot be paired with this Agent grant');
+  let sideEffects = 0;
+  let cognitionCalls = 0;
   const candidates = await buildCapabilityUseCandidates(agent, [capability], { worldMinutes: 100,
-    researchInputs: { artifactsByAgent: new Map([[agent.agentId, [{ id: artifactId,
-      displayName: 'Dependency source', targetType: 'javascript' }]]]),
-    contextsByAgent: new Map([[agent.agentId, [{ relationType: 'goal', relationId: '41',
-      label: 'LEARNING', objective: 'Understand a dependency before using it.' }]]]) } });
+    researchInputs: { researchOpportunitiesByAgent: new Map([[agent.agentId, [opportunity]]]) },
+    chooseWithTypeSafe: async () => { cognitionCalls += 1; },
+    recordJob: () => { sideEffects += 1; }, recordUsage: () => { sideEffects += 1; } });
   assert.equal(candidates.length, 1);
   assert.equal(candidates[0].action, 'capability_use');
   assert.equal(candidates[0].capabilityContext.researchIntent.artifactId, artifactId);
   assert.equal(candidates[0].capabilityContext.researchIntent.relationType, 'goal');
+  assert.equal(candidates[0].capabilityContext.researchIntent.relationId, '41');
   assert.equal(candidates[0].capabilityContext.researchIntent.expectedResult.length > 0, true);
   assert.equal(candidates[0].researchJobId, undefined, 'candidate construction does not enqueue work');
+  assert.equal(sideEffects, 0, 'candidate construction does not create jobs or meter infrastructure');
+  assert.equal(cognitionCalls, 0, 'candidate construction does not invoke a cognition provider');
+
+  const fruitflyDirectory = await mkdtemp(path.join(os.tmpdir(), 'synterra-rea-fruitfly-'));
+  try {
+    const fruitfly = await createFruitflyRuntime(fruitflyDirectory);
+    const rest = { id: 'ordinary-rest-candidate', action: 'rest', score: 100 };
+    const selection = fruitfly.choose(agent.agentId,
+      { self: { food: 20, energy: 90, social: 80 }, mind: { traits: { curiosity: 0.2 }, goals: [], skills: {} } },
+      [candidates[0], rest], candidates[0]);
+    assert.equal(selection.candidate.id, rest.id, 'Fruitfly can select another feasible action over REA');
+  } finally { await rm(fruitflyDirectory, { recursive: true, force: true }); }
+
+  const secondArtifactId = randomUUID();
+  const secondGoalId = '42';
+  const exactPairs = await buildCapabilityUseCandidates(agent, [capability], { researchInputs: {
+    researchOpportunitiesByAgent: new Map([
+      [agent.agentId, [opportunity, { ...opportunity, id: secondArtifactId, relationId: secondGoalId }]]
+    ]) } });
+  assert.deepEqual(exactPairs.map((item) => [item.capabilityContext.researchIntent.artifactId,
+    item.capabilityContext.researchIntent.relationId]), [[artifactId, '41'], [secondArtifactId, secondGoalId]]);
+  assert.notEqual(exactPairs[0].id, exactPairs[1].id, 'each explicit pair has a distinct candidate identity');
 });
 
 test('research intent accepts only a granted artifact reference and typed active world relation', () => {
@@ -42,19 +75,32 @@ test('research intent accepts only a granted artifact reference and typed active
   { id: artifactId, targetType: 'source_code' });
   assert.equal(normalized.artifactId, artifactId);
   assert.equal(normalized.targetType, 'source_code');
+  assert.equal(normalized.relationType, 'project');
+  assert.throws(() => normalizeResearchIntent({ artifactId, targetType: 'source_code',
+    researchQuestion: 'What security properties does this code show?',
+    objective: 'Review the dependency before integration.', desiredInvestigation: 'Inspect safely.',
+    expectedResult: 'A short bounded summary.' }, { id: artifactId, targetType: 'source_code' }), /REA_RELATION_ID_INVALID/);
   assert.throws(() => normalizeResearchIntent({ artifactId: '/etc/passwd', targetType: 'source_code' }),
     /REA_ARTIFACT_ID_INVALID/);
   assert.throws(() => normalizeResearchIntent({ artifactId, targetType: 'binary', researchQuestion: 'A sufficiently long question?',
-    objective: 'A sufficiently long objective.', desiredInvestigation: 'Inspect safely.', expectedResult: 'Summary.' },
+    objective: 'A sufficiently long objective.', desiredInvestigation: 'Inspect safely.', expectedResult: 'Summary.',
+    relationType: 'goal', relationId: '41' },
   { id: artifactId, targetType: 'source_code' }), /REA_TARGET_TYPE_MISMATCH/);
 });
 
-test('resident research context query orders a wrapped UNION result', async () => {
+test('research-input query joins artifact grant, explicit binding, and active relation membership in one result', async () => {
   const queries = [];
-  await listResearchInputsByWorld({ query: async (sql) => { queries.push(sql); return { rows: [] }; } },
+  const inputs = await listResearchInputsByWorld({ query: async (sql) => { queries.push(sql); return { rows: [] }; } },
     { worldId: randomUUID() });
-  assert.equal(queries.length, 2);
-  assert.match(queries[1], /SELECT \* FROM \([\s\S]*UNION ALL[\s\S]*\) AS research_contexts\s+ORDER BY "agentId",CASE "relationType"/);
+  assert.equal(queries.length, 1);
+  assert.match(queries[0], /WITH active_relation_contexts AS/);
+  assert.match(queries[0], /JOIN world_research_artifact_grants/);
+  assert.match(queries[0], /FROM world_research_artifact_relations/);
+  assert.match(queries[0], /project\.status='active' AND member\.status='active'/);
+  assert.match(queries[0], /business\.founder_agent_id/);
+  assert.match(queries[0], /employment\.status='active'/);
+  assert.match(queries[0], /organization\.status='active' AND member\.status='active'/);
+  assert.equal(inputs.researchOpportunitiesByAgent.size, 0);
 });
 
 test('known private material is scanned through the entire artifact, not only its prefix', () => {

@@ -40,7 +40,7 @@ export async function prepareStartupSchema(pool, { rootDirectory, mode = 'apply'
   const migrations = await readWorldMigrationPlan(rootDirectory);
   const requiredMigrations = ['0001_arc_mainnet.sql', '0002_world_environment.sql',
     '0002_arc_agent_token_issuance.sql', '0003_arc_agent_token_issuance_runtime_privileges.sql',
-    '0004_genesis_token_economy.sql', '0005_rea_research_jobs.sql'];
+    '0004_genesis_token_economy.sql', '0005_rea_research_jobs.sql', '0006_research_artifact_relations.sql'];
   for (const name of requiredMigrations) {
     if (!migrations.some((migration) => migration.name === name)) throw incompatible(`missing migration source ${name}`);
   }
@@ -124,6 +124,7 @@ export async function prepareStartupSchema(pool, { rootDirectory, mode = 'apply'
     const researchTableGrants = [
       ['world_research_artifacts', ['SELECT','INSERT']],
       ['world_research_artifact_grants', ['SELECT','INSERT']],
+      ['world_research_artifact_relations', ['SELECT','INSERT']],
       ['world_research_jobs', ['SELECT','INSERT']],
       ['world_research_runtime_status', ['SELECT','INSERT','UPDATE']],
       ['world_capability_uses', ['SELECT','INSERT']],

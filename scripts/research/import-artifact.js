@@ -5,24 +5,46 @@ import { importResearchArtifact } from '../../src/research/artifacts.js';
 import { readIntakeArtifact } from '../../src/research/artifact-intake.js';
 
 const args = process.argv.slice(2);
-const usage = 'Use --world UUID --file RELATIVE_PATH --target TYPE --key KEY --name NAME --media-type TYPE --grant-agent UUID [--grant-agent UUID ...].';
+const usage = 'Use --world UUID --file RELATIVE_PATH --target TYPE --key KEY --name NAME --media-type TYPE --origin-reference HTTPS_URL_OR_OPERATOR_LABEL --grant-agent UUID [--grant-agent UUID ...] [--relation goal:ID|project:UUID|business:UUID|organization:UUID ...] [--relation-relevance TYPE:ID=TEXT].';
 
 function parseArguments(values) {
-  const output = { grantAgentIds: [] };
-  const single = new Set(['--world','--file','--target','--key','--name','--media-type']);
+  const output = { grantAgentIds: [], relationValues: [], relationRelevanceValues: [] };
+  const single = new Set(['--world','--file','--target','--key','--name','--media-type','--origin-reference']);
   for (let index = 0; index < values.length; index += 1) {
     const flag = values[index];
-    if (!single.has(flag) && flag !== '--grant-agent') throw new Error('REA_ARTIFACT_ARGUMENT_INVALID');
+    if (!single.has(flag) && !['--grant-agent','--relation','--relation-relevance'].includes(flag)) {
+      throw new Error('REA_ARTIFACT_ARGUMENT_INVALID');
+    }
     const value = values[++index];
     if (!value || value.startsWith('--')) throw new Error('REA_ARTIFACT_ARGUMENT_MISSING');
     if (flag === '--grant-agent') output.grantAgentIds.push(value);
+    else if (flag === '--relation') output.relationValues.push(value);
+    else if (flag === '--relation-relevance') output.relationRelevanceValues.push(value);
     else {
       if (output[flag]) throw new Error('REA_ARTIFACT_ARGUMENT_DUPLICATE');
       output[flag] = value;
     }
   }
-  const keys = ['--world','--file','--target','--key','--name','--media-type'];
+  const keys = ['--world','--file','--target','--key','--name','--media-type','--origin-reference'];
   if (keys.some((key) => !output[key]) || !output.grantAgentIds.length) throw new Error('REA_ARTIFACT_ARGUMENT_MISSING');
+  const relation = (value) => {
+    const separator = value.indexOf(':');
+    if (separator < 1 || separator === value.length - 1) throw new Error('REA_ARTIFACT_RELATION_ID_INVALID');
+    return { type: value.slice(0, separator), id: value.slice(separator + 1) };
+  };
+  const relations = new Map(output.relationValues.map((value) => {
+    const parsed = relation(value);
+    return [`${parsed.type}:${parsed.id}`, parsed];
+  }));
+  for (const value of output.relationRelevanceValues) {
+    const equals = value.indexOf('=');
+    if (equals < 1 || equals === value.length - 1) throw new Error('REA_ARTIFACT_RELATION_DESCRIPTION_INVALID');
+    const parsed = relation(value.slice(0, equals));
+    const key = `${parsed.type}:${parsed.id}`;
+    if (!relations.has(key)) throw new Error('REA_ARTIFACT_RELATION_DESCRIPTION_WITHOUT_RELATION');
+    relations.get(key).relevanceDescription = value.slice(equals + 1);
+  }
+  output.relations = [...relations.values()];
   return output;
 }
 
@@ -46,10 +68,13 @@ try {
     await client.query('BEGIN');
     const artifact = await importResearchArtifact(client, { worldId, grantAgentIds: options.grantAgentIds,
       artifactKey: options['--key'], displayName: options['--name'], targetType: options['--target'],
-      mediaType: options['--media-type'], bytes: source.bytes, artifactDirectory });
+      mediaType: options['--media-type'], originReference: options['--origin-reference'],
+      relations: options.relations, bytes: source.bytes, artifactDirectory });
     await client.query('COMMIT');
     console.log(JSON.stringify({ artifactId: artifact.id, artifactKey: artifact.artifactKey,
-      targetType: artifact.targetType, byteSize: artifact.byteSize, sha256: artifact.sha256 }));
+      targetType: artifact.targetType, byteSize: artifact.byteSize, sha256: artifact.sha256,
+      intakeMethod: artifact.intakeMethod, originReference: artifact.originReference,
+      relationCount: artifact.relationCount }));
   } catch (error) {
     await client.query('ROLLBACK');
     throw error;

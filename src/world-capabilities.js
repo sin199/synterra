@@ -1258,41 +1258,37 @@ export async function advanceWorldCivilization(client, { worldId, agent, worldMi
 }
 
 function buildResearchCapabilityCandidates(agent, row, context = {}) {
-  const researchInputs = context.researchInputs;
-  const artifacts = researchInputs?.artifactsByAgent?.get(agent.agentId) || [];
-  const relations = researchInputs?.contextsByAgent?.get(agent.agentId) || [];
-  if (!artifacts.length || !relations.length) return [];
-  const primaryGoalId = String(agent.goals?.find((goal) => goal.goalType === 'primary' && goal.status === 'active')?.id || '');
-  const relation = relations.find((item) => item.relationType === 'goal' && String(item.relationId) === primaryGoalId)
-    || relations.find((item) => /research|learn|study|investigate|analy[sz]|build|engineer/i.test(`${item.label} ${item.objective}`))
-    || relations[0];
-  if (!relation?.objective) return [];
+  const opportunities = context.researchInputs?.researchOpportunitiesByAgent?.get(agent.agentId) || [];
+  if (!opportunities.length) return [];
   const curious = clamp(agent.curiosity ?? agent.traits?.curiosity, 0, 1);
   const researchSkill = Math.max(0, Number(agent.skills?.research) || 0);
-  const goalAligned = /research|learn|study|investigate|analy[sz]|build|engineer/i.test(
-    `${relation.label} ${relation.objective} ${agent.primaryGoal || ''} ${agent.currentGoal || ''}`);
   const priorUses = (agent.recentMemories || []).filter((memory) => memory.memoryType === 'capability_use'
     && String(memory.metadata?.capabilityId) === String(row.id));
-  const naturalScore = 20 + curious * 10 + researchSkill * 0.08 + (goalAligned ? 12 : 0)
-    + (priorUses[0]?.metadata?.success === true ? 4 : priorUses[0]?.metadata?.success === false ? -8 : 0);
-  const discoveryInterest = clamp(curious * 0.55 + (goalAligned ? 0.3 : 0) + researchSkill / 700, 0, 1);
-  const discoverableScore = Number(context.maxAlternativeScore) > 0
-    ? Number(context.maxAlternativeScore) * (0.55 + discoveryInterest * 0.2) : 0;
-  return artifacts.slice(0, 2).map((artifact) => {
-    const objective = `${relation.label}: ${relation.objective}`.slice(0, 1_600);
+  return opportunities.filter((item) => item?.objective && item?.label && item?.relationType && item?.relationId)
+    .map((opportunity) => {
+    const goalAligned = /research|learn|study|investigate|analy[sz]|build|engineer/i.test(
+      `${opportunity.label} ${opportunity.objective} ${agent.primaryGoal || ''} ${agent.currentGoal || ''}`);
+    const naturalScore = 20 + curious * 10 + researchSkill * 0.08 + (goalAligned ? 12 : 0)
+      + (priorUses[0]?.metadata?.success === true ? 4 : priorUses[0]?.metadata?.success === false ? -8 : 0);
+    const discoveryInterest = clamp(curious * 0.55 + (goalAligned ? 0.3 : 0) + researchSkill / 700, 0, 1);
+    const discoverableScore = Number(context.maxAlternativeScore) > 0
+      ? Number(context.maxAlternativeScore) * (0.55 + discoveryInterest * 0.2) : 0;
+    const artifact = opportunity;
+    const objective = `${opportunity.label}: ${opportunity.relevanceDescription || opportunity.objective}`.slice(0, 1_600);
     const researchIntent = {
       artifactId: String(artifact.id), targetType: artifact.targetType,
-      researchQuestion: `What evidence does ${artifact.displayName} provide about ${relation.label}?`.slice(0, 1_200),
+      researchQuestion: `What evidence does ${artifact.displayName} provide about ${opportunity.label}?`.slice(0, 1_200),
       objective,
-      desiredInvestigation: `Use REA's supported ${artifact.targetType} analysis to examine the artifact for evidence relevant to this existing ${relation.relationType}.`,
-      expectedResult: `A bounded, evidence-backed summary of findings and unresolved questions relevant to ${relation.label}.`,
-      relationType: relation.relationType, relationId: String(relation.relationId)
+      desiredInvestigation: `Use REA's supported ${artifact.targetType} analysis to examine the artifact for evidence relevant to this existing ${opportunity.relationType}.`,
+      expectedResult: `A bounded, evidence-backed summary of findings and unresolved questions relevant to ${opportunity.label}.`,
+      relationType: opportunity.relationType, relationId: String(opportunity.relationId)
     };
-    return { id: `research:${row.id}:${artifact.id}`, action: 'capability_use', targetLocation: agent.location,
-      goal: `Optional REA research for ${relation.label}: ${artifact.displayName}`,
+    return { id: `research:${row.id}:${artifact.id}:${opportunity.relationType}:${opportunity.relationId}`,
+      action: 'capability_use', targetLocation: agent.location,
+      goal: `Optional REA research for ${opportunity.label}: ${artifact.displayName}`,
       score: Math.max(naturalScore, discoverableScore), capabilityId: row.id,
       capabilityName: row.name, capabilityExperimentId: null,
-      description: `Optional evidence-based investigation of an available ${artifact.targetType} artifact in service of the resident's existing ${relation.relationType}.`,
+      description: `Optional evidence-based investigation of an available ${artifact.targetType} artifact in service of the resident's existing ${opportunity.relationType}.`,
       capabilityContext: { capabilityId: row.id, experimentId: null,
         worldMinutes: Number(context.worldMinutes) || 0, researchIntent } };
   });
