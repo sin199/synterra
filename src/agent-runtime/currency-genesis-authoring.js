@@ -1,7 +1,25 @@
 const OLLAMA_CHAT_URL = 'http://127.0.0.1:11434/api/chat';
 const MODEL = 'qwen2.5:7b';
+const DEFAULT_TIMEOUT_MS = 60_000;
 const MAX_CONTEXT_BYTES = 20_000;
 const MAX_RESPONSE_BYTES = 48_000;
+
+function requestFailureReason(error, fallback) {
+  const name = String(error?.name || '').toLowerCase();
+  const code = String(error?.code || error?.cause?.code || '').toUpperCase();
+  if (name.includes('timeout') || name === 'aborterror'
+      || ['ETIMEDOUT', 'ESOCKETTIMEDOUT', 'ABORT_ERR'].includes(code)) {
+    return 'local_authoring_timeout';
+  }
+  if (['ECONNREFUSED', 'ECONNRESET', 'ENETUNREACH', 'ENOTFOUND', 'EAI_AGAIN'].includes(code)) {
+    return 'local_authoring_unavailable';
+  }
+  return fallback;
+}
+
+function authoringFailure(reason) {
+  return { specification: null, reason, model: MODEL };
+}
 
 function boundedText(value, max = 500) {
   return typeof value === 'string' ? value.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, '').slice(0, max) : '';
@@ -95,8 +113,8 @@ function residentContext(input) {
 }
 
 export async function authorAgentCurrencyProposal(input, { fetchImpl = globalThis.fetch,
-  timeoutMs = 8_000 } = {}) {
-  if (typeof fetchImpl !== 'function') return { specification: null, reason: 'local_authoring_unavailable' };
+  timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
+  if (typeof fetchImpl !== 'function') return authoringFailure('local_authoring_unavailable');
   const context = residentContext(input);
   if (!context?.resident.id) return { specification: null, reason: 'resident_context_missing' };
   const contextJson = JSON.stringify(context);
@@ -121,29 +139,31 @@ export async function authorAgentCurrencyProposal(input, { fetchImpl = globalThi
         options: { temperature: 0.4 }
       })
     });
-  } catch { return { specification: null, reason: 'local_authoring_unavailable' }; }
-  if (!response?.ok) return { specification: null, reason: `local_authoring_http_${response?.status || 'error'}` };
+  } catch (error) { return authoringFailure(requestFailureReason(error, 'local_authoring_provider_error')); }
+  if (!response?.ok) return authoringFailure(`local_authoring_http_${response?.status || 'error'}`);
   let raw;
-  try { raw = await response.text(); } catch { return { specification: null, reason: 'local_authoring_unavailable' }; }
+  try { raw = await response.text(); }
+  catch (error) { return authoringFailure(requestFailureReason(error, 'local_authoring_response_read_error')); }
   if (Buffer.byteLength(raw, 'utf8') > MAX_RESPONSE_BYTES) {
-    return { specification: null, reason: 'local_authoring_response_too_large' };
+    return authoringFailure('local_authoring_response_too_large');
   }
   let envelope;
-  try { envelope = JSON.parse(raw); } catch { return { specification: null, reason: 'local_authoring_response_invalid' }; }
+  try { envelope = JSON.parse(raw); } catch { return authoringFailure('local_authoring_response_invalid'); }
   const content = envelope?.message?.content;
   if (typeof content !== 'string' || Buffer.byteLength(content, 'utf8') > MAX_RESPONSE_BYTES) {
-    return { specification: null, reason: 'local_authoring_content_invalid' };
+    return authoringFailure('local_authoring_content_invalid');
   }
   try {
     const specification = JSON.parse(content);
     if (!specification || typeof specification !== 'object' || Array.isArray(specification)) {
-      return { specification: null, reason: 'local_authoring_specification_invalid' };
+      return authoringFailure('local_authoring_specification_invalid');
     }
     return { specification, reason: null, model: MODEL };
   } catch {
-    return { specification: null, reason: 'local_authoring_specification_invalid' };
+    return authoringFailure('local_authoring_specification_invalid');
   }
 }
 
 export const currencyGenesisAuthoringConfig = Object.freeze({ provider: 'ollama_loopback', model: MODEL,
-  endpoint: OLLAMA_CHAT_URL, maxContextBytes: MAX_CONTEXT_BYTES, maxResponseBytes: MAX_RESPONSE_BYTES });
+  endpoint: OLLAMA_CHAT_URL, timeoutMs: DEFAULT_TIMEOUT_MS,
+  maxContextBytes: MAX_CONTEXT_BYTES, maxResponseBytes: MAX_RESPONSE_BYTES });

@@ -192,6 +192,7 @@ test('Arc Mainnet Agent action reaches persistent outbox, policy evaluation, and
     let allowProposal = false;
     let allowIssuerDecision = false;
     let completeContinueDesign = false;
+    let authoringFailureOverride = null;
     let responseRecorded = false;
     const authoringContextsObserved = [];
     let reviewOutcomeOverride = null;
@@ -250,6 +251,9 @@ test('Arc Mainnet Agent action reaches persistent outbox, policy evaluation, and
         const proposer = input.availableRecipients.find((recipient) => recipient.id === payerId);
         const peer = input.availableRecipients.find((recipient) => recipient.id === recipientId);
         assert.ok(proposer && peer, 'the resident receives real recipient options from the isolated world');
+        if (authoringFailureOverride && input.resident.agentId === payerId) {
+          return { specification: null, reason: authoringFailureOverride, model: 'qwen2.5:7b' };
+        }
         if ((allowProposal || completeContinueDesign) && input.resident.agentId === payerId) {
           assert.equal(input.resident.currentGoal, 'coordinate a research exchange with peers');
           assert.ok(input.resident.recentMemories.some((memory) =>
@@ -350,6 +354,35 @@ test('Arc Mainnet Agent action reaches persistent outbox, policy evaluation, and
     await runReviewFailure({ type: 'return', value: { choice: { id: 'not-an-offered-option' }, confidence: 0.99,
       model: 'isolated-resident-cognition', provider: 'isolated-resident-cognition' } }, 'invalid_choice');
     await runReviewFailure({ type: 'return', value: null }, 'no_valid_decision');
+
+    reviewOutcomeOverride = null;
+    const payerDraftCountBeforeAuthoringFailures = Number((await pool.query(`SELECT count(*)::int AS count
+      FROM world_v7_events WHERE world_id=$1 AND actor_agent_id=$2
+        AND event_type='currency_genesis.design_draft'`, [worldId, payerId])).rows[0].count);
+    for (const [reason, expectedOutcome] of [
+      ['local_authoring_unavailable', 'provider_unavailable'],
+      ['local_authoring_timeout', 'provider_timeout'],
+      ['local_authoring_http_503', 'provider_unavailable'],
+      ['local_authoring_specification_invalid', 'malformed_output']
+    ]) {
+      authoringFailureOverride = reason;
+      await runCurrencyReview();
+      authoringFailureOverride = null;
+      const latest = await pool.query(`SELECT details FROM world_v7_events WHERE world_id=$1 AND actor_agent_id=$2
+        AND event_type='currency_genesis.authoring_outcome'
+        ORDER BY world_minute DESC,created_at DESC LIMIT 1`, [worldId, payerId]);
+      assert.equal(latest.rows[0].details.outcome, expectedOutcome);
+      assert.equal(latest.rows[0].details.reasonCode, reason);
+      assert.equal(latest.rows[0].details.model, 'qwen2.5:7b');
+      const payerDraftCount = Number((await pool.query(`SELECT count(*)::int AS count
+        FROM world_v7_events WHERE world_id=$1 AND actor_agent_id=$2
+          AND event_type='currency_genesis.design_draft'`, [worldId, payerId])).rows[0].count);
+      assert.equal(payerDraftCount, payerDraftCountBeforeAuthoringFailures,
+        'provider failure does not create a blank or synthetic Agent design draft');
+      assert.equal(Number((await pool.query(`SELECT count(*)::int AS count FROM arc_token_issuance_intents WHERE world_id=$1`,
+        [worldId])).rows[0].count), 0, 'authoring failures do not create an issuance intent');
+    }
+    authoringFailureOverride = null;
 
     const savedApiKey = process.env.TYPESAFE_API_KEY;
     delete process.env.TYPESAFE_API_KEY;

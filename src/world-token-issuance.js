@@ -4,7 +4,7 @@ import { inspectAgentTokenSpecification, AGENT_TOKEN_PILOT_GENERATION, AGENT_TOK
   AGENT_TOKEN_HUMAN_SUPPLY, AGENT_TOKEN_AUTHORITY_MODELS,
   AGENT_TOKEN_OWNERSHIP_MODELS, AGENT_TOKEN_UNALLOCATED_SUPPLY_HANDLING } from './arc/token-issuance.js';
 import { createWorldExtensionRequest } from './world-v7.js';
-import { authorAgentCurrencyProposal } from './agent-runtime/currency-genesis-authoring.js';
+import { authorAgentCurrencyProposal, currencyGenesisAuthoringConfig } from './agent-runtime/currency-genesis-authoring.js';
 import { currencyGenesisInfrastructureFacts } from './arc/currency-genesis-context.js';
 import { recordInfrastructureUsageEvent } from './infrastructure-metering.js';
 
@@ -47,6 +47,56 @@ function cleanPartialSpecification(input) {
 function specificationFieldsComplete(input) {
   return SPEC_FIELDS.every((field) => input[field] !== undefined && input[field] !== null)
     && Array.isArray(input.distribution) && input.distribution.length > 0;
+}
+
+function specificationFieldCount(input = {}) {
+  return SPEC_FIELDS.filter((field) => input[field] !== undefined && input[field] !== null
+    && (field !== 'distribution' || (Array.isArray(input.distribution) && input.distribution.length > 0))).length;
+}
+
+function authoringExceptionReason(error) {
+  const name = String(error?.name || '').toLowerCase();
+  const code = String(error?.code || error?.cause?.code || '').toUpperCase();
+  if (name.includes('timeout') || name === 'aborterror'
+      || ['ETIMEDOUT', 'ESOCKETTIMEDOUT', 'ABORT_ERR'].includes(code)) return 'local_authoring_timeout';
+  if (['ECONNREFUSED', 'ECONNRESET', 'ENETUNREACH', 'ENOTFOUND', 'EAI_AGAIN'].includes(code)) {
+    return 'local_authoring_unavailable';
+  }
+  return 'local_authoring_provider_error';
+}
+
+function authoringOutcome(reason, fieldCount) {
+  if (!reason) return fieldCount > 0 ? { outcome: 'expressed', reasonCode: null } : {
+    outcome: 'other', reasonCode: 'no_fields_returned'
+  };
+  const httpStatus = /^local_authoring_http_(\d{3})$/.exec(reason)?.[1];
+  if (httpStatus === '408' || httpStatus === '504') return { outcome: 'provider_timeout', reasonCode: reason };
+  if (httpStatus === '429' || Number(httpStatus) >= 500) return { outcome: 'provider_unavailable', reasonCode: reason };
+  if (reason === 'local_authoring_timeout') return { outcome: 'provider_timeout', reasonCode: reason };
+  if (reason === 'local_authoring_unavailable') return { outcome: 'provider_unavailable', reasonCode: reason };
+  if (['local_authoring_response_invalid', 'local_authoring_response_too_large',
+    'local_authoring_content_invalid', 'local_authoring_specification_invalid'].includes(reason)) {
+    return { outcome: 'malformed_output', reasonCode: reason };
+  }
+  return { outcome: 'provider_error', reasonCode: reason };
+}
+
+async function recordCurrencyGenesisAuthoringOutcome(client, { worldId, agent, worldMinute,
+  selectedAction, authoring, specification }) {
+  const fieldCount = specificationFieldCount(specification);
+  const result = authoringOutcome(authoring.reason || null, fieldCount);
+  const actionId = currencyReviewActionId({ worldId, agentId: agent.agentId, worldMinute,
+    action: `authoring-outcome:${selectedAction}` });
+  const reasonCode = typeof result.reasonCode === 'string'
+    ? result.reasonCode.replace(/[^A-Za-z0-9._:/-]/g, '_').slice(0, 120) : null;
+  const model = typeof authoring.model === 'string' && authoring.model.length
+    ? authoring.model.replace(/[^A-Za-z0-9._:/-]/g, '_').slice(0, 120) : currencyGenesisAuthoringConfig.model;
+  await client.query(`INSERT INTO world_v7_events(world_id,actor_agent_id,event_type,entity_type,entity_id,
+      world_minute,details,action_id) VALUES($1,$2,'currency_genesis.authoring_outcome',
+      'currency_genesis_authoring',$3,$4,$5::jsonb,$6) ON CONFLICT(world_id,actor_agent_id,action_id) DO NOTHING`,
+  [worldId, agent.agentId, worldId, worldMinute, JSON.stringify({ selectedAction,
+    provider: currencyGenesisAuthoringConfig.provider, model, outcome: result.outcome, reasonCode,
+    specificationFieldCount: fieldCount }), actionId]);
 }
 
 function unsupportedPrimitiveChoices(input) {
@@ -810,8 +860,9 @@ export async function advanceWorldCurrencyGenesis(client, { worldId, agent, worl
 
   if (selected.id === 'continue_design' || selected.id === 'propose_when_ready') {
     let authored = { specification: null, reason: 'local_authoring_unavailable' };
-    try { authored = await authorProposal(input, { timeoutMs: 8_000 }); }
-    catch { authored = { specification: null, reason: 'local_authoring_unavailable' }; }
+    try { authored = await authorProposal(input); }
+    catch (error) { authored = { specification: null, reason: authoringExceptionReason(error),
+      model: currencyGenesisAuthoringConfig.model }; }
     const priorSpecification = input.currentDesignDraft?.specification || {};
     let patch = {};
     let authoringReason = authored.reason || null;
@@ -822,6 +873,8 @@ export async function advanceWorldCurrencyGenesis(client, { worldId, agent, worl
       }
       catch { authoringReason = 'local_authoring_specification_invalid'; }
     }
+    await recordCurrencyGenesisAuthoringOutcome(client, { worldId, agent, worldMinute,
+      selectedAction: selected.id, authoring: { ...authored, reason: authoringReason }, specification: patch });
     const specification = { ...priorSpecification, ...patch };
     const complete = specificationFieldsComplete(specification);
     if (selected.id === 'propose_when_ready' && complete) {
@@ -835,7 +888,15 @@ export async function advanceWorldCurrencyGenesis(client, { worldId, agent, worl
         decision: 'proposal_created', intentId: created.intent.id,
         authoringStatus: created.intent.metadata.localAuthoring?.status };
     }
-    const authoringStatus = authored.specification && !authoringReason ? 'expressed' : 'incomplete';
+    const authoredFieldCount = specificationFieldCount(patch);
+    const authoringStatus = authoredFieldCount > 0 && !authoringReason ? 'expressed' : 'incomplete';
+    if (authoredFieldCount === 0) {
+      const incompleteFields = SPEC_FIELDS.filter((field) => specification[field] === undefined || specification[field] === null
+        || (field === 'distribution' && (!Array.isArray(specification.distribution) || !specification.distribution.length)));
+      return { status: incompleteFields.length ? 'DRAFT_INCOMPLETE' : 'DRAFT_COMPLETE',
+        decision: selected.id === 'continue_design' ? 'design_continued' : 'specification_incomplete',
+        incompleteFields, authoringStatus, reason: authoringReason };
+    }
     const savedDraft = await recordCurrencyGenesisDesignDraft(client, { worldId, agent, worldMinute,
       specification, authoring: { model: authored.model || input.currentDesignDraft?.authoring?.model || null,
         status: authoringStatus, reason: authoringReason } });
@@ -871,8 +932,9 @@ export async function advanceWorldCurrencyGenesis(client, { worldId, agent, worl
     const actionId = currencyReviewActionId({ worldId, agentId: agent.agentId, worldMinute, action: selected.id });
     if (decision === 'prepare_specification') {
       let authored = { specification: null, reason: 'local_authoring_unavailable' };
-      try { authored = await authorProposal(input, { timeoutMs: 8_000 }); }
-      catch { authored = { specification: null, reason: 'local_authoring_unavailable' }; }
+      try { authored = await authorProposal(input); }
+      catch (error) { authored = { specification: null, reason: authoringExceptionReason(error),
+        model: currencyGenesisAuthoringConfig.model }; }
       const current = agentTokenSpecificationFromIntentRow(currentIntent);
       let patch = {};
       let authoringReason = authored.reason || null;
@@ -882,6 +944,8 @@ export async function advanceWorldCurrencyGenesis(client, { worldId, agent, worl
           patch = Object.fromEntries(Object.entries(generated).filter(([, value]) => value !== null));
         } catch { authoringReason = 'local_authoring_specification_invalid'; }
       }
+      await recordCurrencyGenesisAuthoringOutcome(client, { worldId, agent, worldMinute,
+        selectedAction: selected.id, authoring: { ...authored, reason: authoringReason }, specification: patch });
       const updated = await updateWorldTokenIssuanceSpecification(client, { worldId, agentId: agent.agentId,
         intentId, specification: { ...current, ...patch }, actionId, worldMinute,
         authoring: { provider: 'ollama_loopback', model: authored.model || null,

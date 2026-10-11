@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { currencyGenesisInfrastructureFacts } from '../src/arc/currency-genesis-context.js';
 import { arcNetworkConfig } from '../src/arc/config.js';
-import { authorAgentCurrencyProposal } from '../src/agent-runtime/currency-genesis-authoring.js';
+import { authorAgentCurrencyProposal, currencyGenesisAuthoringConfig } from '../src/agent-runtime/currency-genesis-authoring.js';
 
 const SPECIFICATION = { name: 'Exchange', symbol: 'EX', meaning: 'A resident expression.', purpose: 'A resident purpose.' };
 
@@ -61,9 +61,56 @@ test('local authoring receives resident-specific state and only expresses a prio
 
 test('unavailable local authoring stays incomplete and does not invent specification fields', async () => {
   const result = await authorAgentCurrencyProposal({ resident: { agentId: 'resident-a', currentGoal: 'trade fairly' } }, {
-    fetchImpl: async () => { throw new Error('Ollama unavailable'); }
+    fetchImpl: async () => { throw Object.assign(new Error('connection refused'), { code: 'ECONNREFUSED' }); }
   });
-  assert.deepEqual(result, { specification: null, reason: 'local_authoring_unavailable' });
+  assert.deepEqual(result, { specification: null, reason: 'local_authoring_unavailable', model: 'qwen2.5:7b' });
+});
+
+test('configured provider uses the discovered model with a bounded generation timeout', async () => {
+  assert.equal(currencyGenesisAuthoringConfig.provider, 'ollama_loopback');
+  assert.equal(currencyGenesisAuthoringConfig.model, 'qwen2.5:7b');
+  assert.equal(currencyGenesisAuthoringConfig.endpoint, 'http://127.0.0.1:11434/api/chat');
+  assert.equal(currencyGenesisAuthoringConfig.timeoutMs, 60_000);
+  let calls = 0;
+  const result = await authorAgentCurrencyProposal({ resident: { agentId: 'resident-a' } }, {
+    fetchImpl: async (url, options) => {
+      calls += 1;
+      assert.equal(url, currencyGenesisAuthoringConfig.endpoint);
+      assert.equal(JSON.parse(options.body).model, 'qwen2.5:7b');
+      assert.equal(options.signal.aborted, false);
+      return { ok: true, text: async () => JSON.stringify({ message: { content: JSON.stringify({ purpose: 'A resident goal.' }) } }) };
+    }
+  });
+  assert.equal(calls, 1, 'the configured provider is actually called once per authoring attempt');
+  assert.equal(result.specification.purpose, 'A resident goal.');
+});
+
+test('authoring timeout is recorded as a timeout rather than provider unavailability', async () => {
+  const result = await authorAgentCurrencyProposal({ resident: { agentId: 'resident-a' } }, {
+    timeoutMs: 5,
+    fetchImpl: async (_url, options) => new Promise((resolve, reject) => {
+      options.signal.addEventListener('abort', () => reject(options.signal.reason), { once: true });
+    })
+  });
+  assert.deepEqual(result, { specification: null, reason: 'local_authoring_timeout', model: 'qwen2.5:7b' });
+});
+
+test('malformed output and provider errors keep distinct technical classifications', async () => {
+  const input = { resident: { agentId: 'resident-a' } };
+  const malformed = await authorAgentCurrencyProposal(input, { fetchImpl: async () => ({ ok: true,
+    text: async () => JSON.stringify({ message: { content: 'not-json' } }) }) });
+  assert.deepEqual(malformed, { specification: null,
+    reason: 'local_authoring_specification_invalid', model: 'qwen2.5:7b' });
+  const providerError = await authorAgentCurrencyProposal(input, { fetchImpl: async () => {
+    throw new Error('provider implementation failed');
+  } });
+  assert.deepEqual(providerError, { specification: null,
+    reason: 'local_authoring_provider_error', model: 'qwen2.5:7b' });
+  const unexpectedTypeError = await authorAgentCurrencyProposal(input, { fetchImpl: async () => {
+    throw new TypeError('provider adapter contract failed');
+  } });
+  assert.deepEqual(unexpectedTypeError, { specification: null,
+    reason: 'local_authoring_provider_error', model: 'qwen2.5:7b' });
 });
 
 test('missing resident context remains unresolved without calling the local model', async () => {
